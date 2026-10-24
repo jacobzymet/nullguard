@@ -223,9 +223,9 @@ fn both_headers_destroyed_is_an_error() {
     assert!(Vault::open(&t.path, Credential::Password(PW), false).is_err());
 }
 
-/// A nullguard 0.1 (format 1) vault is refused with a clear way forward.
+/// A vault made by nullguard 0.1 is refused with instructions.
 #[test]
-fn format_1_vaults_are_refused_with_instructions() {
+fn vaults_from_0_1_are_refused_with_instructions() {
     let t = new_vault();
     for base in [PRIMARY_OFFSET, BACKUP_OFFSET] {
         patch(&t.path, base + 8, |b| b[0] = 1);
@@ -368,10 +368,10 @@ fn restoring_an_old_header_to_revive_an_old_password_is_refused() {
     assert!(matches!(Vault::open(&t.path, Credential::Password(PW), true), Err(Error::StaleHeader)));
 }
 
-/// Regression test for the gap in format 1, where a header change was
-/// recorded in only one superblock: destroying that superblock made the
-/// vault fall back to the older one, which accepted the old header (and
-/// with it a removed keyfile). A header change now commits to both slots.
+/// Regression test: nullguard 0.1 recorded a header change in only one
+/// superblock, so destroying that superblock made the vault fall back to
+/// the older one, which accepted the old header (and with it a removed
+/// keyfile). A header change now commits to both slots.
 #[test]
 fn old_header_stays_refused_even_if_a_superblock_is_destroyed() {
     let bob = Keyfile::generate().unwrap();

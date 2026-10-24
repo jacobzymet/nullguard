@@ -11,8 +11,8 @@
 //! | Memory hygiene         | zeroize on drop, mlock        | `zeroize`, `region`          |
 //!
 //! There is no public-key cryptography. Every secret is a password or a
-//! 256-bit symmetric key, which makes the design post-quantum secure
-//! without needing any post-quantum algorithm.
+//! 256-bit symmetric key, so a quantum computer has no public-key
+//! scheme to break.
 
 pub mod aead;
 pub mod kdf;

@@ -28,12 +28,9 @@ running as you while the vault is unlocked).
 
 ## Assurance
 
-- Cryptography comes only from audited crates (see the README's
-  [cryptographic design](README.md#cryptographic-design)), and only three
-  primitives are used: XChaCha20-Poly1305, Argon2id and SHA-256 (as
-  HMAC/HKDF). No cipher choice, no public-key cryptography.
-- One chain of trust covers the header, the metadata and every data block
-  (see [design principles](README.md#design-principles)).
+- Cryptography comes only from audited crates: XChaCha20-Poly1305,
+  Argon2id and SHA-256 (see the README's
+  [cryptographic design](README.md#cryptographic-design)).
 - `unsafe` is denied crate-wide except for a few libc calls in `src/platform.rs`.
 - CI runs `cargo audit` against the RustSec advisory database on every push.
 - nullguard has **not yet had an independent security audit**.

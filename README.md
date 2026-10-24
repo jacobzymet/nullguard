@@ -11,18 +11,17 @@ and it's an opaque blob that detects any tampering.
 - **One portable binary.** No installer, no runtime, no DLLs, no kernel
   driver. Copy `nullguard` (or `nullguard.exe`) onto a USB stick next to
   your vault and go.
-- **Few parts, on purpose.** One cipher (XChaCha20-Poly1305), one password
-  hash (Argon2id), one hash function (SHA-256). No cipher menu, no tuning
-  knobs, no public-key cryptography. See [design principles](#design-principles).
+- **Audited cryptography.** XChaCha20-Poly1305 for data, Argon2id for
+  passwords and SHA-256 for hashing, all from audited Rust crates.
 - **Tamper-evident.** Every byte is authenticated. Modified, moved, swapped
   or *replayed* (rolled back) blocks are detected, and so is an old header
   put back to revive a removed keyfile or an old password.
 - **Crash-safe.** Copy-on-write with atomic commits: pulling the plug leaves
   the vault exactly as of its last commit. Password and keyfile changes
   are atomic too.
-- **Quantum-resistant by construction.** Every key is a 256-bit symmetric
-  key or derived from a password. There's no public-key cryptography for a
-  quantum computer to break.
+- **Quantum-resistant.** Every key is a 256-bit symmetric key or derived
+  from a password. There's no public-key cryptography for a quantum
+  computer to break.
 
 > **Status: v0.2, not yet independently audited.** The design is
 > deliberately small and heavily tested, but please keep backups and treat
@@ -37,11 +36,10 @@ and it's an opaque blob that detects any tampering.
 - [Commands](#commands)
 - [Platform support](#platform-support)
 - [Building a portable binary](#building-a-portable-binary)
-- [Design principles](#design-principles)
 - [Compared with VeraCrypt](#compared-with-veracrypt)
 - [Threat model](#threat-model)
 - [Cryptographic design](#cryptographic-design)
-- [Vault format specification (v2)](#vault-format-specification-v2)
+- [Vault file format](#vault-file-format)
 - [Code layout](#code-layout)
 - [Limitations and roadmap](#limitations-and-roadmap)
 - [License](#license)
@@ -93,10 +91,8 @@ full revocation, copy your files into a new vault.
 
 ## Upgrading from 0.1
 
-nullguard 0.2 uses vault format 2 and does not read format 1 (supporting
-both would double the parsing code, which is exactly what this release
-removes). To move a vault over, use the old binary to copy the files out
-and the new one to copy them in:
+nullguard 0.2 can't open vaults made by 0.1. To move a vault over, use the
+old binary to copy the files out and the new one to copy them in:
 
 ```bash
 nullguard-0.1 get old.ngv / ./plain       # mind where plaintext lands
@@ -165,45 +161,11 @@ and the real-mount test with `scripts/mount-test.sh target/release/nullguard`
 
 ---
 
-## Design principles
-
-nullguard isn't audited yet, so its security has to come from the design
-itself: few enough parts that each one can be checked, and a structure where
-whole classes of bugs can't happen. In practice:
-
-1. **No primitive of our own, and as few borrowed ones as possible.** Three
-   primitives from audited crates: XChaCha20-Poly1305, Argon2id, SHA-256
-   (as HMAC and HKDF). There's no cipher choice, so there is no downgrade
-   and no rarely-used code path. Changing an algorithm means a new format
-   version, not an option.
-2. **No public-key cryptography.** Passwords and 256-bit keyfiles cover
-   every use. That removes the youngest and most complex code (post-quantum
-   KEMs and hybrid combiners), and nothing is left for a quantum computer to
-   break.
-3. **One chain of trust.** Each superblock is authenticated and names the
-   SHA-256 of the header it was committed under, of the metadata, and
-   (through the metadata) of every data block's exact version. One check
-   covers everything. There's no separate header MAC, no generation
-   counters, no "which copy is newer" logic.
-4. **No settings that weaken the vault.** The command line offers one
-   choice, `--low-memory`. Everything else (cipher, chunk size, random
-   fill, KDF passes) is fixed or picked automatically.
-5. **Strict, canonical parsing.** Every structure has exactly one valid
-   encoding; unknown versions, out-of-range values and non-zero padding
-   are refused. Vault contents are treated as untrusted input even after
-   they authenticate.
-6. **Atomic or nothing.** File changes and key changes alike become durable
-   only through a commit. A crash, error or panic leaves the last commit.
-7. **Small, memory-safe, user-space.** Rust, `unsafe` only for a handful of
-   plain libc calls in one file, no kernel driver, no bootloader. A bug in nullguard can't crash
-   or compromise your kernel.
-
 ## Compared with VeraCrypt
 
 VeraCrypt is mature and has been audited, and it does things nullguard
 doesn't (system/boot-drive encryption, hidden volumes, Windows mounting).
-But several of its *design* choices leave classes of attack open that
-nullguard closes by construction:
+The main differences:
 
 | | VeraCrypt | nullguard |
 |---|---|---|
@@ -211,13 +173,10 @@ nullguard closes by construction:
 | Header rollback | An old volume header backup restores old passwords/keyfiles | An old header is refused, even if a superblock is also destroyed |
 | What a cloud observer sees between versions | Which 16-byte blocks changed (deterministic per sector) | Which chunks changed; rewritten data is indistinguishable from random |
 | Password hashing | PBKDF2 by default (not memory-hard: cheap on GPUs) | Argon2id, 1 GiB by default (memory-hard) |
-| Algorithm choice | 5 ciphers, cascades and 5 hashes; unlocking tries the combinations | Exactly one of each; nothing to choose or downgrade |
+| Algorithm choice | 5 ciphers, cascades and 5 hashes; unlocking tries the combinations | One cipher, one password hash, one hash function |
 | Code base | Large C/C++ and assembly, kernel driver, bootloader | Small Rust, user space only |
 | Plausible deniability | Hidden volumes | Not offered (a vault is recognizable as one) |
 | Independent audit | Yes (2016, 2020) | **Not yet** |
-
-The last row matters: a small design shrinks the room for bugs but can't
-prove their absence. nullguard should still get an outside audit.
 
 ## Threat model
 
@@ -357,7 +316,7 @@ nullguard can't protect you against:
 
 Even to an attacker with the vault file, these are visible by design:
 
-- That the file is a nullguard vault, its format version, and its total size.
+- That the file is a nullguard vault, its version number, and its total size.
 - The chunk size, the password's Argon2id parameters, and how many keyfiles
   can unlock it (but nothing that identifies them).
 
@@ -435,7 +394,7 @@ under exactly one KEK.
 
 ---
 
-## Vault format specification (v2)
+## Vault file format
 
 All integers are little-endian. "‖" is concatenation.
 
@@ -455,7 +414,7 @@ chunk area is filled with random bytes.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | magic `NULLGARD` |
-| 8 | 2 | format version = 2 |
+| 8 | 2 | version = 2 |
 | 10 | 16 | vault ID (random) |
 | 26 | 4 | chunk size: power of two, 4 KiB to 1 MiB |
 | 30 | 8 | chunk count N (≥ 16) |
@@ -466,8 +425,7 @@ chunk area is filled with random bytes.
 | 188 | 104 × K | keyfile slots: wrapped master key |
 | … | … | zero padding to 4096 bytes (must be zero) |
 
-There is no cipher field, no flags and no reserved bytes: format 2 means
-XChaCha20-Poly1305, and anything else would be a new format version.
+The cipher is always XChaCha20-Poly1305, so the header doesn't store it.
 Parsing is strict: unknown versions, out-of-range values and non-zero
 padding are rejected, so every header has exactly one valid encoding.
 Argon2 parameters are capped when *reading* (≤ 4 GiB, ≤ 64 passes, ≤ 64
@@ -539,7 +497,7 @@ rewrites data, so it works even on a full vault). They are never returned
 by reads, and are zeroed before the file grows over them. A file's size
 can't exceed the vault's capacity.
 
-### The chain of trust
+### How it is all authenticated
 
 ```text
 key slot (AEAD + commitment) ─► master key ─► superblock (AEAD)

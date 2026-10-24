@@ -1,4 +1,4 @@
-//! The versioned vault header (format 2).
+//! The vault header.
 //!
 //! One 4 KiB copy at offset 0 and an identical backup at 4 KiB. All
 //! integers are little-endian:
@@ -6,7 +6,7 @@
 //! ```text
 //! offset  size   field
 //!      0     8   magic "NULLGARD"
-//!      8     2   format version = 2
+//!      8     2   version = 2
 //!     10    16   vault id (random)
 //!     26     4   chunk size (power of two, 4 KiB to 1 MiB)
 //!     30     8   chunk count (>= 16)
@@ -28,9 +28,7 @@
 //! the geometry it was made for. The header *as a whole* is authenticated
 //! by the filesystem: every superblock records the SHA-256 of the exact
 //! header it was committed under, and a vault opens only with that header
-//! (see `Vault::open`). There is no separate header MAC or generation
-//! counter: one chain of trust covers the header, the metadata and every
-//! data block.
+//! (see `Vault::open`).
 
 use sha2::{Digest, Sha256};
 
@@ -74,9 +72,9 @@ pub enum HeaderError {
     #[error("not a nullguard vault (bad magic)")]
     NotAVault,
     #[error(
-        "unsupported vault format version {0}: this build reads format {FORMAT_VERSION} only. \
-         Vaults made by nullguard 0.1 (format 1) must be copied out with nullguard 0.1 \
-         (`get`) and into a new vault (`put`)"
+        "this vault was made by a different version of nullguard (vault version {0}) and can't be \
+         opened by this one. For vaults made by nullguard 0.1: copy the files out with nullguard 0.1 \
+         (`get`), then into a new vault (`put`)"
     )]
     UnsupportedVersion(u16),
     #[error("malformed vault header: {0}")]

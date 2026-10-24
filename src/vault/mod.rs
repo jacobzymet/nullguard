@@ -11,9 +11,8 @@
 //!
 //! **Which header is current.** A header copy is used only if it unlocks
 //! with the given credentials *and* its SHA-256 is the one the newest
-//! superblock records. That single rule replaces header MACs, generation
-//! counters and "which copy is newer" logic, and it makes header changes
-//! atomic: a change takes effect at its filesystem commit.
+//! superblock records. A header change therefore takes effect at a single
+//! filesystem commit.
 
 pub mod chunks;
 pub mod fs;

@@ -1,7 +1,7 @@
 //! Keyfiles: a random 256-bit secret in a small text file.
 //!
-//! A keyfile is just a key. It needs no public-key cryptography, so it is
-//! post-quantum secure by construction (a 256-bit symmetric key keeps 128
+//! A keyfile is just a key. It uses no public-key cryptography, so a
+//! quantum computer doesn't help against it (a 256-bit key keeps 128
 //! bits of security against Grover's algorithm), and anyone holding the
 //! file can unlock every vault it was added to. Keep it secret, like the
 //! vault password: on a separate USB stick, or printed as a recovery key.
@@ -59,7 +59,9 @@ impl Keyfile {
             .ok_or(CryptoError::InvalidEncoding("not a nullguard keyfile"))?;
         let b64 = line
             .strip_prefix(PREFIX)
-            .ok_or(CryptoError::InvalidEncoding("not a nullguard keyfile (format 2)"))?;
+            .ok_or(CryptoError::InvalidEncoding(
+                "not a nullguard keyfile (keyfiles from nullguard 0.1 don't work with this version)",
+            ))?;
         let mut raw = Zeroizing::new([0u8; KEY_LEN]);
         let decoded = Base64::decode(b64, raw.as_mut_slice())
             .map_err(|_| CryptoError::InvalidEncoding("keyfile is damaged (not valid base64 of a 32-byte key)"))?;

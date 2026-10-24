@@ -1,9 +1,6 @@
 //! Authenticated encryption for vault chunks and key wrapping.
 //!
-//! nullguard uses exactly one cipher: **XChaCha20-Poly1305**. There is no
-//! cipher choice, so there is nothing to downgrade to and only one
-//! construction to get right. A future algorithm change means a new vault
-//! format version, not a per-vault option.
+//! nullguard uses one cipher, **XChaCha20-Poly1305**, for every vault.
 //!
 //! Its 192-bit nonce is large enough to be picked at random for every
 //! write, so nonces never need to be tracked or counted (a collision is
