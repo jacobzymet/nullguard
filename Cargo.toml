@@ -52,3 +52,7 @@ opt-level = 3
 [features]
 # Type-check / build on macOS without macFUSE installed (mounting disabled).
 macos-no-mount = ["fuser/macos-no-mount"]
+
+# `fuzzing` is set by cargo-fuzz for the fuzz tests in fuzz/.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

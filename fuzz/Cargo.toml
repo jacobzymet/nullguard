@@ -1,0 +1,52 @@
+# Fuzz tests for nullguard's parsers. Test-only: nothing here goes into the
+# nullguard binary. Run with `cargo +nightly fuzz run <target>` (see README).
+[package]
+name = "nullguard-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nullguard = { path = ".." }
+
+# Keep this crate out of the main project's workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+# Integer overflow is a bug we want the fuzzer to find, as in nullguard's
+# own release builds.
+overflow-checks = true
+
+[[bin]]
+name = "header"
+path = "fuzz_targets/header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "superblock"
+path = "fuzz_targets/superblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata"
+path = "fuzz_targets/metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keyfile"
+path = "fuzz_targets/keyfile.rs"
+test = false
+doc = false
+bench = false

@@ -1288,11 +1288,15 @@ pub(crate) fn current_header_hash(store: &ChunkStore) -> Option<[u8; 32]> {
 }
 
 fn read_superblock(store: &ChunkStore, slot: u64) -> Result<Superblock, Error> {
-    let chunk_size = store.chunk_size() as u64;
-    let chunk_count = store.chunk_count();
-    let mut buf = Zeroizing::new(vec![0u8; chunk_size as usize]);
+    let mut buf = Zeroizing::new(vec![0u8; store.chunk_size() as usize]);
     store.read(slot, None, &mut buf)?;
-    let mut r = Reader::new(&buf);
+    parse_superblock(&buf, store.chunk_count())
+}
+
+/// Strictly parse a decrypted superblock (`buf` is one whole chunk).
+fn parse_superblock(buf: &[u8], chunk_count: u64) -> Result<Superblock, Error> {
+    let chunk_size = buf.len() as u64;
+    let mut r = Reader::new(buf);
     let bad = |_| Error::Corrupt("malformed superblock".into());
     if r.take(8).map_err(bad)? != SUPER_MAGIC {
         return Err(Error::Corrupt("unknown superblock format".into()));
@@ -1302,23 +1306,74 @@ fn read_superblock(store: &ChunkStore, slot: u64) -> Result<Superblock, Error> {
     let meta_len = r.u64().map_err(bad)?;
     let meta_hash = r.array::<32>().map_err(bad)?;
     let n = r.u32().map_err(bad)? as u64;
+    // How many metadata chunks there must be. Checked before anything is
+    // allocated, and the allocation can fail cleanly (found by fuzzing: a
+    // crafted superblock could otherwise exhaust memory).
+    let expected = meta_len.div_ceil(chunk_size).max(1);
+    if expected > chunk_count {
+        return Err(Error::Corrupt("superblock metadata length out of range".into()));
+    }
     let mut meta_chunks = Vec::new();
+    meta_chunks
+        .try_reserve_exact(usize::try_from(expected).map_err(|_| Error::NoSpace)?)
+        .map_err(|_| Error::Corrupt("not enough memory to load the vault's metadata".into()))?;
     for _ in 0..n {
         let start = r.u64().map_err(bad)?;
         let len = r.u32().map_err(bad)? as u64;
         let end = start.checked_add(len).filter(|&e| e <= chunk_count && start >= SUPERBLOCK_SLOTS);
-        if len == 0 || end.is_none() || meta_chunks.len() as u64 + len > chunk_count {
+        if len == 0 || end.is_none() || meta_chunks.len() as u64 + len > expected {
             return Err(Error::Corrupt("superblock extent out of range".into()));
         }
         meta_chunks.extend(start..start + len);
     }
-    if (meta_chunks.len() as u64) != meta_len.div_ceil(chunk_size).max(1) {
+    if meta_chunks.len() as u64 != expected {
         return Err(Error::Corrupt("superblock extent length mismatch".into()));
     }
     if r.rest().iter().any(|&b| b != 0) {
         return Err(Error::Corrupt("superblock padding is not zero".into()));
     }
     Ok(Superblock { generation, header_hash, meta_len, meta_hash, meta_chunks })
+}
+
+/// Fuzz test entry points (see `fuzz/`). Only in fuzz builds.
+#[cfg(fuzzing)]
+pub mod fuzzing {
+    use super::*;
+
+    /// Superblock parser. The first 8 bytes pick the vault's chunk count;
+    /// the rest is one 4 KiB decrypted chunk (zero-padded).
+    pub fn superblock(data: &[u8]) {
+        let (count, rest) = data.split_at(data.len().min(8));
+        let mut c = [0u8; 8];
+        c[..count.len()].copy_from_slice(count);
+        // Up to 16 Mi chunks: big enough to exercise every check, small
+        // enough that a legitimate allocation stays under libFuzzer's limit.
+        let chunk_count = u64::from_le_bytes(c) % (1 << 24);
+        let mut buf = vec![0u8; 4096];
+        let n = rest.len().min(4096);
+        buf[..n].copy_from_slice(&rest[..n]);
+        let _ = parse_superblock(&buf, chunk_count);
+    }
+
+    /// Metadata parser. Whatever it accepts must encode and decode again
+    /// to the same bytes (the validator and the encoder agree).
+    pub fn metadata(data: &[u8]) {
+        let Ok((next_ino, inodes)) = decode_metadata(data, 4096, 1 << 40) else { return };
+        let encode = |inodes: &HashMap<u64, Inode>| {
+            let mut order = vec![ROOT_INO];
+            let mut i = 0;
+            while i < order.len() {
+                if let Node::Dir { entries, .. } = &inodes[&order[i]].node {
+                    order.extend(entries.values().copied());
+                }
+                i += 1;
+            }
+            encode_metadata(next_ino, inodes, order)
+        };
+        let once = encode(&inodes);
+        let (_, again) = decode_metadata(&once, 4096, 1 << 40).expect("re-encoded metadata must decode");
+        assert_eq!(*once, *encode(&again), "metadata encoding is not stable");
+    }
 }
 
 fn validate_name(name: &[u8]) -> Result<(), Error> {
@@ -1663,6 +1718,49 @@ mod tests {
         inodes.get_mut(&4).unwrap().node = Node::Symlink { target: b"a\0b".to_vec() };
         let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
         assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
+    }
+
+    fn superblock_bytes(meta_len: u64, extents: &[(u64, u32)]) -> Vec<u8> {
+        let mut b = SUPER_MAGIC.to_vec();
+        b.extend_from_slice(&5u64.to_le_bytes());
+        b.extend_from_slice(&[0; 32]);
+        b.extend_from_slice(&meta_len.to_le_bytes());
+        b.extend_from_slice(&[0; 32]);
+        b.extend_from_slice(&(extents.len() as u32).to_le_bytes());
+        for (start, len) in extents {
+            b.extend_from_slice(&start.to_le_bytes());
+            b.extend_from_slice(&len.to_le_bytes());
+        }
+        b.resize(4096, 0);
+        b
+    }
+
+    #[test]
+    fn superblock_parses_and_checks_its_extents() {
+        let sb = parse_superblock(&superblock_bytes(5000, &[(2, 1), (7, 1)]), 100).unwrap();
+        assert_eq!(sb.meta_chunks, vec![2, 7]);
+        for (meta_len, extents, why) in [
+            (5000, &[(2u64, 1u32)][..], "too few chunks for the length"),
+            (100, &[(2, 2)][..], "too many chunks for the length"),
+            (100, &[(0, 1)][..], "points at a superblock slot"),
+            (100, &[(100, 1)][..], "past the end of the vault"),
+            (100, &[(2, 0)][..], "empty extent"),
+        ] {
+            assert!(parse_superblock(&superblock_bytes(meta_len, extents), 100).is_err(), "{why}");
+        }
+    }
+
+    /// Found by fuzzing: a superblock claiming an enormous metadata length
+    /// (with long extents to match) made the parser try to allocate it all,
+    /// and the process aborted out of memory. Now it's an ordinary error.
+    #[test]
+    fn superblock_with_huge_metadata_length_is_an_error_not_an_abort() {
+        let huge = superblock_bytes(u64::MAX, &[(2, u32::MAX); 300]);
+        assert!(parse_superblock(&huge, 1 << 40).is_err());
+        // A length that fits the vault but not its extents: refused without
+        // filling in the (possibly reserved) list.
+        let big = superblock_bytes(1 << 50, &[(2, 1)]);
+        assert!(parse_superblock(&big, 1 << 40).is_err());
     }
 
     #[test]

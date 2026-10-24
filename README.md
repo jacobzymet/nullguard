@@ -159,6 +159,19 @@ security bug, so it aborts instead of wrapping). Run the tests with `cargo test`
 and the real-mount test with `scripts/mount-test.sh target/release/nullguard`
 (Linux, needs FUSE).
 
+The parsers for untrusted input (header, superblock, metadata, keyfile)
+have fuzz tests in `fuzz/`, which throw millions of random and malformed
+inputs at each one. They need nightly Rust and
+[cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz), and are not part of
+the nullguard binary:
+
+```bash
+cd fuzz
+cargo +nightly fuzz run header seeds/header -- -max_total_time=600
+```
+
+The other targets are `superblock`, `metadata` and `keyfile`.
+
 ---
 
 ## Compared with VeraCrypt
@@ -572,7 +585,6 @@ scripts/mount-test.sh  real FUSE mount test (Linux)
 ## Limitations and roadmap
 
 - **An independent security audit.**
-- **Fuzzing** of every parser (header, superblock, metadata, keyfile).
 - **Windows mounting** via WinFsp.
 - **`rekey`**: re-encrypt everything under a new master key (for compromised passwords).
 - **Anti-rollback state**: an optional local record of the last seen
