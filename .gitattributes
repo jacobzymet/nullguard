@@ -1,0 +1,2 @@
+# Keep LF everywhere (shell scripts must stay runnable when checked out on Windows).
+* text=auto eol=lf

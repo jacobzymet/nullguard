@@ -1,0 +1,10 @@
+# nullguard ships as one self-contained binary: no installer, no runtime DLLs.
+
+# Windows: link the C runtime statically (no VC++ redistributable needed).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Linux: build for *-unknown-linux-musl, which is fully static by default.

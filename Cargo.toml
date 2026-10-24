@@ -1,0 +1,57 @@
+[package]
+name = "nullguard"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Encrypted vault containers that mount as drives. A modern, post-quantum-ready VeraCrypt alternative."
+rust-version = "1.89"
+
+[dependencies]
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+aes-gcm = { version = "0.11", features = ["zeroize"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize", "parallel"] }
+libcrux-ml-kem = "0.0.11"
+x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"] }
+zeroize = { version = "1.9", features = ["derive"] }
+unicode-normalization = "0.1"
+hkdf = "0.13"
+hmac = "0.13"
+sha2 = "0.11"
+subtle = "2.6"
+getrandom = "0.4"
+base64ct = { version = "1.8", features = ["alloc"] }
+clap = { version = "4.6", features = ["derive"] }
+rpassword = "7.5"
+region = "3"
+anyhow = "1"
+thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+ctrlc = { version = "3.5", features = ["termination"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.18" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+# Integer overflow is a security bug: keep the checks in release builds.
+overflow-checks = true
+
+# Crypto (especially Argon2) is unbearably slow unoptimized; optimize
+# dependencies even in debug/test builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[features]
+# Type-check / build on macOS without macFUSE installed (mounting disabled).
+macos-no-mount = ["fuser/macos-no-mount"]
