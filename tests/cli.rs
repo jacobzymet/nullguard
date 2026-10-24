@@ -17,7 +17,9 @@ fn ng(args: &[&str], stdin: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn nullguard");
-    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    // The program may exit (e.g. on a bad option) before reading its
+    // input; a broken pipe here is fine, the exit status is what's checked.
+    let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
     child.wait_with_output().unwrap()
 }
 
