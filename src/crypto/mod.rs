@@ -1,28 +1,28 @@
 //! Cryptographic building blocks.
 //!
 //! nullguard never implements cryptographic primitives itself. Everything
-//! here is a thin, misuse-resistant wrapper around audited or formally
-//! verified crates:
+//! here is a thin, misuse-resistant wrapper around audited crates:
 //!
 //! | Purpose                | Algorithm                     | Crate                        |
 //! |------------------------|-------------------------------|------------------------------|
-//! | Data encryption        | XChaCha20-Poly1305 (default)  | `chacha20poly1305`           |
-//! | Data encryption        | AES-256-GCM                   | `aes-gcm`                    |
+//! | Encryption             | XChaCha20-Poly1305            | `chacha20poly1305`           |
 //! | Password hashing       | Argon2id                      | `argon2`                     |
-//! | Post-quantum KEM       | ML-KEM-1024 (FIPS 203)        | `libcrux-ml-kem`             |
-//! | Classical KEM          | X25519                        | `x25519-dalek`               |
 //! | Key derivation / MAC   | HKDF-SHA256, HMAC-SHA256      | `hkdf`, `hmac`, `sha2`       |
 //! | Memory hygiene         | zeroize on drop, mlock        | `zeroize`, `region`          |
+//!
+//! There is no public-key cryptography. Every secret is a password or a
+//! 256-bit symmetric key, which makes the design post-quantum secure
+//! without needing any post-quantum algorithm.
 
 pub mod aead;
-pub mod hybrid;
 pub mod kdf;
+pub mod keyfile;
 pub mod random;
 pub mod secret;
 
-pub use aead::{Aead, CipherSuite, NONCE_LEN, TAG_LEN};
-pub use hybrid::{HybridCiphertext, HybridPublicKey, HybridSecretKey};
+pub use aead::{Aead, NONCE_LEN, TAG_LEN};
 pub use kdf::Argon2Params;
+pub use keyfile::Keyfile;
 pub use secret::{KEY_LEN, SecretKey, derive_subkey};
 
 use hmac::{KeyInit, Mac};
@@ -45,10 +45,6 @@ pub enum CryptoError {
     InvalidParams(&'static str),
     #[error("invalid encoding: {0}")]
     InvalidEncoding(&'static str),
-    #[error("this keyfile is protected by a passphrase")]
-    PassphraseRequired,
-    #[error("wrong keyfile passphrase")]
-    WrongPassphrase,
 }
 
 /// HMAC-SHA256 tag over `parts` (concatenated).
@@ -73,13 +69,13 @@ pub fn hmac_sha256_verify(key: &SecretKey, parts: &[&[u8]], tag: &[u8; 32]) -> b
 
 /// Length of a key commitment.
 pub const COMMITMENT_LEN: usize = 32;
-const COMMITMENT_LABEL: &[u8] = b"nullguard/v1/key-commitment";
+const COMMITMENT_LABEL: &[u8] = b"nullguard/v2/key-commitment";
 
 /// Key commitment for a wrapped key:
-/// `HMAC-SHA256(kek, "nullguard/v1/key-commitment" || nonce || aad)`.
+/// `HMAC-SHA256(kek, "nullguard/v2/key-commitment" || nonce || aad)`.
 ///
-/// Poly1305 and GHASH are not key-committing: one ciphertext can be built
-/// to authenticate under many keys at once, which enables "partitioning
+/// Poly1305 is not key-committing: one ciphertext can be built to
+/// authenticate under many keys at once, which enables "partitioning
 /// oracle" attacks on password-derived keys. HMAC-SHA256 is
 /// collision-resistant in its key, so checking this value before
 /// decrypting makes unwrapping succeed for exactly one key.
@@ -119,10 +115,8 @@ mod tests {
         let mut mac = <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(b"Jefe").unwrap();
         mac.update(b"what do ya want for nothing?");
         let out: [u8; 32] = mac.finalize().into_bytes().into();
-        assert_eq!(
-            hybrid::hex(&out),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
+        let hex: String = out.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
     }
 
     #[test]

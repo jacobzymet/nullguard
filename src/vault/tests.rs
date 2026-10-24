@@ -1,13 +1,16 @@
 //! End-to-end tests of vault files: create, unlock, tamper, crash.
 
 use super::*;
-use crate::crypto::hybrid::HybridSecretKey;
+use crate::crypto::Keyfile;
 use crate::vault::fs::{ROOT_INO, SetAttr};
 use std::path::PathBuf;
 
 const PW: &[u8] = b"correct horse battery staple";
+const PW2: &[u8] = b"a brand new long password";
 /// The weakest parameters `create` accepts, to keep tests fast.
 const KDF: Argon2Params = Argon2Params { memory_kib: Argon2Params::MIN_CREATE_MEMORY_KIB, iterations: 2, parallelism: 1 };
+/// Where the primary copy's wrapped password key starts.
+const PASSWORD_SLOT: u64 = 82;
 
 struct Tmp {
     _dir: tempfile::TempDir,
@@ -15,14 +18,7 @@ struct Tmp {
 }
 
 fn opts(size: u64) -> CreateOptions {
-    CreateOptions {
-        size,
-        cipher: CipherSuite::XChaCha20Poly1305,
-        kdf: KDF,
-        chunk_size: Some(4096),
-        fill_random: false,
-        recipients: Vec::new(),
-    }
+    CreateOptions { size, kdf: KDF, chunk_size: Some(4096), fill_random: false }
 }
 
 fn new_vault_with(o: CreateOptions) -> Tmp {
@@ -50,11 +46,30 @@ fn patch(path: &Path, offset: u64, f: impl FnOnce(&mut [u8])) {
 
 fn chunk_offset(t: &Tmp, chunk: u64) -> u64 {
     let h = Vault::peek_header(&t.path).unwrap();
-    h.data_offset + chunk * chunk_stride(h.chunk_size)
+    DATA_OFFSET + chunk * chunk_stride(h.chunk_size)
 }
 
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
     (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+}
+
+fn read_at(path: &Path, offset: u64, len: u64) -> Vec<u8> {
+    std::fs::read(path).unwrap()[offset as usize..(offset + len) as usize].to_vec()
+}
+
+fn write_at(path: &Path, offset: u64, bytes: &[u8]) {
+    let file = OpenOptions::new().write(true).open(path).unwrap();
+    write_all_at(&file, bytes, offset).unwrap();
+}
+
+/// Both header copies (primary, backup).
+fn header_area(path: &Path) -> Vec<u8> {
+    read_at(path, 0, 2 * HEADER_AREA)
+}
+
+fn copies_match(path: &Path) -> bool {
+    let h = header_area(path);
+    h[..HEADER_AREA as usize] == h[HEADER_AREA as usize..]
 }
 
 #[test]
@@ -82,22 +97,23 @@ fn create_write_reopen_read() {
 }
 
 #[test]
-fn aes_gcm_vault_and_random_fill() {
+fn random_fill_vault() {
     let mut o = opts(2 << 20);
-    o.cipher = CipherSuite::Aes256Gcm;
     o.fill_random = true;
     let t = new_vault_with(o);
     {
         let mut fs = open_fs(&t);
         let f = fs.create_file(ROOT_INO, b"a", 0o600, 0, 0).unwrap();
-        fs.write(f, 0, b"gcm data").unwrap();
+        fs.write(f, 0, b"data").unwrap();
         fs.commit().unwrap();
     }
     let mut fs = open_fs(&t);
     let f = fs.resolve("a").unwrap();
-    assert_eq!(&fs.read(f, 0, 100).unwrap()[..], b"gcm data");
+    assert_eq!(&fs.read(f, 0, 100).unwrap()[..], b"data");
     drop(fs);
-    assert_eq!(Vault::peek_header(&t.path).unwrap().cipher, CipherSuite::Aes256Gcm);
+    // Unused space is random, not zeros.
+    let tail = read_at(&t.path, std::fs::metadata(&t.path).unwrap().len() - 4096, 4096);
+    assert!(tail.iter().filter(|&&b| b == 0).count() < 100);
 }
 
 #[test]
@@ -121,7 +137,7 @@ fn plaintext_never_hits_the_disk() {
 fn wrong_password_and_wrong_keyfile() {
     let t = new_vault();
     assert!(matches!(Vault::open(&t.path, Credential::Password(b"nope"), false), Err(Error::WrongCredentials)));
-    let k = HybridSecretKey::generate().unwrap();
+    let k = Keyfile::generate().unwrap();
     assert!(matches!(Vault::open(&t.path, Credential::Keyfile(&k), false), Err(Error::WrongCredentials)));
 }
 
@@ -149,41 +165,74 @@ fn weak_kdf_refused_at_create() {
     assert!(!dir.path().join("v").exists(), "failed create must not leave a file");
 }
 
+/// Anyone can append a keyfile slot to a header without the master key.
+/// The password still unlocks that header, but its hash isn't the one the
+/// filesystem recorded, so it's refused. The attacker's keyfile "unlocks"
+/// a key that opens nothing.
 #[test]
-fn header_tampering_is_detected() {
+fn injected_keyfile_slot_is_refused() {
     let t = new_vault();
-    // Flip a bit in the MAC of both copies: parses fine, unlocks, MAC fails.
-    let signed_len = 64 + 4 + 152; // core + one password slot
-    for base in [header::PRIMARY_OFFSET, header::BACKUP_OFFSET] {
-        patch(&t.path, base + signed_len + 3, |b| b[0] ^= 0x10);
+    let mallory = Keyfile::generate().unwrap();
+    let mut h = Vault::peek_header(&t.path).unwrap();
+    h.add_keyfile(&SecretKey::generate().unwrap(), &mallory).unwrap();
+    write_at(&t.path, PRIMARY_OFFSET, &h.to_bytes());
+    write_at(&t.path, BACKUP_OFFSET, &h.to_bytes());
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), false), Err(Error::StaleHeader)));
+    assert!(matches!(Vault::open(&t.path, Credential::Keyfile(&mallory), false), Err(Error::Corrupt(_))));
+}
+
+/// A damaged primary copy: the backup is used, the user is warned, and a
+/// writable open restores the primary.
+#[test]
+fn damaged_primary_is_reported_and_restored_from_backup() {
+    for offset in [PASSWORD_SLOT + 60, 0 /* magic */, HEADER_AREA - 1 /* padding */] {
+        let t = new_vault();
+        patch(&t.path, PRIMARY_OFFSET + offset, |b| b[0] ^= 0x10);
+        let v = Vault::open(&t.path, Credential::Password(PW), true).unwrap();
+        assert!(v.warnings.iter().any(|w| w.contains("primary") && w.contains("does not match")), "{:?}", v.warnings);
+        assert_eq!(v.check_headers().unwrap().len(), 1);
+        drop(v);
+        assert!(!copies_match(&t.path), "a read-only open must not write");
+
+        let v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+        assert!(v.warnings.iter().any(|w| w.contains("restored")), "{:?}", v.warnings);
+        drop(v);
+        assert!(copies_match(&t.path));
+        let v = Vault::open(&t.path, Credential::Password(PW), true).unwrap();
+        assert!(v.warnings.is_empty(), "{:?}", v.warnings);
+        assert!(v.check_headers().unwrap().is_empty());
+        assert!(v.into_fs().is_ok());
     }
-    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), false), Err(Error::HeaderTampered)));
 }
 
 #[test]
-fn tampered_primary_with_intact_backup_opens_with_security_warning() {
+fn damaged_backup_is_restored_from_primary() {
     let t = new_vault();
-    let signed_len = 64 + 4 + 152;
-    patch(&t.path, header::PRIMARY_OFFSET + signed_len + 3, |b| b[0] ^= 0x10);
+    patch(&t.path, BACKUP_OFFSET + PASSWORD_SLOT + 60, |b| b[0] ^= 0x10);
     let v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
-    assert!(v.warnings.iter().any(|w| w.contains("SECURITY") && w.contains("primary")), "{:?}", v.warnings);
-}
-
-#[test]
-fn damaged_primary_header_falls_back_to_backup_with_warning() {
-    let t = new_vault();
-    patch(&t.path, 100, |b| b[0] ^= 0xFF); // inside the password slot
-    let v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
-    assert!(v.warnings.iter().any(|w| w.contains("differ")));
-    assert!(v.warnings.iter().any(|w| w.contains("backup")));
+    assert!(v.warnings.iter().any(|w| w.contains("backup")), "{:?}", v.warnings);
+    drop(v);
+    assert!(copies_match(&t.path));
 }
 
 #[test]
 fn both_headers_destroyed_is_an_error() {
     let t = new_vault();
-    patch(&t.path, header::PRIMARY_OFFSET, |b| b[0] = 0);
-    patch(&t.path, header::BACKUP_OFFSET, |b| b[0] = 0);
+    patch(&t.path, PRIMARY_OFFSET, |b| b[0] = 0);
+    patch(&t.path, BACKUP_OFFSET, |b| b[0] = 0);
     assert!(Vault::open(&t.path, Credential::Password(PW), false).is_err());
+}
+
+/// A nullguard 0.1 (format 1) vault is refused with a clear way forward.
+#[test]
+fn format_1_vaults_are_refused_with_instructions() {
+    let t = new_vault();
+    for base in [PRIMARY_OFFSET, BACKUP_OFFSET] {
+        patch(&t.path, base + 8, |b| b[0] = 1);
+    }
+    let err = Vault::open(&t.path, Credential::Password(PW), true).err().unwrap();
+    assert!(matches!(err, Error::Header(HeaderError::UnsupportedVersion(1))), "{err}");
+    assert!(err.to_string().contains("nullguard 0.1"));
 }
 
 #[test]
@@ -288,70 +337,98 @@ fn crash_before_commit_keeps_last_committed_state() {
     assert_eq!(fs.verify().unwrap().bad_blocks.len(), 0);
 }
 
-fn header_area(path: &Path) -> Vec<u8> {
-    std::fs::read(path).unwrap()[..(2 * header::HEADER_AREA) as usize].to_vec()
-}
+// ----------------------------------------------------------------------
+// Header changes: rollback and crash safety
+// ----------------------------------------------------------------------
 
-fn restore_header_area(path: &Path, saved: &[u8]) {
-    let file = OpenOptions::new().write(true).open(path).unwrap();
-    write_all_at(&file, saved, 0).unwrap();
-}
-
-/// Putting back an old (authentic) header to revive a removed recipient is
-/// detected: the data was committed under a newer header generation.
+/// Putting back an old (authentic) header to revive a removed keyfile is
+/// refused: the filesystem was last committed under a different header.
 #[test]
-fn restoring_an_old_header_to_revive_a_removed_recipient_is_detected() {
-    let bob = HybridSecretKey::generate().unwrap();
-    let mut o = opts(4 << 20);
-    o.recipients = vec![bob.public_key()];
-    let t = new_vault_with(o);
-    let old_headers = header_area(&t.path);
-    {
-        let mut v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
-        v.remove_recipient(&bob.public_key().fingerprint_hex()).unwrap();
-        assert_eq!(v.header().generation, 2);
-    }
+fn restoring_an_old_header_to_revive_a_removed_keyfile_is_refused() {
+    let bob = Keyfile::generate().unwrap();
+    let t = new_vault();
+    Vault::open(&t.path, Credential::Password(PW), false).unwrap().add_keyfile(&bob).unwrap();
+    let with_bob = header_area(&t.path);
+    Vault::open(&t.path, Credential::Password(PW), false).unwrap().remove_keyfile(&bob).unwrap();
     assert!(matches!(Vault::open(&t.path, Credential::Keyfile(&bob), true), Err(Error::WrongCredentials)));
 
-    restore_header_area(&t.path, &old_headers);
-    // The old header itself is authentic, so Bob's slot unlocks it...
-    let v = Vault::open(&t.path, Credential::Keyfile(&bob), true).unwrap();
-    // ...but the filesystem knows it was committed under generation 2.
-    assert!(matches!(v.into_fs(), Err(Error::HeaderRollback { header: 1, recorded: 2 })));
-    let v = Vault::open(&t.path, Credential::Password(PW), true).unwrap();
-    assert!(matches!(v.into_fs(), Err(Error::HeaderRollback { .. })));
+    write_at(&t.path, 0, &with_bob);
+    // The old header is authentic, so Bob's slot unlocks it, but it isn't
+    // the current header.
+    assert!(matches!(Vault::open(&t.path, Credential::Keyfile(&bob), true), Err(Error::StaleHeader)));
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), true), Err(Error::StaleHeader)));
 }
 
 #[test]
-fn restoring_an_old_header_to_revive_an_old_password_is_detected() {
+fn restoring_an_old_header_to_revive_an_old_password_is_refused() {
     let t = new_vault();
-    let old_headers = header_area(&t.path);
-    {
-        let mut v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
-        v.change_password(b"a brand new long password", KDF).unwrap();
-    }
-    restore_header_area(&t.path, &old_headers);
-    let v = Vault::open(&t.path, Credential::Password(PW), true).unwrap();
-    assert!(matches!(v.into_fs(), Err(Error::HeaderRollback { .. })));
+    let old = header_area(&t.path);
+    Vault::open(&t.path, Credential::Password(PW), false).unwrap().change_password(PW2, KDF).unwrap();
+    write_at(&t.path, 0, &old);
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), true), Err(Error::StaleHeader)));
 }
 
-/// If a header change is interrupted after the backup copy was written,
-/// the newer backup wins (not the stale primary).
+/// Regression test for the gap in format 1, where a header change was
+/// recorded in only one superblock: destroying that superblock made the
+/// vault fall back to the older one, which accepted the old header (and
+/// with it a removed keyfile). A header change now commits to both slots.
 #[test]
-fn newest_header_copy_wins_after_interrupted_change() {
-    let alice = HybridSecretKey::generate().unwrap();
+fn old_header_stays_refused_even_if_a_superblock_is_destroyed() {
+    let bob = Keyfile::generate().unwrap();
     let t = new_vault();
-    let gen1 = header_area(&t.path);
-    {
-        let mut v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
-        v.add_recipient(&alice.public_key()).unwrap();
+    Vault::open(&t.path, Credential::Password(PW), false).unwrap().add_keyfile(&bob).unwrap();
+    let with_bob = header_area(&t.path);
+    Vault::open(&t.path, Credential::Password(PW), false).unwrap().remove_keyfile(&bob).unwrap();
+    let after_removal = std::fs::read(&t.path).unwrap();
+    for slot in 0..2 {
+        std::fs::write(&t.path, &after_removal).unwrap();
+        write_at(&t.path, 0, &with_bob);
+        patch(&t.path, chunk_offset(&t, slot) + 30, |b| b[0] ^= 1);
+        assert!(
+            matches!(Vault::open(&t.path, Credential::Keyfile(&bob), true), Err(Error::StaleHeader)),
+            "superblock {slot} destroyed: the removed keyfile must stay removed"
+        );
     }
-    // Simulate the interruption: the primary still holds generation 1.
-    restore_header_area(&t.path, &gen1[..header::HEADER_AREA as usize]);
+}
+
+/// A crash right after a header change wrote the backup copy, before its
+/// commit: the change didn't happen. The old header is used (and the
+/// backup restored), and the new credentials don't work.
+#[test]
+fn header_change_interrupted_before_its_commit_did_not_happen() {
+    let alice = Keyfile::generate().unwrap();
+    let t = new_vault();
+    let before = std::fs::read(&t.path).unwrap();
+    Vault::open(&t.path, Credential::Password(PW), false).unwrap().add_keyfile(&alice).unwrap();
+    let new_header = read_at(&t.path, BACKUP_OFFSET, HEADER_AREA);
+    std::fs::write(&t.path, &before).unwrap();
+    write_at(&t.path, BACKUP_OFFSET, &new_header);
+
+    assert!(matches!(Vault::open(&t.path, Credential::Keyfile(&alice), true), Err(Error::StaleHeader)));
     let v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
-    assert_eq!(v.header().generation, 2, "must use the newer backup copy");
+    assert!(v.header().keyfiles.is_empty());
+    assert!(v.warnings.iter().any(|w| w.contains("backup")), "{:?}", v.warnings);
     assert!(v.into_fs().is_ok());
-    assert!(Vault::open(&t.path, Credential::Keyfile(&alice), true).is_ok());
+    assert!(copies_match(&t.path), "the stale backup was restored");
+    assert!(matches!(Vault::open(&t.path, Credential::Keyfile(&alice), true), Err(Error::WrongCredentials)));
+}
+
+/// A crash after a header change's commit, before the primary copy was
+/// rewritten: the change happened. The new header (backup) is used, the
+/// old password no longer works, and the primary is restored.
+#[test]
+fn header_change_interrupted_after_its_commit_took_effect() {
+    let t = new_vault();
+    let old_primary = read_at(&t.path, PRIMARY_OFFSET, HEADER_AREA);
+    Vault::open(&t.path, Credential::Password(PW), false).unwrap().change_password(PW2, KDF).unwrap();
+    write_at(&t.path, PRIMARY_OFFSET, &old_primary);
+
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), true), Err(Error::StaleHeader)));
+    let v = Vault::open(&t.path, Credential::Password(PW2), false).unwrap();
+    assert!(v.warnings.iter().any(|w| w.contains("primary")), "{:?}", v.warnings);
+    assert!(v.into_fs().is_ok());
+    assert!(copies_match(&t.path), "the stale primary was restored");
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), true), Err(Error::WrongCredentials)));
 }
 
 /// Dropping a filesystem never commits: a command that fails halfway
@@ -444,44 +521,58 @@ fn change_password() {
         fs.write(f, 0, b"keep me").unwrap();
         fs.commit().unwrap();
     }
-    let sk = HybridSecretKey::generate().unwrap();
+    let key = Keyfile::generate().unwrap();
     {
         let mut v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
-        v.add_recipient(&sk.public_key()).unwrap();
-        v.change_password(b"a brand new long password", KDF).unwrap();
+        v.add_keyfile(&key).unwrap();
+        v.change_password(PW2, KDF).unwrap();
     }
     assert!(matches!(Vault::open(&t.path, Credential::Password(PW), false), Err(Error::WrongCredentials)));
-    let v = Vault::open(&t.path, Credential::Password(b"a brand new long password"), false).unwrap();
-    assert!(v.warnings.is_empty());
-    assert_eq!(v.header().password_slot_count(), 1);
+    let v = Vault::open(&t.path, Credential::Password(PW2), false).unwrap();
+    assert!(v.warnings.is_empty(), "{:?}", v.warnings);
+    assert!(v.check_headers().unwrap().is_empty());
     let mut fs = v.into_fs().unwrap();
     let f = fs.resolve("f").unwrap();
     assert_eq!(&fs.read(f, 0, 100).unwrap()[..], b"keep me");
     drop(fs);
-    // The recipient slot survived the password change.
-    assert!(Vault::open(&t.path, Credential::Keyfile(&sk), true).is_ok());
+    // The keyfile survived the password change.
+    assert!(Vault::open(&t.path, Credential::Keyfile(&key), true).is_ok());
 }
 
 #[test]
-fn recipients_unlock_and_can_be_removed() {
-    let alice = HybridSecretKey::generate().unwrap();
-    let bob = HybridSecretKey::generate().unwrap();
-    let mut o = opts(4 << 20);
-    o.recipients = vec![alice.public_key()];
-    let t = new_vault_with(o);
+fn keyfiles_unlock_and_can_be_removed() {
+    let alice = Keyfile::generate().unwrap();
+    let bob = Keyfile::generate().unwrap();
+    let t = new_vault();
+    Vault::open(&t.path, Credential::Password(PW), false).unwrap().add_keyfile(&alice).unwrap();
     {
         let mut v = Vault::open(&t.path, Credential::Keyfile(&alice), false).unwrap();
-        v.add_recipient(&bob.public_key()).unwrap();
-        assert!(v.add_recipient(&bob.public_key()).is_err(), "duplicate recipient");
+        v.add_keyfile(&bob).unwrap();
+        assert!(v.add_keyfile(&bob).is_err(), "duplicate keyfile");
     }
-    assert!(Vault::open(&t.path, Credential::Keyfile(&bob), true).is_ok());
-    {
-        let mut v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
-        let fp = bob.public_key().fingerprint_hex();
-        assert_eq!(v.remove_recipient(&fp[..10]).unwrap(), fp);
-    }
+    assert!(Vault::open(&t.path, Credential::Keyfile(&bob), true).unwrap().into_fs().is_ok());
+    Vault::open(&t.path, Credential::Password(PW), false).unwrap().remove_keyfile(&bob).unwrap();
     assert!(matches!(Vault::open(&t.path, Credential::Keyfile(&bob), true), Err(Error::WrongCredentials)));
     assert!(Vault::open(&t.path, Credential::Keyfile(&alice), true).is_ok());
+    {
+        let mut v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+        assert!(matches!(v.remove_keyfile(&bob), Err(Error::Usage(_))), "already removed");
+        assert_eq!(v.remove_all_keyfiles().unwrap(), 1);
+        assert!(matches!(v.remove_all_keyfiles(), Err(Error::Usage(_))));
+    }
+    assert!(matches!(Vault::open(&t.path, Credential::Keyfile(&alice), true), Err(Error::WrongCredentials)));
+    assert!(Vault::open(&t.path, Credential::Password(PW), true).unwrap().into_fs().is_ok());
+}
+
+/// A keyfile added to one vault doesn't open another.
+#[test]
+fn keyfiles_are_per_vault() {
+    let key = Keyfile::generate().unwrap();
+    let a = new_vault();
+    let b = new_vault();
+    Vault::open(&a.path, Credential::Password(PW), false).unwrap().add_keyfile(&key).unwrap();
+    assert!(Vault::open(&a.path, Credential::Keyfile(&key), true).is_ok());
+    assert!(matches!(Vault::open(&b.path, Credential::Keyfile(&key), true), Err(Error::WrongCredentials)));
 }
 
 #[test]

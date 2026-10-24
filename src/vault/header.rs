@@ -1,41 +1,58 @@
-//! The versioned vault header.
+//! The versioned vault header (format 2).
 //!
-//! The header is stored twice (primary at offset 0, backup at 64 KiB) and
-//! is parsed strictly: every field is range-checked, unknown versions,
-//! algorithms or flags are refused, and unused bytes must be zero, so there
-//! is exactly one valid encoding of any header.
+//! One 4 KiB copy at offset 0 and an identical backup at 4 KiB. All
+//! integers are little-endian:
 //!
-//! Integrity: each key slot wraps the master key with an AEAD whose
-//! associated data covers the vault parameters and the slot's own fields.
-//! After unwrapping, the whole header (all slots included) is checked with
-//! HMAC-SHA256 under a key derived from the master key. This detects any
-//! modification, slot swapping or parameter downgrade, and makes the
-//! construction key-committing. See `README.md` for the byte layout.
+//! ```text
+//! offset  size   field
+//!      0     8   magic "NULLGARD"
+//!      8     2   format version = 2
+//!     10    16   vault id (random)
+//!     26     4   chunk size (power of two, 4 KiB to 1 MiB)
+//!     30     8   chunk count (>= 16)
+//!     38    12   Argon2id memory (KiB), iterations, parallelism
+//!     50    32   Argon2id salt
+//!     82   104   password slot: the wrapped master key
+//!    186     2   keyfile slot count K (0 to 16)
+//!    188 104*K   keyfile slots: the wrapped master key, once per keyfile
+//!      …     …   zero padding to 4096 bytes
+//! ```
+//!
+//! Every vault has exactly one password and up to 16 keyfiles. Parsing is
+//! strict (unknown versions, out-of-range values and non-zero padding are
+//! refused), so every header has exactly one valid encoding.
+//!
+//! **Integrity.** Each slot wraps the master key with an AEAD whose
+//! associated data is the header's first 38 bytes (magic, version, vault
+//! id, geometry), so a slot unlocks only the vault it was made for, with
+//! the geometry it was made for. The header *as a whole* is authenticated
+//! by the filesystem: every superblock records the SHA-256 of the exact
+//! header it was committed under, and a vault opens only with that header
+//! (see `Vault::open`). There is no separate header MAC or generation
+//! counter: one chain of trust covers the header, the metadata and every
+//! data block.
 
-use crate::crypto::hybrid::{self, HybridCiphertext, HybridPublicKey, HybridSecretKey};
+use sha2::{Digest, Sha256};
+
 use crate::crypto::kdf::{self, Argon2Params, SALT_LEN};
 use crate::crypto::{
-    Aead, COMMITMENT_LEN, CipherSuite, CryptoError, KEY_LEN, NONCE_LEN, SecretKey, TAG_LEN, derive_subkey,
-    hmac_sha256, hmac_sha256_verify, key_commitment, random, verify_key_commitment,
+    Aead, COMMITMENT_LEN, CryptoError, KEY_LEN, Keyfile, NONCE_LEN, SecretKey, TAG_LEN, key_commitment, random,
+    verify_key_commitment,
 };
 
 pub const MAGIC: [u8; 8] = *b"NULLGARD";
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 
 /// Size of one header copy on disk.
-pub const HEADER_AREA: u64 = 64 * 1024;
+pub const HEADER_AREA: u64 = 4096;
 pub const PRIMARY_OFFSET: u64 = 0;
 pub const BACKUP_OFFSET: u64 = HEADER_AREA;
-/// Where the chunk area starts (v1: right after the two header copies).
+/// Where the chunk area starts: right after the two header copies.
 pub const DATA_OFFSET: u64 = 2 * HEADER_AREA;
 
 pub const VAULT_ID_LEN: usize = 16;
-pub const MAC_LEN: usize = 32;
-pub const MAX_SLOTS: usize = 32;
-/// At most this many password slots. Each costs a full Argon2id run on
-/// every unlock attempt, so a crafted vault with many expensive slots
-/// could otherwise stall unlocking for a very long time.
-pub const MAX_PASSWORD_SLOTS: usize = 4;
+/// Most keyfiles a vault can have.
+pub const MAX_KEYFILES: usize = 16;
 
 pub const MIN_CHUNK_SIZE: u32 = 4 * 1024;
 pub const MAX_CHUNK_SIZE: u32 = 1024 * 1024;
@@ -44,48 +61,36 @@ pub const MIN_CHUNKS: u64 = 16;
 /// Upper bound on vault size (2^50 bytes = 1 PiB) to keep arithmetic safe.
 pub const MAX_VAULT_BYTES: u64 = 1 << 50;
 
-const CORE_LEN: usize = 64;
-/// Bytes of the core bound into every key slot (everything except the slot
-/// count and reserved bytes, so slots can be added without rewrapping).
-const SLOT_AAD_CORE_LEN: usize = 52;
-const SLOT_HEADER_LEN: usize = 4;
-
-const SLOT_PASSWORD: u8 = 1;
-const SLOT_RECIPIENT: u8 = 2;
-const KDF_ARGON2ID: u8 = 1;
-const KEM_MLKEM1024_X25519: u8 = 1;
-
+/// Magic, version, vault id and geometry: bound into every key slot.
+const CORE_LEN: usize = 8 + 2 + VAULT_ID_LEN + 4 + 8;
 const WRAPPED_KEY_LEN: usize = NONCE_LEN + COMMITMENT_LEN + KEY_LEN + TAG_LEN;
-const PASSWORD_BODY_LEN: usize = 4 + 12 + SALT_LEN + WRAPPED_KEY_LEN;
-const RECIPIENT_BODY_LEN: usize = 4 + hybrid::FINGERPRINT_LEN + hybrid::CIPHERTEXT_LEN + WRAPPED_KEY_LEN;
+const KEYFILES_OFFSET: usize = CORE_LEN + 12 + SALT_LEN + WRAPPED_KEY_LEN + 2;
 
-const LABEL_SLOT_AAD: &[u8] = b"nullguard/v1/keyslot";
-const LABEL_HEADER_MAC: &[u8] = b"nullguard/v1/header-mac";
+const LABEL_SLOT_AAD: &[u8] = b"nullguard/v2/keyslot";
 
-/// Why a header could not be parsed.
+/// Why a header could not be parsed or changed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HeaderError {
     #[error("not a nullguard vault (bad magic)")]
     NotAVault,
-    #[error("unsupported vault format version {0} (this build supports version {FORMAT_VERSION})")]
+    #[error(
+        "unsupported vault format version {0}: this build reads format {FORMAT_VERSION} only. \
+         Vaults made by nullguard 0.1 (format 1) must be copied out with nullguard 0.1 \
+         (`get`) and into a new vault (`put`)"
+    )]
     UnsupportedVersion(u16),
     #[error("malformed vault header: {0}")]
     Malformed(&'static str),
+    #[error("{0}")]
+    Slots(&'static str),
     #[error(transparent)]
     Crypto(#[from] CryptoError),
-}
-
-/// A key slot: one way to unlock the master key.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum KeySlot {
-    Password(PasswordSlot),
-    Recipient(RecipientSlot),
 }
 
 /// The master key wrapped under a key-encryption key (KEK):
 /// `XChaCha20-Poly1305(KEK, nonce, master_key, aad)` plus a key commitment
 /// to the KEK (see [`crate::crypto::key_commitment`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WrappedKey {
     pub nonce: [u8; NONCE_LEN],
     pub commitment: [u8; COMMITMENT_LEN],
@@ -94,24 +99,22 @@ pub struct WrappedKey {
 }
 
 impl WrappedKey {
-    fn seal(kek: SecretKey, aad: &[u8], master: &SecretKey) -> Result<Self, CryptoError> {
+    fn seal(kek: &SecretKey, aad: &[u8], master: &SecretKey) -> Result<Self, CryptoError> {
         let mut buf = zeroize::Zeroizing::new(*master.expose());
         let nonce = random::array::<NONCE_LEN>()?;
-        let commitment = key_commitment(&kek, &nonce, aad);
-        let aead = Aead::new(CipherSuite::XChaCha20Poly1305, kek);
-        let tag = aead.seal_with_nonce(&nonce, aad, buf.as_mut_slice())?;
+        let commitment = key_commitment(kek, &nonce, aad);
+        let tag = Aead::new(kek.duplicate()).seal_with_nonce(&nonce, aad, buf.as_mut_slice())?;
         Ok(Self { nonce, commitment, ciphertext: *buf, tag })
     }
 
     /// Recover the master key. The commitment is checked first (in constant
     /// time), so this succeeds under at most one KEK.
-    fn open(&self, kek: SecretKey, aad: &[u8]) -> Result<SecretKey, CryptoError> {
-        if !verify_key_commitment(&kek, &self.nonce, aad, &self.commitment) {
+    fn open(&self, kek: &SecretKey, aad: &[u8]) -> Result<SecretKey, CryptoError> {
+        if !verify_key_commitment(kek, &self.nonce, aad, &self.commitment) {
             return Err(CryptoError::AuthFailed);
         }
-        let aead = Aead::new(CipherSuite::XChaCha20Poly1305, kek);
         let mut buf = zeroize::Zeroizing::new(self.ciphertext);
-        aead.open(&self.nonce, aad, buf.as_mut_slice(), &self.tag)?;
+        Aead::new(kek.duplicate()).open(&self.nonce, aad, buf.as_mut_slice(), &self.tag)?;
         Ok(SecretKey::from_bytes(&mut buf))
     }
 
@@ -127,34 +130,17 @@ impl WrappedKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PasswordSlot {
-    pub kdf: Argon2Params,
-    pub salt: [u8; SALT_LEN],
-    pub key: WrappedKey,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecipientSlot {
-    pub fingerprint: [u8; hybrid::FINGERPRINT_LEN],
-    pub kem: HybridCiphertext,
-    pub key: WrappedKey,
-}
-
 /// The parsed vault header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
-    pub cipher: CipherSuite,
     pub vault_id: [u8; VAULT_ID_LEN],
     pub chunk_size: u32,
     pub chunk_count: u64,
-    pub data_offset: u64,
-    pub slots: Vec<KeySlot>,
-    pub mac: [u8; MAC_LEN],
-    /// Incremented on every header change (password change, recipient
-    /// added or removed). Covered by the MAC, and recorded in every
-    /// filesystem commit, so restoring an older header is detected.
-    pub generation: u64,
+    /// Argon2id parameters and salt of the password slot.
+    pub kdf: Argon2Params,
+    pub salt: [u8; SALT_LEN],
+    pub password: WrappedKey,
+    pub keyfiles: Vec<WrappedKey>,
 }
 
 /// Bytes each chunk occupies on disk: nonce || ciphertext || tag.
@@ -163,19 +149,25 @@ pub fn chunk_stride(chunk_size: u32) -> u64 {
 }
 
 impl Header {
-    /// A new header with no key slots yet.
-    pub fn new(cipher: CipherSuite, chunk_size: u32, chunk_count: u64) -> Result<Self, HeaderError> {
-        let h = Self {
-            cipher,
+    /// A new header for a new vault, with `password` unlocking `master`.
+    pub fn create(
+        chunk_size: u32,
+        chunk_count: u64,
+        master: &SecretKey,
+        password: &[u8],
+        kdf: Argon2Params,
+    ) -> Result<Self, HeaderError> {
+        let mut h = Self {
             vault_id: random::array()?,
             chunk_size,
             chunk_count,
-            data_offset: DATA_OFFSET,
-            slots: Vec::new(),
-            mac: [0; MAC_LEN],
-            generation: 1,
+            kdf,
+            salt: [0; SALT_LEN],
+            password: WrappedKey::default(),
+            keyfiles: Vec::new(),
         };
         h.validate_geometry()?;
+        h.set_password(master, password, kdf)?;
         Ok(h)
     }
 
@@ -189,13 +181,10 @@ impl Header {
         if self.chunk_count < MIN_CHUNKS {
             return Err(HeaderError::Malformed("too few chunks"));
         }
-        if self.data_offset != DATA_OFFSET {
-            return Err(HeaderError::Malformed("unexpected data offset"));
-        }
         let total = self
             .chunk_count
             .checked_mul(chunk_stride(self.chunk_size))
-            .and_then(|n| n.checked_add(self.data_offset))
+            .and_then(|n| n.checked_add(DATA_OFFSET))
             .ok_or(HeaderError::Malformed("vault size overflows"))?;
         if total > MAX_VAULT_BYTES {
             return Err(HeaderError::Malformed("vault too large"));
@@ -205,54 +194,46 @@ impl Header {
 
     /// Total size of the vault file this header describes.
     pub fn file_len(&self) -> u64 {
-        self.data_offset + self.chunk_count * chunk_stride(self.chunk_size)
+        DATA_OFFSET + self.chunk_count * chunk_stride(self.chunk_size)
     }
 
     fn core_bytes(&self) -> [u8; CORE_LEN] {
         let mut c = [0u8; CORE_LEN];
         c[0..8].copy_from_slice(&MAGIC);
         c[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        c[10..12].copy_from_slice(&self.cipher.id().to_le_bytes());
-        c[12..16].copy_from_slice(&0u32.to_le_bytes()); // flags
-        c[16..32].copy_from_slice(&self.vault_id);
-        c[32..36].copy_from_slice(&self.chunk_size.to_le_bytes());
-        c[36..44].copy_from_slice(&self.chunk_count.to_le_bytes());
-        c[44..52].copy_from_slice(&self.data_offset.to_le_bytes());
-        c[52..54].copy_from_slice(&(self.slots.len() as u16).to_le_bytes());
-        c[54..62].copy_from_slice(&self.generation.to_le_bytes());
-        // 62..64 reserved, zero
+        c[10..26].copy_from_slice(&self.vault_id);
+        c[26..30].copy_from_slice(&self.chunk_size.to_le_bytes());
+        c[30..38].copy_from_slice(&self.chunk_count.to_le_bytes());
         c
-    }
-
-    /// Everything covered by the header MAC: core || slots.
-    fn signed_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(CORE_LEN + self.slots.len() * (SLOT_HEADER_LEN + RECIPIENT_BODY_LEN));
-        out.extend_from_slice(&self.core_bytes());
-        for slot in &self.slots {
-            let (ty, body) = match slot {
-                KeySlot::Password(p) => (SLOT_PASSWORD, p.body()),
-                KeySlot::Recipient(r) => (SLOT_RECIPIENT, r.body()),
-            };
-            out.push(ty);
-            out.push(0);
-            out.extend_from_slice(&(body.len() as u16).to_le_bytes());
-            out.extend_from_slice(&body);
-        }
-        out
     }
 
     /// Serialize to exactly [`HEADER_AREA`] bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
-        assert!(self.slots.len() <= MAX_SLOTS && !self.slots.is_empty(), "slot count invariant");
-        let mut out = self.signed_bytes();
-        out.extend_from_slice(&self.mac);
-        assert!(out.len() as u64 <= HEADER_AREA);
+        assert!(self.keyfiles.len() <= MAX_KEYFILES, "keyfile slot invariant");
+        let mut out = Vec::with_capacity(HEADER_AREA as usize);
+        out.extend_from_slice(&self.core_bytes());
+        out.extend_from_slice(&self.kdf.memory_kib.to_le_bytes());
+        out.extend_from_slice(&self.kdf.iterations.to_le_bytes());
+        out.extend_from_slice(&self.kdf.parallelism.to_le_bytes());
+        out.extend_from_slice(&self.salt);
+        self.password.encode(&mut out);
+        out.extend_from_slice(&(self.keyfiles.len() as u16).to_le_bytes());
+        debug_assert_eq!(out.len(), KEYFILES_OFFSET);
+        for k in &self.keyfiles {
+            k.encode(&mut out);
+        }
         out.resize(HEADER_AREA as usize, 0);
         out
     }
 
-    /// Strictly parse a header copy. Does not authenticate it (that needs
-    /// the master key; see [`Header::verify_mac`]).
+    /// SHA-256 of the encoded header: what the filesystem records in every
+    /// commit, and the only header it will open with.
+    pub fn hash(&self) -> [u8; 32] {
+        Sha256::digest(self.to_bytes()).into()
+    }
+
+    /// Strictly parse a header copy. Nothing in it is trusted until a slot
+    /// unlocks it and the filesystem confirms its hash (see `Vault::open`).
     pub fn parse(bytes: &[u8]) -> Result<Self, HeaderError> {
         if bytes.len() < HEADER_AREA as usize {
             return Err(HeaderError::Malformed("truncated header"));
@@ -266,239 +247,89 @@ impl Header {
         if version != FORMAT_VERSION {
             return Err(HeaderError::UnsupportedVersion(version));
         }
-        let cipher = CipherSuite::from_id(r.u16()?).ok_or(HeaderError::Malformed("unknown cipher suite"))?;
-        if r.u32()? != 0 {
-            return Err(HeaderError::Malformed("unknown flags set"));
-        }
-        let vault_id = r.array::<VAULT_ID_LEN>()?;
+        let vault_id = r.array()?;
         let chunk_size = r.u32()?;
         let chunk_count = r.u64()?;
-        let data_offset = r.u64()?;
-        let slot_count = r.u16()? as usize;
-        let generation = r.u64()?;
-        if generation == 0 {
-            return Err(HeaderError::Malformed("header generation is zero"));
+        let kdf = Argon2Params { memory_kib: r.u32()?, iterations: r.u32()?, parallelism: r.u32()? };
+        kdf.validate()?;
+        let salt = r.array()?;
+        let password = WrappedKey::parse(&mut r)?;
+        let count = r.u16()? as usize;
+        if count > MAX_KEYFILES {
+            return Err(HeaderError::Malformed("too many keyfile slots"));
         }
-        if r.take(2)?.iter().any(|&b| b != 0) {
-            return Err(HeaderError::Malformed("reserved bytes are not zero"));
-        }
-        if slot_count == 0 || slot_count > MAX_SLOTS {
-            return Err(HeaderError::Malformed("bad key slot count"));
-        }
-        let mut slots = Vec::with_capacity(slot_count);
-        for _ in 0..slot_count {
-            let ty = r.u8()?;
-            if r.u8()? != 0 {
-                return Err(HeaderError::Malformed("reserved slot byte is not zero"));
-            }
-            let len = r.u16()? as usize;
-            let body = r.take(len)?;
-            slots.push(match ty {
-                SLOT_PASSWORD => KeySlot::Password(PasswordSlot::parse(body)?),
-                SLOT_RECIPIENT => KeySlot::Recipient(RecipientSlot::parse(body)?),
-                _ => return Err(HeaderError::Malformed("unknown key slot type")),
-            });
-        }
-        if slots.iter().filter(|s| matches!(s, KeySlot::Password(_))).count() > MAX_PASSWORD_SLOTS {
-            return Err(HeaderError::Malformed("too many password slots"));
-        }
-        let mac = r.array::<MAC_LEN>()?;
+        let keyfiles = (0..count).map(|_| WrappedKey::parse(&mut r)).collect::<Result<Vec<_>, _>>()?;
         if r.rest().iter().any(|&b| b != 0) {
             return Err(HeaderError::Malformed("header padding is not zero"));
         }
-        let h = Self { cipher, vault_id, chunk_size, chunk_count, data_offset, slots, mac, generation };
+        let h = Self { vault_id, chunk_size, chunk_count, kdf, salt, password, keyfiles };
         h.validate_geometry()?;
         Ok(h)
     }
 
-    fn mac_key(master: &SecretKey) -> Result<SecretKey, CryptoError> {
-        derive_subkey(master, LABEL_HEADER_MAC)
+    /// Associated data of every key slot: binds the vault id and geometry,
+    /// so a slot can't be moved to another vault or reinterpreted.
+    fn slot_aad(&self) -> Vec<u8> {
+        [LABEL_SLOT_AAD, &self.core_bytes()].concat()
     }
 
-    /// Recompute the header MAC (after any change to the header).
-    pub fn seal(&mut self, master: &SecretKey) -> Result<(), CryptoError> {
-        let key = Self::mac_key(master)?;
-        self.mac = hmac_sha256(&key, &[&self.signed_bytes()]);
-        Ok(())
-    }
-
-    /// Constant-time check of the header MAC under the master key.
-    pub fn verify_mac(&self, master: &SecretKey) -> Result<bool, CryptoError> {
-        let key = Self::mac_key(master)?;
-        Ok(hmac_sha256_verify(&key, &[&self.signed_bytes()], &self.mac))
-    }
-
-    /// Associated data for a key slot: binds the vault parameters and the
-    /// slot's non-secret fields, so none of them can be altered.
-    fn slot_aad(&self, slot_type: u8, slot_fields: &[u8]) -> Vec<u8> {
-        let core = self.core_bytes();
-        [LABEL_SLOT_AAD, &core[..SLOT_AAD_CORE_LEN], &[slot_type], slot_fields].concat()
-    }
-
-    /// Add a password slot wrapping `master`.
-    pub fn add_password_slot(
-        &mut self,
-        master: &SecretKey,
-        password: &[u8],
-        params: Argon2Params,
-    ) -> Result<(), HeaderError> {
-        self.check_slot_room()?;
-        if self.password_slot_count() >= MAX_PASSWORD_SLOTS {
-            return Err(HeaderError::Malformed("too many password slots"));
-        }
-        params.validate()?;
-        let salt = random::array::<SALT_LEN>()?;
-        let kek = kdf::derive_key(password, &salt, &params)?;
-        let aad = self.slot_aad(SLOT_PASSWORD, &PasswordSlot::bound_fields(&params, &salt));
-        let key = WrappedKey::seal(kek, &aad, master)?;
-        self.slots.push(KeySlot::Password(PasswordSlot { kdf: params, salt, key }));
-        Ok(())
-    }
-
-    /// Add a slot that `recipient`'s keyfile can unlock.
-    pub fn add_recipient_slot(&mut self, master: &SecretKey, recipient: &HybridPublicKey) -> Result<(), HeaderError> {
-        self.check_slot_room()?;
-        let fingerprint = recipient.fingerprint();
-        if self.slots.iter().any(|s| matches!(s, KeySlot::Recipient(r) if r.fingerprint == fingerprint)) {
-            return Err(HeaderError::Malformed("that recipient already has a key slot"));
-        }
-        let (kem, kek) = hybrid::encapsulate(recipient)?;
-        let aad = self.slot_aad(SLOT_RECIPIENT, &RecipientSlot::bound_fields(&fingerprint, &kem));
-        let key = WrappedKey::seal(kek, &aad, master)?;
-        self.slots.push(KeySlot::Recipient(RecipientSlot { fingerprint, kem, key }));
-        Ok(())
-    }
-
-    fn check_slot_room(&self) -> Result<(), HeaderError> {
-        if self.slots.len() >= MAX_SLOTS {
-            return Err(HeaderError::Malformed("no free key slots"));
-        }
-        Ok(())
-    }
-
-    /// Try every password slot. Returns the master key on success.
-    ///
-    /// All password slots are tried even after a match would be found, so
-    /// timing does not reveal which slot matched.
-    ///
-    /// A slot whose key derivation fails (for example a tampered slot that
-    /// asks for more memory than the machine has) is skipped, not fatal. If
-    /// no slot opens, the first such error is returned.
-    pub fn unlock_with_password(&self, password: &[u8]) -> Result<Option<SecretKey>, HeaderError> {
-        let mut found = None;
-        let mut err = None;
-        for slot in &self.slots {
-            if let KeySlot::Password(p) = slot {
-                let kek = match kdf::derive_key(password, &p.salt, &p.kdf) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        err.get_or_insert(e);
-                        continue;
-                    }
-                };
-                let aad = self.slot_aad(SLOT_PASSWORD, &PasswordSlot::bound_fields(&p.kdf, &p.salt));
-                if let Ok(k) = p.key.open(kek, &aad) {
-                    found.get_or_insert(k);
-                }
-            }
-        }
-        match (found, err) {
-            (Some(k), _) => Ok(Some(k)),
-            (None, Some(e)) => Err(e.into()),
-            (None, None) => Ok(None),
-        }
-    }
-
-    /// Try the recipient slot(s) matching `sk`'s public key.
-    pub fn unlock_with_keyfile(&self, sk: &HybridSecretKey) -> Result<Option<SecretKey>, HeaderError> {
-        let fp = sk.public_key().fingerprint();
-        for slot in &self.slots {
-            if let KeySlot::Recipient(r) = slot
-                && r.fingerprint == fp
-            {
-                // A malformed (e.g. low-order X25519) ciphertext just means this
-                // slot isn't ours; keep looking.
-                let Ok(kek) = hybrid::decapsulate(sk, &r.kem) else { continue };
-                let aad = self.slot_aad(SLOT_RECIPIENT, &RecipientSlot::bound_fields(&r.fingerprint, &r.kem));
-                if let Ok(k) = r.key.open(kek, &aad) {
-                    return Ok(Some(k));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    pub fn password_slot_count(&self) -> usize {
-        self.slots.iter().filter(|s| matches!(s, KeySlot::Password(_))).count()
-    }
-}
-
-impl PasswordSlot {
-    /// Fields bound into the wrap AAD (everything but the wrapped key).
-    fn bound_fields(kdf: &Argon2Params, salt: &[u8; SALT_LEN]) -> Vec<u8> {
-        let mut v = Vec::with_capacity(16 + SALT_LEN);
-        v.extend_from_slice(&[KDF_ARGON2ID, 0, 0, 0]);
-        v.extend_from_slice(&kdf.memory_kib.to_le_bytes());
-        v.extend_from_slice(&kdf.iterations.to_le_bytes());
-        v.extend_from_slice(&kdf.parallelism.to_le_bytes());
-        v.extend_from_slice(salt);
-        v
-    }
-
-    fn body(&self) -> Vec<u8> {
-        let mut v = Self::bound_fields(&self.kdf, &self.salt);
-        self.key.encode(&mut v);
-        debug_assert_eq!(v.len(), PASSWORD_BODY_LEN);
-        v
-    }
-
-    fn parse(body: &[u8]) -> Result<Self, HeaderError> {
-        if body.len() != PASSWORD_BODY_LEN {
-            return Err(HeaderError::Malformed("password slot has the wrong length"));
-        }
-        let mut r = Reader::new(body);
-        if r.u8()? != KDF_ARGON2ID {
-            return Err(HeaderError::Malformed("unknown key derivation function"));
-        }
-        if r.take(3)? != [0, 0, 0] {
-            return Err(HeaderError::Malformed("reserved slot bytes are not zero"));
-        }
-        let kdf = Argon2Params { memory_kib: r.u32()?, iterations: r.u32()?, parallelism: r.u32()? };
+    /// Replace the password slot: `password` now unlocks `master`.
+    pub fn set_password(&mut self, master: &SecretKey, password: &[u8], kdf: Argon2Params) -> Result<(), HeaderError> {
         kdf.validate()?;
-        Ok(Self { kdf, salt: r.array()?, key: WrappedKey::parse(&mut r)? })
-    }
-}
-
-impl RecipientSlot {
-    fn bound_fields(fingerprint: &[u8; hybrid::FINGERPRINT_LEN], kem: &HybridCiphertext) -> Vec<u8> {
-        let mut v = Vec::with_capacity(4 + hybrid::FINGERPRINT_LEN + hybrid::CIPHERTEXT_LEN);
-        v.extend_from_slice(&[KEM_MLKEM1024_X25519, 0, 0, 0]);
-        v.extend_from_slice(fingerprint);
-        v.extend_from_slice(&kem.to_bytes());
-        v
+        let salt = random::array::<SALT_LEN>()?;
+        let kek = kdf::derive_key(password, &salt, &kdf)?;
+        self.password = WrappedKey::seal(&kek, &self.slot_aad(), master)?;
+        self.kdf = kdf;
+        self.salt = salt;
+        Ok(())
     }
 
-    fn body(&self) -> Vec<u8> {
-        let mut v = Self::bound_fields(&self.fingerprint, &self.kem);
-        self.key.encode(&mut v);
-        debug_assert_eq!(v.len(), RECIPIENT_BODY_LEN);
-        v
+    /// Add a slot that `keyfile` unlocks.
+    pub fn add_keyfile(&mut self, master: &SecretKey, keyfile: &Keyfile) -> Result<(), HeaderError> {
+        if self.keyfiles.len() >= MAX_KEYFILES {
+            return Err(HeaderError::Slots("this vault already has the maximum of 16 keyfiles"));
+        }
+        if self.keyfile_slot(keyfile)?.is_some() {
+            return Err(HeaderError::Slots("that keyfile can already unlock this vault"));
+        }
+        let kek = keyfile.kek(&self.vault_id)?;
+        self.keyfiles.push(WrappedKey::seal(&kek, &self.slot_aad(), master)?);
+        Ok(())
     }
 
-    fn parse(body: &[u8]) -> Result<Self, HeaderError> {
-        if body.len() != RECIPIENT_BODY_LEN {
-            return Err(HeaderError::Malformed("recipient slot has the wrong length"));
+    /// Remove the slot `keyfile` unlocks. Returns whether there was one.
+    pub fn remove_keyfile(&mut self, keyfile: &Keyfile) -> Result<bool, HeaderError> {
+        match self.keyfile_slot(keyfile)? {
+            Some(i) => {
+                self.keyfiles.remove(i);
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        let mut r = Reader::new(body);
-        if r.u8()? != KEM_MLKEM1024_X25519 {
-            return Err(HeaderError::Malformed("unknown key encapsulation mechanism"));
-        }
-        if r.take(3)? != [0, 0, 0] {
-            return Err(HeaderError::Malformed("reserved slot bytes are not zero"));
-        }
-        let fingerprint = r.array()?;
-        let kem = HybridCiphertext::from_bytes(r.take(hybrid::CIPHERTEXT_LEN)?)?;
-        Ok(Self { fingerprint, kem, key: WrappedKey::parse(&mut r)? })
+    }
+
+    /// The index of the keyfile slot `keyfile` unlocks. Slots carry no
+    /// identifier (which would tell anyone who has access), so each is
+    /// tried; that costs one HMAC per slot.
+    fn keyfile_slot(&self, keyfile: &Keyfile) -> Result<Option<usize>, HeaderError> {
+        let kek = keyfile.kek(&self.vault_id)?;
+        let aad = self.slot_aad();
+        Ok(self.keyfiles.iter().position(|k| k.open(&kek, &aad).is_ok()))
+    }
+
+    /// Unlock with the password. `Ok(None)` means it's the wrong password.
+    /// An error means the key derivation itself failed (for example a
+    /// tampered header asking for more memory than the machine has).
+    pub fn unlock_with_password(&self, password: &[u8]) -> Result<Option<SecretKey>, HeaderError> {
+        let kek = kdf::derive_key(password, &self.salt, &self.kdf)?;
+        Ok(self.password.open(&kek, &self.slot_aad()).ok())
+    }
+
+    /// Unlock with a keyfile. `Ok(None)` means no slot accepts it.
+    pub fn unlock_with_keyfile(&self, keyfile: &Keyfile) -> Result<Option<SecretKey>, HeaderError> {
+        let kek = keyfile.kek(&self.vault_id)?;
+        let aad = self.slot_aad();
+        Ok(self.keyfiles.iter().find_map(|k| k.open(&kek, &aad).ok()))
     }
 }
 
@@ -561,40 +392,80 @@ mod tests {
     use super::*;
     use crate::crypto::kdf::TEST_PARAMS;
 
+    const PW: &[u8] = b"correct horse battery staple";
+
     fn sample() -> (Header, SecretKey) {
         let master = SecretKey::generate().unwrap();
-        let mut h = Header::new(CipherSuite::XChaCha20Poly1305, 16 * 1024, 1000).unwrap();
-        h.add_password_slot(&master, b"correct horse battery staple", TEST_PARAMS).unwrap();
-        h.seal(&master).unwrap();
+        let h = Header::create(16 * 1024, 1000, &master, PW, TEST_PARAMS).unwrap();
         (h, master)
     }
 
     #[test]
     fn serialize_parse_roundtrip() {
-        let (h, master) = sample();
+        let (mut h, master) = sample();
+        h.add_keyfile(&master, &Keyfile::generate().unwrap()).unwrap();
         let bytes = h.to_bytes();
         assert_eq!(bytes.len() as u64, HEADER_AREA);
         let parsed = Header::parse(&bytes).unwrap();
         assert_eq!(parsed, h);
-        assert!(parsed.verify_mac(&master).unwrap());
         assert_eq!(parsed.to_bytes(), bytes, "encoding must be canonical");
+        assert_eq!(parsed.hash(), h.hash());
     }
 
     #[test]
-    fn roundtrip_with_recipients_and_aes() {
-        let master = SecretKey::generate().unwrap();
-        let mut h = Header::new(CipherSuite::Aes256Gcm, 64 * 1024, 5000).unwrap();
-        h.add_password_slot(&master, b"pw-one-is-long-enough", TEST_PARAMS).unwrap();
-        let sk = HybridSecretKey::generate().unwrap();
-        h.add_recipient_slot(&master, &sk.public_key()).unwrap();
-        h.seal(&master).unwrap();
-        let parsed = Header::parse(&h.to_bytes()).unwrap();
-        assert_eq!(parsed, h);
-        let k = parsed.unlock_with_keyfile(&sk).unwrap().expect("keyfile unlocks");
+    fn password_unlock() {
+        let (h, master) = sample();
+        let k = h.unlock_with_password(PW).unwrap().unwrap();
         assert_eq!(k.expose(), master.expose());
-        // A different keyfile does not unlock.
-        let other = HybridSecretKey::generate().unwrap();
-        assert!(parsed.unlock_with_keyfile(&other).unwrap().is_none());
+        assert!(h.unlock_with_password(b"correct horse battery stapler").unwrap().is_none());
+        assert!(h.unlock_with_password(b"").unwrap().is_none());
+    }
+
+    #[test]
+    fn set_password_replaces_the_old_one() {
+        let (mut h, master) = sample();
+        let old_salt = h.salt;
+        h.set_password(&master, b"another long password", TEST_PARAMS).unwrap();
+        assert_ne!(h.salt, old_salt, "a new password gets a new salt");
+        assert!(h.unlock_with_password(PW).unwrap().is_none());
+        assert_eq!(h.unlock_with_password(b"another long password").unwrap().unwrap().expose(), master.expose());
+    }
+
+    #[test]
+    fn keyfiles_unlock_and_can_be_removed() {
+        let (mut h, master) = sample();
+        let a = Keyfile::generate().unwrap();
+        let b = Keyfile::generate().unwrap();
+        assert!(h.unlock_with_keyfile(&a).unwrap().is_none());
+        h.add_keyfile(&master, &a).unwrap();
+        h.add_keyfile(&master, &b).unwrap();
+        assert!(matches!(h.add_keyfile(&master, &a), Err(HeaderError::Slots(_))), "duplicate keyfile");
+        let parsed = Header::parse(&h.to_bytes()).unwrap();
+        for k in [&a, &b] {
+            assert_eq!(parsed.unlock_with_keyfile(k).unwrap().unwrap().expose(), master.expose());
+        }
+        assert!(parsed.unlock_with_keyfile(&Keyfile::generate().unwrap()).unwrap().is_none());
+
+        assert!(h.remove_keyfile(&a).unwrap());
+        assert!(!h.remove_keyfile(&a).unwrap(), "already removed");
+        assert!(h.unlock_with_keyfile(&a).unwrap().is_none());
+        assert!(h.unlock_with_keyfile(&b).unwrap().is_some());
+        assert!(h.unlock_with_password(PW).unwrap().is_some());
+    }
+
+    #[test]
+    fn max_keyfiles_fit_in_header_area() {
+        let (mut h, master) = sample();
+        for _ in 0..MAX_KEYFILES {
+            h.add_keyfile(&master, &Keyfile::generate().unwrap()).unwrap();
+        }
+        assert!(matches!(h.add_keyfile(&master, &Keyfile::generate().unwrap()), Err(HeaderError::Slots(_))));
+        let parsed = Header::parse(&h.to_bytes()).unwrap();
+        assert_eq!(parsed.keyfiles.len(), MAX_KEYFILES);
+        // A crafted header claiming more keyfile slots is refused.
+        let mut b = h.to_bytes();
+        b[KEYFILES_OFFSET - 2..KEYFILES_OFFSET].copy_from_slice(&(MAX_KEYFILES as u16 + 1).to_le_bytes());
+        assert_eq!(Header::parse(&b).unwrap_err(), HeaderError::Malformed("too many keyfile slots"));
     }
 
     /// Unwrapping needs both the commitment and the AEAD tag to verify under
@@ -605,58 +476,20 @@ mod tests {
         let kek_a = SecretKey::generate().unwrap();
         let kek_b = SecretKey::generate().unwrap();
         let aad = b"slot aad";
-        let w = WrappedKey::seal(kek_a.duplicate(), aad, &master).unwrap();
-        assert_eq!(w.open(kek_a.duplicate(), aad).unwrap().expose(), master.expose());
-        assert!(w.open(kek_b.duplicate(), aad).is_err());
+        let w = WrappedKey::seal(&kek_a, aad, &master).unwrap();
+        assert_eq!(w.open(&kek_a, aad).unwrap().expose(), master.expose());
+        assert!(w.open(&kek_b, aad).is_err());
         // Swap in an honest commitment for KEK B: B now passes the commitment
         // but fails the AEAD, and A fails the commitment.
         let mut forged = w.clone();
         forged.commitment = key_commitment(&kek_b, &forged.nonce, aad);
-        assert!(forged.open(kek_b, aad).is_err());
-        assert!(forged.open(kek_a.duplicate(), aad).is_err());
+        assert!(forged.open(&kek_b, aad).is_err());
+        assert!(forged.open(&kek_a, aad).is_err());
         // The commitment also binds nonce and AAD.
-        assert!(w.open(kek_a.duplicate(), b"other aad").is_err());
+        assert!(w.open(&kek_a, b"other aad").is_err());
         let mut bad = w.clone();
         bad.commitment[0] ^= 1;
-        assert!(bad.open(kek_a, aad).is_err());
-    }
-
-    #[test]
-    fn password_slots_are_capped() {
-        let master = SecretKey::generate().unwrap();
-        let mut h = Header::new(CipherSuite::XChaCha20Poly1305, 16 * 1024, 1000).unwrap();
-        for _ in 0..MAX_PASSWORD_SLOTS {
-            h.add_password_slot(&master, b"pw", TEST_PARAMS).unwrap();
-        }
-        assert!(h.add_password_slot(&master, b"pw", TEST_PARAMS).is_err());
-        // A crafted header with more password slots is refused when parsing.
-        let extra = h.slots[0].clone();
-        h.slots.push(extra);
-        h.seal(&master).unwrap();
-        assert_eq!(Header::parse(&h.to_bytes()).unwrap_err(), HeaderError::Malformed("too many password slots"));
-    }
-
-    #[test]
-    fn max_slots_fit_in_header_area() {
-        let master = SecretKey::generate().unwrap();
-        let mut h = Header::new(CipherSuite::XChaCha20Poly1305, 16 * 1024, 1000).unwrap();
-        h.add_password_slot(&master, b"pw", TEST_PARAMS).unwrap();
-        while h.slots.len() < MAX_SLOTS {
-            h.add_recipient_slot(&master, &HybridSecretKey::generate().unwrap().public_key()).unwrap();
-        }
-        assert!(h.add_recipient_slot(&master, &HybridSecretKey::generate().unwrap().public_key()).is_err());
-        h.seal(&master).unwrap();
-        let parsed = Header::parse(&h.to_bytes()).unwrap();
-        assert_eq!(parsed.slots.len(), MAX_SLOTS);
-    }
-
-    #[test]
-    fn password_unlock() {
-        let (h, master) = sample();
-        let k = h.unlock_with_password(b"correct horse battery staple").unwrap().unwrap();
-        assert_eq!(k.expose(), master.expose());
-        assert!(h.unlock_with_password(b"correct horse battery stapler").unwrap().is_none());
-        assert!(h.unlock_with_password(b"").unwrap().is_none());
+        assert!(bad.open(&kek_a, aad).is_err());
     }
 
     #[test]
@@ -666,9 +499,10 @@ mod tests {
         b[0] ^= 1;
         assert_eq!(Header::parse(&b).unwrap_err(), HeaderError::NotAVault);
 
+        // A nullguard 0.1 vault.
         let mut b = h.to_bytes();
-        b[8] = 2;
-        assert_eq!(Header::parse(&b).unwrap_err(), HeaderError::UnsupportedVersion(2));
+        b[8] = 1;
+        assert_eq!(Header::parse(&b).unwrap_err(), HeaderError::UnsupportedVersion(1));
 
         let b = h.to_bytes();
         assert!(Header::parse(&b[..1000]).is_err());
@@ -676,21 +510,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_cipher_flags_and_geometry() {
+    fn rejects_bad_geometry() {
         let (h, _) = sample();
-        let cases: [(usize, u8); 6] = [
-            (10, 99), // cipher id
-            (12, 1),  // flags
-            (32, 1),  // chunk size not a power of two
-            (62, 1),  // reserved
-            (52, 0),  // slot count 1 -> 0
-            (44, 1),  // data offset
-        ];
-        for (off, val) in cases {
+        let with = |off: usize, val: &[u8]| {
             let mut b = h.to_bytes();
-            b[off] = val;
-            assert!(Header::parse(&b).is_err(), "byte {off} = {val} should be rejected");
-        }
+            b[off..off + val.len()].copy_from_slice(val);
+            Header::parse(&b)
+        };
+        assert!(with(26, &(16 * 1024u32 + 1).to_le_bytes()).is_err(), "chunk size not a power of two");
+        assert!(with(26, &2048u32.to_le_bytes()).is_err(), "chunk size too small");
+        assert!(with(26, &(2u32 << 20).to_le_bytes()).is_err(), "chunk size too large");
+        assert!(with(30, &15u64.to_le_bytes()).is_err(), "too few chunks");
+        assert!(with(30, &u64::MAX.to_le_bytes()).is_err(), "size overflows");
+        assert!(with(30, &(1u64 << 40).to_le_bytes()).is_err(), "larger than 1 PiB");
+        assert!(with(30, &16u64.to_le_bytes()).is_ok());
     }
 
     #[test]
@@ -700,84 +533,83 @@ mod tests {
         let last = b.len() - 1;
         b[last] = 1;
         assert_eq!(Header::parse(&b).unwrap_err(), HeaderError::Malformed("header padding is not zero"));
+        // The first padding byte too (right after the keyfile count).
+        let mut b = h.to_bytes();
+        b[KEYFILES_OFFSET] = 1;
+        assert!(Header::parse(&b).is_err());
     }
 
     #[test]
     fn rejects_hostile_kdf_params() {
         let (h, _) = sample();
-        // The password slot's memory cost sits at core(64) + slot header(4) + 4.
         let mut b = h.to_bytes();
-        b[72..76].copy_from_slice(&u32::MAX.to_le_bytes());
+        b[38..42].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(Header::parse(&b).is_err());
     }
 
-    /// Every single-bit change in the authenticated region is either
-    /// rejected by the parser, prevents unlocking, or is caught by the MAC.
-    #[test]
-    fn every_bit_flip_is_detected() {
-        let (h, master) = sample();
-        let bytes = h.to_bytes();
-        let signed_len = h.signed_bytes().len() + MAC_LEN;
-        for i in 0..signed_len * 8 {
-            let mut b = bytes.clone();
-            b[i / 8] ^= 1 << (i % 8);
-            let Ok(parsed) = Header::parse(&b) else { continue };
-            // Parsed fine: the MAC must now fail under the real master key.
-            assert!(!parsed.verify_mac(&master).unwrap(), "bit {i} flip went undetected");
-        }
-    }
-
-    /// Changing a slot's KDF params (a downgrade attack) breaks the wrap.
+    /// Changing the KDF parameters (a downgrade attack) or the salt breaks
+    /// the password slot.
     #[test]
     fn kdf_downgrade_breaks_unlock() {
         let master = SecretKey::generate().unwrap();
         let strong = Argon2Params { iterations: 3, ..TEST_PARAMS };
-        let mut h = Header::new(CipherSuite::XChaCha20Poly1305, 16 * 1024, 1000).unwrap();
-        h.add_password_slot(&master, b"pw", strong).unwrap();
-        if let KeySlot::Password(p) = &mut h.slots[0] {
-            p.kdf.iterations = 1;
-        }
-        assert!(h.unlock_with_password(b"pw").unwrap().is_none());
+        let mut h = Header::create(16 * 1024, 1000, &master, PW, strong).unwrap();
+        h.kdf.iterations = 1;
+        assert!(h.unlock_with_password(PW).unwrap().is_none());
+        let (mut h, _) = sample();
+        h.salt[0] ^= 1;
+        assert!(h.unlock_with_password(PW).unwrap().is_none());
     }
 
-    /// Changing vault parameters (e.g. cipher) breaks every slot's wrap.
+    /// Changing the vault id or geometry breaks every slot.
     #[test]
     fn parameter_tampering_breaks_unlock() {
-        let (mut h, _) = sample();
-        h.cipher = CipherSuite::Aes256Gcm;
-        assert!(h.unlock_with_password(b"correct horse battery staple").unwrap().is_none());
-        let (mut h, _) = sample();
-        h.chunk_count += 1;
-        assert!(h.unlock_with_password(b"correct horse battery staple").unwrap().is_none());
-        let (mut h, _) = sample();
-        h.vault_id[0] ^= 1;
-        assert!(h.unlock_with_password(b"correct horse battery staple").unwrap().is_none());
+        let kf = Keyfile::generate().unwrap();
+        let tamper: [fn(&mut Header); 3] =
+            [|h| h.chunk_count += 1, |h| h.chunk_size *= 2, |h| h.vault_id[0] ^= 1];
+        for t in tamper {
+            let (mut h, master) = sample();
+            h.add_keyfile(&master, &kf).unwrap();
+            t(&mut h);
+            assert!(h.unlock_with_password(PW).unwrap().is_none());
+            assert!(h.unlock_with_keyfile(&kf).unwrap().is_none());
+        }
     }
 
-    /// A slot copied from another vault (same password!) does not unlock,
-    /// and slots can't be moved between vaults.
+    /// Slots copied from another vault (same password, same keyfile!) don't
+    /// unlock: slots can't be moved between vaults.
     #[test]
     fn slots_are_bound_to_their_vault() {
-        let (a, _) = sample();
+        let kf = Keyfile::generate().unwrap();
+        let (mut a, master_a) = sample();
+        a.add_keyfile(&master_a, &kf).unwrap();
         let (mut b, _) = sample();
-        b.slots = a.slots.clone();
-        assert!(b.unlock_with_password(b"correct horse battery staple").unwrap().is_none());
+        b.kdf = a.kdf;
+        b.salt = a.salt;
+        b.password = a.password.clone();
+        b.keyfiles = a.keyfiles.clone();
+        assert!(b.unlock_with_password(PW).unwrap().is_none());
+        assert!(b.unlock_with_keyfile(&kf).unwrap().is_none());
     }
 
-    /// Adding a slot to a sealed header without the master key is detected.
+    /// Any change to the header changes its hash, which is what the
+    /// filesystem checks. (Injecting a keyfile slot needs no master key.)
     #[test]
-    fn injected_slot_detected_by_mac() {
-        let (mut h, master) = sample();
-        let attacker_key = SecretKey::generate().unwrap();
-        h.add_password_slot(&attacker_key, b"attacker", TEST_PARAMS).unwrap();
-        let parsed = Header::parse(&h.to_bytes()).unwrap();
-        assert!(!parsed.verify_mac(&master).unwrap());
+    fn every_change_changes_the_hash() {
+        let (h, master) = sample();
+        let mut injected = h.clone();
+        injected.add_keyfile(&SecretKey::generate().unwrap(), &Keyfile::generate().unwrap()).unwrap();
+        assert_ne!(injected.hash(), h.hash());
+        let mut other = h.clone();
+        other.set_password(&master, PW, TEST_PARAMS).unwrap();
+        assert_ne!(other.hash(), h.hash(), "even the same password rewrapped is a different header");
     }
 
     /// Cheap deterministic fuzzing: random corruption never panics.
     #[test]
     fn random_corruption_never_panics() {
-        let (h, _) = sample();
+        let (mut h, master) = sample();
+        h.add_keyfile(&master, &Keyfile::generate().unwrap()).unwrap();
         let base = h.to_bytes();
         let mut state = 0x9E3779B97F4A7C15u64;
         let mut next = || {
@@ -795,7 +627,7 @@ mod tests {
             let _ = Header::parse(&b);
         }
         for _ in 0..500 {
-            let len = (next() % 70_000) as usize;
+            let len = (next() % 10_000) as usize;
             let b: Vec<u8> = (0..len).map(|_| next() as u8).collect();
             let _ = Header::parse(&b);
         }

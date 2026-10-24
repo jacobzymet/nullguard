@@ -7,7 +7,7 @@ use std::process::{Command, Output, Stdio};
 
 const PW: &str = "correct horse battery staple";
 const PW2: &str = "an even better passphrase here";
-const FAST_KDF: [&str; 6] = ["--kdf-memory", "64", "--kdf-iterations", "2", "--kdf-parallelism", "1"];
+const FAST_KDF: [&str; 1] = ["--low-memory"];
 
 fn ng(args: &[&str], stdin: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_nullguard"))
@@ -85,19 +85,27 @@ fn full_workflow() {
     fails(&["ls", v, "--password-stdin"], &format!("{PW}\n"));
     ok(&["ls", v, "--password-stdin"], &format!("{PW2}\n"));
 
-    // Keyfiles: generate (passphrase-protected), share, unlock, revoke.
+    // Keyfiles: generate, add, unlock, remove.
     let key = dir.path().join("me.key");
-    let out = ok(&["keygen", s(&key), "--password-stdin"], "keyfile passphrase 123\n");
-    let fp_line = out.lines().find(|l| l.starts_with("Fingerprint")).unwrap();
-    let fp = fp_line.split_whitespace().last().unwrap().to_string();
-    let pubkey = format!("{}.pub", s(&key));
-    ok(&["add-recipient", v, &pubkey, "--password-stdin"], &format!("{PW2}\n"));
-    assert!(ok(&["info", v], "").contains(&fp));
-    let ls = ok(&["ls", v, "/src", "--keyfile", s(&key), "--password-stdin"], "keyfile passphrase 123\n");
+    let key2 = dir.path().join("spare.key");
+    ok(&["keygen", s(&key)], "");
+    ok(&["keygen", s(&key2)], "");
+    fails(&["keygen", s(&key)], ""); // never overwrites
+    fails(&["ls", v, "--keyfile", s(&key)], ""); // not added yet
+    ok(&["add-keyfile", v, s(&key), "--password-stdin"], &format!("{PW2}\n"));
+    // A keyfile can add another keyfile.
+    ok(&["add-keyfile", v, s(&key2), "--keyfile", s(&key)], "");
+    fails(&["add-keyfile", v, s(&key2), "--keyfile", s(&key)], ""); // already added
+    assert!(ok(&["info", v], "").contains("keyfiles:    2"));
+    let ls = ok(&["ls", v, "/src", "--keyfile", s(&key)], "");
     assert!(ls.contains("a.txt"));
-    fails(&["ls", v, "--keyfile", s(&key), "--password-stdin"], "wrong keyfile passphrase\n");
-    ok(&["remove-recipient", v, &fp[..12], "--password-stdin"], &format!("{PW2}\n"));
-    fails(&["ls", v, "--keyfile", s(&key), "--password-stdin"], "keyfile passphrase 123\n");
+    ok(&["remove-keyfile", v, s(&key), "--password-stdin"], &format!("{PW2}\n"));
+    fails(&["ls", v, "--keyfile", s(&key)], "");
+    ok(&["ls", v, "--keyfile", s(&key2)], "");
+    fails(&["remove-keyfile", v, "--password-stdin"], &format!("{PW2}\n")); // which one?
+    let out = ok(&["remove-keyfile", v, "--all", "--password-stdin"], &format!("{PW2}\n"));
+    assert!(out.contains("Removed 1 keyfile"), "{out}");
+    fails(&["ls", v, "--keyfile", s(&key2)], "");
 
     // rm, mkdir, verify.
     ok(&["rm", v, "/src/sub", "-r", "--password-stdin"], &format!("{PW2}\n"));
@@ -113,7 +121,7 @@ fn verify_detects_tampering() {
     let dir = tempfile::tempdir().unwrap();
     let vault = dir.path().join("v.ngv");
     let v = s(&vault);
-    ok(&[&["create", v, "--size", "4M", "--quick", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
     let src = dir.path().join("f.bin");
     std::fs::write(&src, vec![0x42u8; 200_000]).unwrap();
     ok(&["put", v, s(&src), "/", "--password-stdin"], &format!("{PW}\n"));
@@ -121,7 +129,7 @@ fn verify_detects_tampering() {
     // Flip one bit in every 4 KiB of the data area past the two superblocks.
     // Metadata and file data both live there, so the vault must not verify.
     let mut raw = std::fs::read(&vault).unwrap();
-    let start = 128 * 1024 + 2 * (16 * 1024 + 40);
+    let start = 8192 + 2 * (16 * 1024 + 40);
     for off in (start..raw.len()).step_by(4096) {
         raw[off] ^= 1;
     }
@@ -138,7 +146,7 @@ fn password_handling() {
     // Created with a decomposed accent ("e" + U+0301)...
     let decomposed = "cre\u{300}me bru\u{302}le\u{301}e passphrase";
     let composed = "cr\u{e8}me br\u{fb}l\u{e9}e passphrase";
-    ok(&[&["create", v, "--size", "4M", "--quick", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{decomposed}\n"));
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{decomposed}\n"));
     // ...unlocks with the precomposed form another OS/keyboard might send.
     ok(&["ls", v, "--password-stdin"], &format!("{composed}\n"));
 
@@ -157,7 +165,7 @@ fn failed_get_leaves_no_partial_plaintext() {
     let dir = tempfile::tempdir().unwrap();
     let vault = dir.path().join("v.ngv");
     let v = s(&vault);
-    ok(&[&["create", v, "--size", "8M", "--quick", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    ok(&[&["create", v, "--size", "8M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
     let src = dir.path().join("f.bin");
     std::fs::write(&src, vec![0x42u8; 3_000_000]).unwrap();
     ok(&["put", v, s(&src), "/", "--password-stdin"], &format!("{PW}\n"));
@@ -166,7 +174,7 @@ fn failed_get_leaves_no_partial_plaintext() {
     // decrypts, so a naive copy would leave a partial file behind.
     let mut raw = std::fs::read(&vault).unwrap();
     let stride = 16 * 1024 + 40;
-    let data_end = 128 * 1024 + (2 + 3_000_000 / (16 * 1024)) * stride;
+    let data_end = 8192 + (2 + 3_000_000 / (16 * 1024)) * stride;
     for off in (data_end - 200 * 1024..data_end).step_by(4096) {
         raw[off] ^= 1;
     }
@@ -184,7 +192,7 @@ fn failed_put_force_keeps_the_original_file() {
     let dir = tempfile::tempdir().unwrap();
     let vault = dir.path().join("v.ngv");
     let v = s(&vault);
-    ok(&[&["create", v, "--size", "8M", "--quick", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    ok(&[&["create", v, "--size", "8M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
     let src = dir.path().join("f.bin");
     let original = vec![0x11u8; 5_000_000];
     std::fs::write(&src, &original).unwrap();
@@ -205,7 +213,7 @@ fn rm_refuses_dot_paths_and_never_commits_on_failure() {
     let dir = tempfile::tempdir().unwrap();
     let vault = dir.path().join("v.ngv");
     let v = s(&vault);
-    ok(&[&["create", v, "--size", "4M", "--quick", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
     let src = dir.path().join("d");
     std::fs::create_dir_all(src.join("sub")).unwrap();
     std::fs::write(src.join("a.txt"), b"important").unwrap();
@@ -229,21 +237,61 @@ fn verify_fails_when_a_header_copy_is_tampered() {
     let dir = tempfile::tempdir().unwrap();
     let vault = dir.path().join("v.ngv");
     let v = s(&vault);
-    ok(&[&["create", v, "--size", "4M", "--quick", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
     ok(&["verify", v, "--password-stdin"], &format!("{PW}\n"));
-    // Corrupt the primary header's MAC area; the backup stays intact.
+    // Corrupt the primary header's password slot; the backup stays intact.
     let mut raw = std::fs::read(&vault).unwrap();
-    raw[64 + 4 + 152 + 5] ^= 0xFF;
+    raw[82 + 30] ^= 0xFF;
     std::fs::write(&vault, &raw).unwrap();
-    // Normal use still works (from the authentic backup), with a warning...
+    // Read-only use still works (from the backup), with a warning...
     let out = ng(&["ls", v, "--password-stdin"], &format!("{PW}\n"));
     assert!(out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("SECURITY"), "{stderr}");
-    assert_eq!(stderr.matches("FAILED its integrity check").count(), 1, "warnings printed more than once: {stderr}");
+    assert_eq!(stderr.matches("primary header copy does not match").count(), 1, "{stderr}");
     // ...but verify must fail.
     let err = fails(&["verify", v, "--password-stdin"], &format!("{PW}\n"));
     assert!(err.contains("verification FAILED"), "{err}");
+    assert_eq!(err.matches("primary header copy does not match").count(), 2, "warning plus BAD line: {err}");
+    // A writable command restores the primary, and the vault verifies again.
+    let out = ng(&["mkdir", v, "/x", "--password-stdin"], &format!("{PW}\n"));
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("restored"));
+    ok(&["verify", v, "--password-stdin"], &format!("{PW}\n"));
+}
+
+/// Settings that used to make weaker vaults no longer exist.
+#[test]
+fn removed_options_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    for extra in [
+        &["--cipher", "aes-256-gcm"][..],
+        &["--quick"],
+        &["--chunk-size", "4K"],
+        &["--kdf-memory", "64"],
+        &["--recipient", "x.pub"],
+    ] {
+        fails(&[&["create", v, "--size", "4M", "--password-stdin"][..], extra].concat(), &format!("{PW}\n"));
+        assert!(!vault.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn keyfiles_readable_by_others_are_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    let key = dir.path().join("k");
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    ok(&["keygen", s(&key)], "");
+    assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+    ok(&["add-keyfile", v, s(&key), "--password-stdin"], &format!("{PW}\n"));
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = fails(&["ls", v, "--keyfile", s(&key)], "");
+    assert!(err.contains("readable by other users"), "{err}");
 }
 
 #[cfg(unix)]
@@ -253,7 +301,7 @@ fn exported_directories_are_private() {
     let dir = tempfile::tempdir().unwrap();
     let vault = dir.path().join("v.ngv");
     let v = s(&vault);
-    ok(&[&["create", v, "--size", "4M", "--quick", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
     ok(&["mkdir", v, "/secret-folder-name", "--password-stdin"], &format!("{PW}\n"));
     let out = dir.path().join("out");
     ok(&["get", v, "/secret-folder-name", s(&out), "--password-stdin"], &format!("{PW}\n"));

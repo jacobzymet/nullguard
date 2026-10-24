@@ -8,10 +8,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use zeroize::Zeroizing;
 
-use crate::crypto::{Argon2Params, CipherSuite, HybridPublicKey, HybridSecretKey};
+use crate::crypto::{Argon2Params, Keyfile};
 use crate::mount::{self, MountOptions};
 use crate::vault::fs::{Fs, Kind, Timestamp};
-use crate::vault::header::{KeySlot, chunk_stride};
 use crate::vault::{self, CreateOptions, Credential, Vault};
 
 /// Minimum length (in characters) for new vault passwords.
@@ -35,21 +34,8 @@ enum Command {
         /// Vault size, e.g. 500M, 10G, 1T.
         #[arg(long, short)]
         size: String,
-        /// Data cipher: xchacha20-poly1305 (default) or aes-256-gcm.
-        #[arg(long, default_value = "xchacha20-poly1305")]
-        cipher: String,
         #[command(flatten)]
         kdf: KdfArgs,
-        /// Chunk size, a power of two from 4K to 1M (default: picked from the vault size).
-        #[arg(long)]
-        chunk_size: Option<String>,
-        /// Skip filling the vault with random data. Faster, but reveals how
-        /// much of the vault is used.
-        #[arg(long)]
-        quick: bool,
-        /// Also allow this public key's keyfile to unlock the vault (repeatable).
-        #[arg(long = "recipient", value_name = "PUBKEY_FILE")]
-        recipients: Vec<PathBuf>,
         /// Read the password from standard input instead of the terminal.
         #[arg(long)]
         password_stdin: bool,
@@ -70,7 +56,7 @@ enum Command {
     },
     /// Unmount (lock) a mounted vault.
     Unmount { mountpoint: PathBuf },
-    /// Change the vault password (replaces all password slots).
+    /// Change the vault password. Keyfiles keep working.
     ChangePassword {
         vault: PathBuf,
         #[command(flatten)]
@@ -78,29 +64,30 @@ enum Command {
         #[command(flatten)]
         kdf: KdfArgs,
     },
-    /// Generate a post-quantum hybrid keyfile (ML-KEM-1024 + X25519).
+    /// Generate a new keyfile (a random 256-bit key).
     Keygen {
-        /// Where to write the secret keyfile; the public key goes to <FILE>.pub.
+        /// Where to write the keyfile (must not exist).
         out: PathBuf,
-        /// Store the keyfile unencrypted (not recommended).
-        #[arg(long)]
-        no_passphrase: bool,
-        /// Read the passphrase from standard input.
-        #[arg(long)]
-        password_stdin: bool,
     },
-    /// Let another keyfile unlock this vault (share it, or add your own keyfile).
-    AddRecipient {
+    /// Let a keyfile unlock this vault.
+    AddKeyfile {
         vault: PathBuf,
-        /// Public key file (from `nullguard keygen`).
-        pubkey: PathBuf,
+        /// The keyfile to add (from `nullguard keygen`).
+        #[arg(value_name = "NEW_KEYFILE")]
+        new_keyfile: PathBuf,
         #[command(flatten)]
         unlock: UnlockArgs,
     },
-    /// Revoke a recipient's key slot, by fingerprint (see `info`).
-    RemoveRecipient {
+    /// Stop a keyfile from unlocking this vault (or, with --all, every keyfile).
+    #[command(group(clap::ArgGroup::new("which").required(true).args(["target", "all"])))]
+    RemoveKeyfile {
         vault: PathBuf,
-        fingerprint: String,
+        /// The keyfile to remove.
+        #[arg(value_name = "KEYFILE")]
+        target: Option<PathBuf>,
+        /// Remove every keyfile, e.g. after losing one (then add back the ones you still have).
+        #[arg(long)]
+        all: bool,
         #[command(flatten)]
         unlock: UnlockArgs,
     },
@@ -171,28 +158,21 @@ struct UnlockArgs {
     password_stdin: bool,
 }
 
+/// The password's key derivation: one strong default, one setting for
+/// machines that can't spare the memory. No other knobs, so there is no way
+/// to pick weak parameters.
 #[derive(Args, Clone)]
 struct KdfArgs {
-    /// Argon2id memory cost in MiB (minimum 64).
-    #[arg(long, default_value_t = Argon2Params::DEFAULT.memory_kib / 1024)]
-    kdf_memory: u32,
-    /// Argon2id passes (minimum 2).
-    #[arg(long, default_value_t = Argon2Params::DEFAULT.iterations)]
-    kdf_iterations: u32,
-    /// Argon2id lanes.
-    #[arg(long, default_value_t = Argon2Params::DEFAULT.parallelism)]
-    kdf_parallelism: u32,
+    /// Use 64 MiB for the password's key derivation instead of 1 GiB, for
+    /// machines with little memory. Cheaper to unlock, but also cheaper for
+    /// an attacker to guess.
+    #[arg(long)]
+    low_memory: bool,
 }
 
 impl KdfArgs {
-    fn params(&self) -> Result<Argon2Params> {
-        let p = Argon2Params {
-            memory_kib: self.kdf_memory.checked_mul(1024).ok_or_else(|| anyhow!("--kdf-memory is too large"))?,
-            iterations: self.kdf_iterations,
-            parallelism: self.kdf_parallelism,
-        };
-        p.validate_for_new_slot()?;
-        Ok(p)
+    fn params(&self) -> Argon2Params {
+        if self.low_memory { Argon2Params::LOW_MEMORY } else { Argon2Params::DEFAULT }
     }
 }
 
@@ -281,48 +261,34 @@ fn read_secret_line_from_stdin() -> Result<Zeroizing<String>> {
     }
 }
 
-/// Largest keyfile accepted (real ones are well under 1 KiB).
-const MAX_KEYFILE_BYTES: u64 = 64 * 1024;
+/// Largest keyfile accepted (real ones are under 200 bytes).
+const MAX_KEYFILE_BYTES: u64 = 4096;
 
-/// Read a keyfile into one pre-sized, wiped-on-drop buffer, refusing
-/// anything implausibly large.
-fn read_keyfile(path: &Path) -> Result<Zeroizing<String>> {
-    let file = std::fs::File::open(path).with_context(|| format!("reading keyfile {}", path.display()))?;
-    let len = file.metadata()?.len();
-    if len > MAX_KEYFILE_BYTES {
-        bail!("{} is too large to be a nullguard keyfile", path.display());
-    }
-    let mut text = Zeroizing::new(String::with_capacity(len as usize + 1));
-    file.take(MAX_KEYFILE_BYTES + 1)
-        .read_to_string(&mut text)
-        .with_context(|| format!("reading keyfile {}", path.display()))?;
+/// Read and parse a keyfile: refuse one other users can read, and read it
+/// into one pre-sized, wiped-on-drop buffer.
+fn read_keyfile(path: &Path) -> Result<Keyfile> {
+    let what = || format!("reading keyfile {}", path.display());
+    let file = std::fs::File::open(path).with_context(what)?;
+    check_keyfile_permissions(path, &file)?;
+    let mut text = Zeroizing::new(String::with_capacity(MAX_KEYFILE_BYTES as usize + 1));
+    file.take(MAX_KEYFILE_BYTES + 1).read_to_string(&mut text).with_context(what)?;
     if text.len() as u64 > MAX_KEYFILE_BYTES {
         bail!("{} is too large to be a nullguard keyfile", path.display());
     }
-    Ok(text)
+    Keyfile::decode(&text).with_context(what)
 }
 
 /// Holds whichever secret unlocks the vault.
 enum Unlocker {
     Password(Zeroizing<String>),
-    Keyfile(HybridSecretKey),
+    Keyfile(Keyfile),
 }
 
 impl Unlocker {
     fn from_args(args: &UnlockArgs, p: &Prompter) -> Result<Self> {
         match &args.keyfile {
             None => Ok(Self::Password(p.read("Vault password: ")?)),
-            Some(path) => {
-                let text = read_keyfile(path)?;
-                check_keyfile_permissions(path, HybridSecretKey::keyfile_is_encrypted(&text))?;
-                let pass = if HybridSecretKey::keyfile_is_encrypted(&text) {
-                    Some(p.read("Keyfile passphrase: ")?)
-                } else {
-                    None
-                };
-                let key = HybridSecretKey::from_keyfile(&text, pass.as_ref().map(|s| s.as_bytes()))?;
-                Ok(Self::Keyfile(key))
-            }
+            Some(path) => Ok(Self::Keyfile(read_keyfile(path)?)),
         }
     }
 
@@ -352,27 +318,24 @@ fn warn_memory_lock() {
     }
 }
 
-/// Refuse (unencrypted) or warn about (encrypted) keyfiles that other users
-/// can read, like ssh does for private keys.
-fn check_keyfile_permissions(path: &Path, encrypted: bool) -> Result<()> {
+/// Refuse keyfiles that other users can read, like ssh does for private
+/// keys. (Checked on the open file, so it can't be swapped in between.)
+fn check_keyfile_permissions(path: &Path, file: &std::fs::File) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        let mode = file.metadata()?.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
-            let fix = format!("chmod 600 {}", path.display());
-            if !encrypted {
-                bail!(
-                    "keyfile {} is readable by other users (mode {mode:o}) and has no passphrase; \
-                     refusing to use it. Fix with: {fix}",
-                    path.display()
-                );
-            }
-            eprintln!("WARNING: keyfile {} is readable by other users (mode {mode:o}). Fix with: {fix}", path.display());
+            bail!(
+                "keyfile {} is readable by other users (mode {mode:o}); refusing to use it. \
+                 Fix with: chmod 600 {}",
+                path.display(),
+                path.display()
+            );
         }
     }
     #[cfg(not(unix))]
-    let _ = (path, encrypted);
+    let _ = (path, file);
     Ok(())
 }
 
@@ -451,24 +414,9 @@ pub fn run() -> Result<()> {
     crate::platform::harden_process();
     let cli = Cli::parse();
     match cli.command {
-        Command::Create { vault, size, cipher, kdf, chunk_size, quick, recipients, password_stdin } => {
+        Command::Create { vault, size, kdf, password_stdin } => {
             let size = parse_size(&size)?;
-            let cipher = CipherSuite::from_name(&cipher).ok_or_else(|| anyhow!("unknown cipher {cipher:?}"))?;
-            let chunk_size = match chunk_size {
-                Some(s) => Some(u32::try_from(parse_size(&s)?).map_err(|_| anyhow!("chunk size too large"))?),
-                None => None,
-            };
-            let recipients = recipients
-                .iter()
-                .map(|p| {
-                    let t = std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
-                    HybridPublicKey::decode(&t).with_context(|| format!("parsing public key {}", p.display()))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let opts = CreateOptions { size, cipher, kdf: kdf.params()?, chunk_size, fill_random: !quick, recipients };
-            if quick {
-                eprintln!("WARNING: --quick skips random fill; an observer can tell how much of the vault is used.");
-            }
+            let opts = CreateOptions { size, kdf: kdf.params(), chunk_size: None, fill_random: true };
             let pw = Prompter { stdin: password_stdin }.new_password("vault password")?;
             eprintln!("Creating vault (deriving key, {} MiB of memory)...", opts.kdf.memory_kib / 1024);
             let mut last = 0;
@@ -485,10 +433,9 @@ pub fn run() -> Result<()> {
             .with_context(|| format!("creating {}", vault.display()))?;
             let h = Vault::peek_header(&vault)?;
             println!(
-                "Created {} ({} usable, {}, {} chunks).",
+                "Created {} ({} usable, {} chunks).",
                 vault.display(),
                 human(h.chunk_count * h.chunk_size as u64),
-                h.cipher.name(),
                 human(h.chunk_size as u64)
             );
         }
@@ -538,7 +485,7 @@ pub fn run() -> Result<()> {
         }
 
         Command::ChangePassword { vault, unlock: u, kdf } => {
-            let params = kdf.params()?;
+            let params = kdf.params();
             let (mut v, p, old) = unlock(&vault, &u, false)?;
             let pw = p.new_password("vault password")?;
             if let Unlocker::Password(old) = &old
@@ -556,72 +503,61 @@ pub fn run() -> Result<()> {
             );
         }
 
-        Command::Keygen { out, no_passphrase, password_stdin } => {
-            let pub_path = PathBuf::from(format!("{}.pub", out.display()));
-            if out.exists() || pub_path.exists() {
-                bail!("{} or {} already exists; refusing to overwrite", out.display(), pub_path.display());
-            }
-            let sk = HybridSecretKey::generate()?;
-            let text = if no_passphrase {
-                eprintln!("WARNING: the keyfile will be stored unencrypted. Anyone who copies it can unlock your vaults.");
-                sk.to_keyfile(None)?
-            } else {
-                let p = Prompter { stdin: password_stdin };
-                let pass = p.new_password("keyfile passphrase")?;
-                eprintln!("Encrypting keyfile...");
-                sk.to_keyfile(Some((pass.as_bytes(), Argon2Params::DEFAULT)))?
-            };
+        Command::Keygen { out } => {
+            let key = Keyfile::generate()?;
             create_private(&out, false)
-                .and_then(|mut f| f.write_all(text.as_bytes()).and_then(|_| f.sync_all()))
-                .with_context(|| format!("writing {}", out.display()))?;
-            let pk = sk.public_key();
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&pub_path)
-                .and_then(|mut f| f.write_all(pk.encode().as_bytes()))
-                .with_context(|| format!("writing {}", pub_path.display()))?;
-            println!("Secret keyfile: {} (keep it secret, keep a backup)", out.display());
-            println!("Public key:     {}", pub_path.display());
-            println!("Fingerprint:    {}", pk.fingerprint_hex());
+                .and_then(|mut f| f.write_all(key.encode().as_bytes()).and_then(|_| f.sync_all()))
+                .with_context(|| format!("writing {} (it must not exist yet)", out.display()))?;
+            println!("Keyfile: {}", out.display());
+            eprintln!(
+                "Anyone with this file can unlock every vault you add it to: keep it secret, and keep a backup.\n\
+                 Add it to a vault with: nullguard add-keyfile <vault> {}",
+                out.display()
+            );
         }
 
-        Command::AddRecipient { vault, pubkey, unlock: u } => {
-            let text = std::fs::read_to_string(&pubkey).with_context(|| format!("reading {}", pubkey.display()))?;
-            let pk = HybridPublicKey::decode(&text)?;
+        Command::AddKeyfile { vault, new_keyfile, unlock: u } => {
+            let key = read_keyfile(&new_keyfile)?;
             let (mut v, _, _) = unlock(&vault, &u, false)?;
-            v.add_recipient(&pk)?;
-            println!("Added recipient {}.", pk.fingerprint_hex());
+            v.add_keyfile(&key)?;
+            println!("Added keyfile {}.", new_keyfile.display());
         }
 
-        Command::RemoveRecipient { vault, fingerprint, unlock: u } => {
+        Command::RemoveKeyfile { vault, target, all, unlock: u } => {
+            let key = target.as_deref().map(read_keyfile).transpose()?;
             let (mut v, _, _) = unlock(&vault, &u, false)?;
-            let fp = v.remove_recipient(&fingerprint)?;
-            println!("Removed recipient {fp}.");
+            match key {
+                Some(key) => {
+                    v.remove_keyfile(&key)?;
+                    println!("Removed the keyfile.");
+                }
+                None => {
+                    debug_assert!(all);
+                    let n = v.remove_all_keyfiles()?;
+                    println!("Removed {n} keyfile(s). The password still unlocks the vault.");
+                }
+            }
+            eprintln!(
+                "Note: the master key is unchanged. Anyone who already unlocked the vault, or kept an \
+                 older copy of the vault file, can still read what that copy holds. For full revocation, \
+                 copy your files into a new vault."
+            );
         }
 
         Command::Info { vault } => {
             let h = Vault::peek_header(&vault)?;
             println!("nullguard vault (format version {})", vault::header::FORMAT_VERSION);
-            println!("  cipher:      {}", h.cipher.name());
+            println!("  cipher:      {}", crate::crypto::aead::CIPHER_NAME);
             println!("  chunk size:  {}", human(h.chunk_size as u64));
             println!("  capacity:    {} ({} chunks)", human(h.chunk_count * h.chunk_size as u64), h.chunk_count);
-            println!("  file size:   {}", human(h.data_offset + h.chunk_count * chunk_stride(h.chunk_size)));
-            println!("  key slots:");
-            for (i, s) in h.slots.iter().enumerate() {
-                match s {
-                    KeySlot::Password(p) => println!(
-                        "    [{i}] password  argon2id m={} MiB t={} p={}",
-                        p.kdf.memory_kib / 1024,
-                        p.kdf.iterations,
-                        p.kdf.parallelism
-                    ),
-                    KeySlot::Recipient(r) => println!(
-                        "    [{i}] keyfile   ml-kem-1024+x25519 fingerprint {}",
-                        crate::crypto::hybrid::hex(&r.fingerprint)
-                    ),
-                }
-            }
+            println!("  file size:   {}", human(h.file_len()));
+            println!(
+                "  password:    argon2id m={} MiB t={} p={}",
+                h.kdf.memory_kib / 1024,
+                h.kdf.iterations,
+                h.kdf.parallelism
+            );
+            println!("  keyfiles:    {}", h.keyfiles.len());
             println!("(Header values are not authenticated until the vault is unlocked.)");
         }
 

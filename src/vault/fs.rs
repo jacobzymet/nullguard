@@ -10,6 +10,12 @@
 //!   holds its SHA-256. Since superblocks are authenticated chunks, this
 //!   gives an authentication chain superblock -> metadata -> every block.
 //!   A stale copy of any block is detected (its nonce differs).
+//! * Every superblock also records the SHA-256 of the **vault header** it
+//!   was committed under, and the filesystem only opens with exactly that
+//!   header. That puts the header on the same chain: an old header put back
+//!   (to revive a removed keyfile or an old password) is refused. A header
+//!   change commits twice, so both superblock slots name the new header
+//!   and falling back to the older slot can't revive the old one either.
 //! * Data is **copy-on-write**: a modified block is always written to a
 //!   free chunk, and chunks a commit stops referencing are only reused after
 //!   the next commit is durable. A crash (or yanked USB stick) leaves the
@@ -35,10 +41,9 @@ pub const MAX_NAME_LEN: usize = 255;
 pub const MAX_SYMLINK_LEN: usize = 4095;
 
 const SUPERBLOCK_SLOTS: u64 = 2;
-const SUPER_MAGIC: &[u8; 8] = b"NGSUPER1";
-const META_MAGIC: &[u8; 8] = b"NGMETA01";
-const FS_VERSION: u32 = 1;
-const SUPER_FIXED_LEN: usize = 8 + 4 + 4 + 8 + 8 + 8 + 32 + 4;
+const SUPER_MAGIC: &[u8; 8] = b"NGSUPER2";
+const META_MAGIC: &[u8; 8] = b"NGMETA02";
+const SUPER_FIXED_LEN: usize = 8 + 8 + 32 + 8 + 32 + 4;
 const EXTENT_LEN: usize = 12;
 
 const CACHE_CAPACITY: usize = 256;
@@ -188,8 +193,8 @@ pub struct VerifyReport {
 
 struct Superblock {
     generation: u64,
-    /// Generation of the vault header in use when this commit was made.
-    header_generation: u64,
+    /// SHA-256 of the vault header this commit was made under.
+    header_hash: [u8; 32],
     meta_len: u64,
     meta_hash: [u8; 32],
     meta_chunks: Vec<u64>,
@@ -307,8 +312,8 @@ pub struct Fs {
     inodes: HashMap<u64, Inode>,
     next_ino: u64,
     generation: u64,
-    /// Generation of the unlocked vault header, recorded in every commit.
-    header_generation: u64,
+    /// SHA-256 of the vault header in use, recorded in every commit.
+    header_hash: [u8; 32],
     bitmap: Bitmap,
     meta_chunks: Vec<u64>,
     /// Chunks the last commit references but the live state no longer
@@ -338,8 +343,8 @@ pub struct Fs {
 impl Fs {
     /// Create an empty filesystem (root directory only) and commit it to
     /// both superblock slots.
-    pub fn format(store: ChunkStore, uid: u32, gid: u32, header_generation: u64) -> Result<Self, Error> {
-        let mut fs = Self::empty(store, header_generation)?;
+    pub fn format(store: ChunkStore, uid: u32, gid: u32, header_hash: [u8; 32]) -> Result<Self, Error> {
+        let mut fs = Self::empty(store, header_hash)?;
         let now = Timestamp::now();
         fs.inodes.insert(
             ROOT_INO,
@@ -360,7 +365,7 @@ impl Fs {
         Ok(fs)
     }
 
-    fn empty(store: ChunkStore, header_generation: u64) -> Result<Self, Error> {
+    fn empty(store: ChunkStore, header_hash: [u8; 32]) -> Result<Self, Error> {
         let mut bitmap = Bitmap::try_new(store.chunk_count())?;
         for i in 0..SUPERBLOCK_SLOTS {
             bitmap.set(i);
@@ -371,7 +376,7 @@ impl Fs {
             inodes: HashMap::new(),
             next_ino: ROOT_INO + 1,
             generation: 0,
-            header_generation,
+            header_hash,
             bitmap,
             meta_chunks: Vec::new(),
             pending_free: Vec::new(),
@@ -390,15 +395,15 @@ impl Fs {
 
     /// Open the filesystem from the newest valid superblock.
     ///
-    /// `header_generation` is the generation of the vault header that was
-    /// just unlocked. If the filesystem was last committed under a *newer*
-    /// header, this header is an old one put back (for example to undo a
-    /// password change or a recipient's removal) and opening is refused.
-    pub fn open(store: ChunkStore, header_generation: u64) -> Result<Self, Error> {
-        let mut fs = Self::empty(store, header_generation)?;
+    /// `header_hash` is the hash of the vault header that was just
+    /// unlocked. The filesystem opens only if the superblock it loads was
+    /// committed under exactly that header, so an old or modified header
+    /// is refused ([`Error::StaleHeader`]).
+    pub fn open(store: ChunkStore, header_hash: [u8; 32]) -> Result<Self, Error> {
+        let mut fs = Self::empty(store, header_hash)?;
         let mut supers = Vec::new();
         for slot in 0..SUPERBLOCK_SLOTS {
-            match fs.read_superblock(slot) {
+            match read_superblock(&fs.store, slot) {
                 Ok(sb) => supers.push(sb),
                 Err(e) => fs.warnings.push(format!(
                     "superblock {slot} is unreadable ({e}). This means damage or tampering; \
@@ -409,10 +414,10 @@ impl Fs {
         supers.sort_by_key(|s| std::cmp::Reverse(s.generation));
         let mut last_err = None;
         for (i, sb) in supers.iter().enumerate() {
-            if sb.header_generation > header_generation {
-                // Don't fall back to an older superblock: that would help
-                // the rollback succeed.
-                return Err(Error::HeaderRollback { header: header_generation, recorded: sb.header_generation });
+            if !ct_eq(&sb.header_hash, &header_hash) {
+                // Don't fall back to an older superblock: that could help
+                // an old header back into use.
+                return Err(Error::StaleHeader);
             }
             match fs.load_metadata(sb) {
                 Ok(()) => {
@@ -429,38 +434,6 @@ impl Fs {
             }
         }
         Err(last_err.unwrap_or_else(|| Error::Corrupt("no valid superblock: the vault is damaged or was tampered with".into())))
-    }
-
-    fn read_superblock(&mut self, slot: u64) -> Result<Superblock, Error> {
-        let mut buf = Zeroizing::new(vec![0u8; self.chunk_size as usize]);
-        self.store.read(slot, None, &mut buf)?;
-        let mut r = Reader::new(&buf);
-        let bad = |_| Error::Corrupt("malformed superblock".into());
-        if r.take(8).map_err(bad)? != SUPER_MAGIC || r.u32().map_err(bad)? != FS_VERSION || r.u32().map_err(bad)? != 0 {
-            return Err(Error::Corrupt("unknown superblock format".into()));
-        }
-        let generation = r.u64().map_err(bad)?;
-        let header_generation = r.u64().map_err(bad)?;
-        let meta_len = r.u64().map_err(bad)?;
-        let meta_hash = r.array::<32>().map_err(bad)?;
-        let n = r.u32().map_err(bad)? as u64;
-        let mut meta_chunks = Vec::new();
-        for _ in 0..n {
-            let start = r.u64().map_err(bad)?;
-            let len = r.u32().map_err(bad)? as u64;
-            let end = start.checked_add(len).filter(|&e| e <= self.store.chunk_count() && start >= SUPERBLOCK_SLOTS);
-            if len == 0 || end.is_none() || meta_chunks.len() as u64 + len > self.store.chunk_count() {
-                return Err(Error::Corrupt("superblock extent out of range".into()));
-            }
-            meta_chunks.extend(start..start + len);
-        }
-        if (meta_chunks.len() as u64) != meta_len.div_ceil(self.chunk_size).max(1) {
-            return Err(Error::Corrupt("superblock extent length mismatch".into()));
-        }
-        if r.rest().iter().any(|&b| b != 0) {
-            return Err(Error::Corrupt("superblock padding is not zero".into()));
-        }
-        Ok(Superblock { generation, header_generation, meta_len, meta_hash, meta_chunks })
     }
 
     fn load_metadata(&mut self, sb: &Superblock) -> Result<(), Error> {
@@ -539,13 +512,17 @@ impl Fs {
         Ok(())
     }
 
-    /// Commit if dirty.
-    /// Commit now, even with no file changes, so the superblock records the
-    /// current header generation (called right after a header change).
-    pub fn commit_header_change(&mut self) -> Result<(), Error> {
+    /// Make `header_hash` the vault's header: commit it to *both*
+    /// superblock slots. After the first commit the new header is in effect;
+    /// after the second, no superblock names the old header any more, so
+    /// destroying the newest superblock can't bring the old header back.
+    pub fn commit_header_change(&mut self, header_hash: [u8; 32]) -> Result<(), Error> {
+        self.header_hash = header_hash;
+        self.commit_now()?;
         self.commit_now()
     }
 
+    /// Commit if dirty.
     pub fn commit(&mut self) -> Result<(), Error> {
         if self.dirty { self.commit_now() } else { Ok(()) }
     }
@@ -577,10 +554,8 @@ impl Fs {
             }
             let mut sb = Zeroizing::new(Vec::with_capacity(cs));
             sb.extend_from_slice(SUPER_MAGIC);
-            sb.extend_from_slice(&FS_VERSION.to_le_bytes());
-            sb.extend_from_slice(&0u32.to_le_bytes());
             sb.extend_from_slice(&(self.generation + 1).to_le_bytes());
-            sb.extend_from_slice(&self.header_generation.to_le_bytes());
+            sb.extend_from_slice(&self.header_hash);
             sb.extend_from_slice(&(blob.len() as u64).to_le_bytes());
             sb.extend_from_slice(&Sha256::digest(blob.as_slice()));
             sb.extend_from_slice(&(extents.len() as u32).to_le_bytes());
@@ -1300,6 +1275,50 @@ impl Drop for Fs {
             }
         }
     }
+}
+
+/// The hash of the vault header that the newest readable superblock was
+/// committed under: the vault's current header. `None` if no superblock
+/// decrypts (wrong key, or the vault is destroyed).
+pub(crate) fn current_header_hash(store: &ChunkStore) -> Option<[u8; 32]> {
+    (0..SUPERBLOCK_SLOTS)
+        .filter_map(|slot| read_superblock(store, slot).ok())
+        .max_by_key(|sb| sb.generation)
+        .map(|sb| sb.header_hash)
+}
+
+fn read_superblock(store: &ChunkStore, slot: u64) -> Result<Superblock, Error> {
+    let chunk_size = store.chunk_size() as u64;
+    let chunk_count = store.chunk_count();
+    let mut buf = Zeroizing::new(vec![0u8; chunk_size as usize]);
+    store.read(slot, None, &mut buf)?;
+    let mut r = Reader::new(&buf);
+    let bad = |_| Error::Corrupt("malformed superblock".into());
+    if r.take(8).map_err(bad)? != SUPER_MAGIC {
+        return Err(Error::Corrupt("unknown superblock format".into()));
+    }
+    let generation = r.u64().map_err(bad)?;
+    let header_hash = r.array::<32>().map_err(bad)?;
+    let meta_len = r.u64().map_err(bad)?;
+    let meta_hash = r.array::<32>().map_err(bad)?;
+    let n = r.u32().map_err(bad)? as u64;
+    let mut meta_chunks = Vec::new();
+    for _ in 0..n {
+        let start = r.u64().map_err(bad)?;
+        let len = r.u32().map_err(bad)? as u64;
+        let end = start.checked_add(len).filter(|&e| e <= chunk_count && start >= SUPERBLOCK_SLOTS);
+        if len == 0 || end.is_none() || meta_chunks.len() as u64 + len > chunk_count {
+            return Err(Error::Corrupt("superblock extent out of range".into()));
+        }
+        meta_chunks.extend(start..start + len);
+    }
+    if (meta_chunks.len() as u64) != meta_len.div_ceil(chunk_size).max(1) {
+        return Err(Error::Corrupt("superblock extent length mismatch".into()));
+    }
+    if r.rest().iter().any(|&b| b != 0) {
+        return Err(Error::Corrupt("superblock padding is not zero".into()));
+    }
+    Ok(Superblock { generation, header_hash, meta_len, meta_hash, meta_chunks })
 }
 
 fn validate_name(name: &[u8]) -> Result<(), Error> {

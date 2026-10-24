@@ -1,7 +1,7 @@
 //! The encrypted chunk store: the vault's data area as an array of
 //! fixed-size, individually authenticated chunks.
 //!
-//! On disk, chunk `i` lives at `data_offset + i * (chunk_size + 40)`:
+//! On disk, chunk `i` lives at `8192 + i * (chunk_size + 40)`:
 //!
 //! ```text
 //! nonce (24) || ciphertext (chunk_size) || tag (16)
@@ -9,10 +9,10 @@
 //!
 //! Every write uses a fresh random 192-bit nonce. The associated data binds
 //! each chunk to its vault and its position, so a chunk can't be moved,
-//! copied into another vault, or reinterpreted under another cipher:
+//! copied into another vault, or read with another chunk size:
 //!
 //! ```text
-//! aad = "NGCHUNK1" || vault_id (16) || cipher id (u16) || chunk_size (u32) || index (u64)
+//! aad = "NGCHUNK2" || vault_id (16) || chunk_size (u32) || index (u64)
 //! ```
 //!
 //! Callers that know which nonce a chunk *should* have (the filesystem
@@ -25,10 +25,10 @@ use std::io;
 use crate::crypto::{Aead, NONCE_LEN, TAG_LEN, ct_eq};
 
 use super::Error;
-use super::header::{Header, VAULT_ID_LEN, chunk_stride};
+use super::header::{DATA_OFFSET, Header, VAULT_ID_LEN, chunk_stride};
 
-const AAD_LABEL: &[u8; 8] = b"NGCHUNK1";
-const AAD_LEN: usize = 8 + VAULT_ID_LEN + 2 + 4 + 8;
+const AAD_LABEL: &[u8; 8] = b"NGCHUNK2";
+const AAD_LEN: usize = 8 + VAULT_ID_LEN + 4 + 8;
 
 pub struct ChunkStore {
     file: File,
@@ -36,7 +36,6 @@ pub struct ChunkStore {
     vault_id: [u8; VAULT_ID_LEN],
     chunk_size: u32,
     chunk_count: u64,
-    data_offset: u64,
     read_only: bool,
 }
 
@@ -48,7 +47,6 @@ impl ChunkStore {
             vault_id: header.vault_id,
             chunk_size: header.chunk_size,
             chunk_count: header.chunk_count,
-            data_offset: header.data_offset,
             read_only,
         }
     }
@@ -69,9 +67,8 @@ impl ChunkStore {
         let mut a = [0u8; AAD_LEN];
         a[..8].copy_from_slice(AAD_LABEL);
         a[8..24].copy_from_slice(&self.vault_id);
-        a[24..26].copy_from_slice(&self.aead.suite().id().to_le_bytes());
-        a[26..30].copy_from_slice(&self.chunk_size.to_le_bytes());
-        a[30..38].copy_from_slice(&index.to_le_bytes());
+        a[24..28].copy_from_slice(&self.chunk_size.to_le_bytes());
+        a[28..36].copy_from_slice(&index.to_le_bytes());
         a
     }
 
@@ -79,7 +76,7 @@ impl ChunkStore {
         if index >= self.chunk_count {
             return Err(Error::Corrupt(format!("chunk index {index} out of range")));
         }
-        Ok(self.data_offset + index * chunk_stride(self.chunk_size))
+        Ok(DATA_OFFSET + index * chunk_stride(self.chunk_size))
     }
 
     /// Read and decrypt chunk `index` into `out` (exactly `chunk_size` bytes).

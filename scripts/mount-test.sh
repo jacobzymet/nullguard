@@ -7,7 +7,7 @@ set -euo pipefail
 NG=$(realpath "${1:?usage: $0 path/to/nullguard}")
 WORK=$(mktemp -d)
 PW="correct horse battery staple"
-KDF=(--kdf-memory 64 --kdf-iterations 2 --kdf-parallelism 1)
+KDF=(--low-memory)
 cd "$WORK"
 cleanup() { fusermount3 -u "$WORK/mnt" 2>/dev/null || true; rm -rf "$WORK"; }
 trap cleanup EXIT
@@ -111,7 +111,7 @@ if [ "$(id -u)" = 0 ] && command -v useradd >/dev/null && command -v su >/dev/nu
   # /home/runner on CI), so give it its own copy of the binary.
   cp "$NG" "$WORK/ng" && chmod 755 "$WORK/ng"
   UNG="$WORK/ng"
-  printf '%s\n' "$PW" | "$NG" create other.ngv --size 16M --quick --password-stdin "${KDF[@]}"
+  printf '%s\n' "$PW" | "$NG" create other.ngv --size 16M --password-stdin "${KDF[@]}"
   echo "written by root" > rootfile.txt
   printf '%s\n' "$PW" | "$NG" put other.ngv rootfile.txt / --password-stdin
   [ "$(stat -c %a other.ngv)" = 600 ]   # vault files are private
@@ -132,11 +132,11 @@ if [ "$(id -u)" = 0 ] && command -v useradd >/dev/null && command -v su >/dev/nu
 fi
 
 echo "== tampering is detected"
-python3 - <<'PY' || perl -e 'open F,"+<","v.ngv"; for($o=128*1024+2*(16424);$o<-s "v.ngv";$o+=4096){seek F,$o,0;read F,$b,1;seek F,$o,0;print F chr(ord($b)^1)}'
+python3 - <<'PY' || perl -e 'open F,"+<","v.ngv"; for($o=8192+2*(16424);$o<-s "v.ngv";$o+=4096){seek F,$o,0;read F,$b,1;seek F,$o,0;print F chr(ord($b)^1)}'
 import os
 size = os.path.getsize("v.ngv")
 with open("v.ngv", "r+b") as f:
-    for off in range(128 * 1024 + 2 * (16 * 1024 + 40), size, 4096):
+    for off in range(8192 + 2 * (16 * 1024 + 40), size, 4096):
         f.seek(off); b = f.read(1); f.seek(off); f.write(bytes([b[0] ^ 1]))
 PY
 if printf '%s\n' "$PW" | "$NG" verify v.ngv --password-stdin; then echo "TAMPERING NOT DETECTED"; exit 1; fi

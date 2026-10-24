@@ -27,6 +27,11 @@ impl Argon2Params {
     /// rare, and each guess an attacker makes costs 1 GiB of memory-hard work.
     pub const DEFAULT: Self = Self { memory_kib: 1024 * 1024, iterations: 4, parallelism: 4 };
 
+    /// For machines that can't spare 1 GiB (`--low-memory`): RFC 9106's
+    /// recommended setting for memory-constrained environments, 64 MiB,
+    /// 3 passes, 4 lanes.
+    pub const LOW_MEMORY: Self = Self { memory_kib: 64 * 1024, iterations: 3, parallelism: 4 };
+
     /// Lowest memory cost `create` and `change-password` accept (64 MiB).
     pub const MIN_CREATE_MEMORY_KIB: u32 = 64 * 1024;
     /// Lowest pass count `create` and `change-password` accept.
@@ -194,5 +199,6 @@ mod tests {
         assert!(TEST_PARAMS.validate().is_ok());
         assert!(TEST_PARAMS.validate_for_new_slot().is_err());
         assert!(Argon2Params::DEFAULT.validate_for_new_slot().is_ok());
+        assert!(Argon2Params::LOW_MEMORY.validate_for_new_slot().is_ok());
     }
 }
