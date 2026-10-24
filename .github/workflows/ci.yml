@@ -26,7 +26,7 @@ jobs:
             features: "--features macos-no-mount"
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -38,19 +38,22 @@ jobs:
   mount-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y fuse3
       - run: cargo build --release --locked
-      - run: ./scripts/mount-test.sh target/release/nullguard
+      - name: Mount test (as a normal user)
+        run: ./scripts/mount-test.sh target/release/nullguard
+      - name: Mount test (as root, adds cross-user ownership and isolation checks)
+        run: sudo ./scripts/mount-test.sh target/release/nullguard
 
   # Known-vulnerable or yanked dependencies fail the build.
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -67,7 +70,7 @@ jobs:
           - { os: macos-latest, target: aarch64-apple-darwin }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -83,9 +86,11 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           for f in nullguard nullguard.exe; do
-            [ -f "$f" ] && (shasum -a 256 "$f" > "$f.sha256" || sha256sum "$f" > "$f.sha256")
+            if [ -f "$f" ]; then
+              if command -v sha256sum >/dev/null; then sha256sum "$f" > "$f.sha256"; else shasum -a 256 "$f" > "$f.sha256"; fi
+            fi
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: nullguard-${{ matrix.target }}
           path: |

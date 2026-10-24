@@ -15,8 +15,8 @@
 use crate::crypto::hybrid::{self, HybridCiphertext, HybridPublicKey, HybridSecretKey};
 use crate::crypto::kdf::{self, Argon2Params, SALT_LEN};
 use crate::crypto::{
-    Aead, CipherSuite, CryptoError, KEY_LEN, NONCE_LEN, SecretKey, TAG_LEN, derive_subkey, hmac_sha256,
-    hmac_sha256_verify, random,
+    Aead, COMMITMENT_LEN, CipherSuite, CryptoError, KEY_LEN, NONCE_LEN, SecretKey, TAG_LEN, derive_subkey,
+    hmac_sha256, hmac_sha256_verify, key_commitment, random, verify_key_commitment,
 };
 
 pub const MAGIC: [u8; 8] = *b"NULLGARD";
@@ -32,6 +32,10 @@ pub const DATA_OFFSET: u64 = 2 * HEADER_AREA;
 pub const VAULT_ID_LEN: usize = 16;
 pub const MAC_LEN: usize = 32;
 pub const MAX_SLOTS: usize = 32;
+/// At most this many password slots. Each costs a full Argon2id run on
+/// every unlock attempt, so a crafted vault with many expensive slots
+/// could otherwise stall unlocking for a very long time.
+pub const MAX_PASSWORD_SLOTS: usize = 4;
 
 pub const MIN_CHUNK_SIZE: u32 = 4 * 1024;
 pub const MAX_CHUNK_SIZE: u32 = 1024 * 1024;
@@ -51,9 +55,9 @@ const SLOT_RECIPIENT: u8 = 2;
 const KDF_ARGON2ID: u8 = 1;
 const KEM_MLKEM1024_X25519: u8 = 1;
 
-const PASSWORD_BODY_LEN: usize = 4 + 12 + SALT_LEN + NONCE_LEN + KEY_LEN + TAG_LEN;
-const RECIPIENT_BODY_LEN: usize =
-    4 + hybrid::FINGERPRINT_LEN + hybrid::CIPHERTEXT_LEN + NONCE_LEN + KEY_LEN + TAG_LEN;
+const WRAPPED_KEY_LEN: usize = NONCE_LEN + COMMITMENT_LEN + KEY_LEN + TAG_LEN;
+const PASSWORD_BODY_LEN: usize = 4 + 12 + SALT_LEN + WRAPPED_KEY_LEN;
+const RECIPIENT_BODY_LEN: usize = 4 + hybrid::FINGERPRINT_LEN + hybrid::CIPHERTEXT_LEN + WRAPPED_KEY_LEN;
 
 const LABEL_SLOT_AAD: &[u8] = b"nullguard/v1/keyslot";
 const LABEL_HEADER_MAC: &[u8] = b"nullguard/v1/header-mac";
@@ -78,22 +82,63 @@ pub enum KeySlot {
     Recipient(RecipientSlot),
 }
 
+/// The master key wrapped under a key-encryption key (KEK):
+/// `XChaCha20-Poly1305(KEK, nonce, master_key, aad)` plus a key commitment
+/// to the KEK (see [`crate::crypto::key_commitment`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrappedKey {
+    pub nonce: [u8; NONCE_LEN],
+    pub commitment: [u8; COMMITMENT_LEN],
+    pub ciphertext: [u8; KEY_LEN],
+    pub tag: [u8; TAG_LEN],
+}
+
+impl WrappedKey {
+    fn seal(kek: SecretKey, aad: &[u8], master: &SecretKey) -> Result<Self, CryptoError> {
+        let mut buf = zeroize::Zeroizing::new(*master.expose());
+        let nonce = random::array::<NONCE_LEN>()?;
+        let commitment = key_commitment(&kek, &nonce, aad);
+        let aead = Aead::new(CipherSuite::XChaCha20Poly1305, kek);
+        let tag = aead.seal_with_nonce(&nonce, aad, buf.as_mut_slice())?;
+        Ok(Self { nonce, commitment, ciphertext: *buf, tag })
+    }
+
+    /// Recover the master key. The commitment is checked first (in constant
+    /// time), so this succeeds under at most one KEK.
+    fn open(&self, kek: SecretKey, aad: &[u8]) -> Result<SecretKey, CryptoError> {
+        if !verify_key_commitment(&kek, &self.nonce, aad, &self.commitment) {
+            return Err(CryptoError::AuthFailed);
+        }
+        let aead = Aead::new(CipherSuite::XChaCha20Poly1305, kek);
+        let mut buf = zeroize::Zeroizing::new(self.ciphertext);
+        aead.open(&self.nonce, aad, buf.as_mut_slice(), &self.tag)?;
+        Ok(SecretKey::from_bytes(&mut buf))
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&self.commitment);
+        out.extend_from_slice(&self.ciphertext);
+        out.extend_from_slice(&self.tag);
+    }
+
+    fn parse(r: &mut Reader<'_>) -> Result<Self, HeaderError> {
+        Ok(Self { nonce: r.array()?, commitment: r.array()?, ciphertext: r.array()?, tag: r.array()? })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PasswordSlot {
     pub kdf: Argon2Params,
     pub salt: [u8; SALT_LEN],
-    pub nonce: [u8; NONCE_LEN],
-    pub wrapped: [u8; KEY_LEN],
-    pub tag: [u8; TAG_LEN],
+    pub key: WrappedKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipientSlot {
     pub fingerprint: [u8; hybrid::FINGERPRINT_LEN],
     pub kem: HybridCiphertext,
-    pub nonce: [u8; NONCE_LEN],
-    pub wrapped: [u8; KEY_LEN],
-    pub tag: [u8; TAG_LEN],
+    pub key: WrappedKey,
 }
 
 /// The parsed vault header.
@@ -244,6 +289,9 @@ impl Header {
                 _ => return Err(HeaderError::Malformed("unknown key slot type")),
             });
         }
+        if slots.iter().filter(|s| matches!(s, KeySlot::Password(_))).count() > MAX_PASSWORD_SLOTS {
+            return Err(HeaderError::Malformed("too many password slots"));
+        }
         let mac = r.array::<MAC_LEN>()?;
         if r.rest().iter().any(|&b| b != 0) {
             return Err(HeaderError::Malformed("header padding is not zero"));
@@ -285,16 +333,15 @@ impl Header {
         params: Argon2Params,
     ) -> Result<(), HeaderError> {
         self.check_slot_room()?;
+        if self.password_slot_count() >= MAX_PASSWORD_SLOTS {
+            return Err(HeaderError::Malformed("too many password slots"));
+        }
         params.validate()?;
         let salt = random::array::<SALT_LEN>()?;
         let kek = kdf::derive_key(password, &salt, &params)?;
-        let mut slot = PasswordSlot { kdf: params, salt, nonce: [0; NONCE_LEN], wrapped: [0; KEY_LEN], tag: [0; TAG_LEN] };
-        let aad = self.slot_aad(SLOT_PASSWORD, &slot.bound_fields());
-        let (nonce, tag, wrapped) = wrap(kek, &aad, master)?;
-        slot.nonce = nonce;
-        slot.tag = tag;
-        slot.wrapped = wrapped;
-        self.slots.push(KeySlot::Password(slot));
+        let aad = self.slot_aad(SLOT_PASSWORD, &PasswordSlot::bound_fields(&params, &salt));
+        let key = WrappedKey::seal(kek, &aad, master)?;
+        self.slots.push(KeySlot::Password(PasswordSlot { kdf: params, salt, key }));
         Ok(())
     }
 
@@ -306,14 +353,9 @@ impl Header {
             return Err(HeaderError::Malformed("that recipient already has a key slot"));
         }
         let (kem, kek) = hybrid::encapsulate(recipient)?;
-        let mut slot =
-            RecipientSlot { fingerprint, kem, nonce: [0; NONCE_LEN], wrapped: [0; KEY_LEN], tag: [0; TAG_LEN] };
-        let aad = self.slot_aad(SLOT_RECIPIENT, &slot.bound_fields());
-        let (nonce, tag, wrapped) = wrap(kek, &aad, master)?;
-        slot.nonce = nonce;
-        slot.tag = tag;
-        slot.wrapped = wrapped;
-        self.slots.push(KeySlot::Recipient(slot));
+        let aad = self.slot_aad(SLOT_RECIPIENT, &RecipientSlot::bound_fields(&fingerprint, &kem));
+        let key = WrappedKey::seal(kek, &aad, master)?;
+        self.slots.push(KeySlot::Recipient(RecipientSlot { fingerprint, kem, key }));
         Ok(())
     }
 
@@ -333,8 +375,8 @@ impl Header {
         for slot in &self.slots {
             if let KeySlot::Password(p) = slot {
                 let kek = kdf::derive_key(password, &p.salt, &p.kdf)?;
-                let aad = self.slot_aad(SLOT_PASSWORD, &p.bound_fields());
-                if let Ok(k) = unwrap(kek, &aad, &p.nonce, &p.wrapped, &p.tag) {
+                let aad = self.slot_aad(SLOT_PASSWORD, &PasswordSlot::bound_fields(&p.kdf, &p.salt));
+                if let Ok(k) = p.key.open(kek, &aad) {
                     found.get_or_insert(k);
                 }
             }
@@ -350,8 +392,8 @@ impl Header {
                 && r.fingerprint == fp
             {
                 let kek = hybrid::decapsulate(sk, &r.kem)?;
-                let aad = self.slot_aad(SLOT_RECIPIENT, &r.bound_fields());
-                if let Ok(k) = unwrap(kek, &aad, &r.nonce, &r.wrapped, &r.tag) {
+                let aad = self.slot_aad(SLOT_RECIPIENT, &RecipientSlot::bound_fields(&r.fingerprint, &r.kem));
+                if let Ok(k) = r.key.open(kek, &aad) {
                     return Ok(Some(k));
                 }
             }
@@ -364,46 +406,21 @@ impl Header {
     }
 }
 
-/// A wrapped key: (nonce, tag, ciphertext).
-type Wrapped = ([u8; NONCE_LEN], [u8; TAG_LEN], [u8; KEY_LEN]);
-
-fn wrap(kek: SecretKey, aad: &[u8], master: &SecretKey) -> Result<Wrapped, CryptoError> {
-    let aead = Aead::new(CipherSuite::XChaCha20Poly1305, kek);
-    let mut buf = zeroize::Zeroizing::new(*master.expose());
-    let (nonce, tag) = aead.seal(aad, buf.as_mut_slice())?;
-    Ok((nonce, tag, *buf))
-}
-
-fn unwrap(
-    kek: SecretKey,
-    aad: &[u8],
-    nonce: &[u8; NONCE_LEN],
-    wrapped: &[u8; KEY_LEN],
-    tag: &[u8; TAG_LEN],
-) -> Result<SecretKey, CryptoError> {
-    let aead = Aead::new(CipherSuite::XChaCha20Poly1305, kek);
-    let mut buf = zeroize::Zeroizing::new(*wrapped);
-    aead.open(nonce, aad, buf.as_mut_slice(), tag)?;
-    Ok(SecretKey::from_bytes(&mut buf))
-}
-
 impl PasswordSlot {
-    /// Fields bound into the wrap AAD (everything but nonce/wrapped/tag).
-    fn bound_fields(&self) -> Vec<u8> {
+    /// Fields bound into the wrap AAD (everything but the wrapped key).
+    fn bound_fields(kdf: &Argon2Params, salt: &[u8; SALT_LEN]) -> Vec<u8> {
         let mut v = Vec::with_capacity(16 + SALT_LEN);
         v.extend_from_slice(&[KDF_ARGON2ID, 0, 0, 0]);
-        v.extend_from_slice(&self.kdf.memory_kib.to_le_bytes());
-        v.extend_from_slice(&self.kdf.iterations.to_le_bytes());
-        v.extend_from_slice(&self.kdf.parallelism.to_le_bytes());
-        v.extend_from_slice(&self.salt);
+        v.extend_from_slice(&kdf.memory_kib.to_le_bytes());
+        v.extend_from_slice(&kdf.iterations.to_le_bytes());
+        v.extend_from_slice(&kdf.parallelism.to_le_bytes());
+        v.extend_from_slice(salt);
         v
     }
 
     fn body(&self) -> Vec<u8> {
-        let mut v = self.bound_fields();
-        v.extend_from_slice(&self.nonce);
-        v.extend_from_slice(&self.wrapped);
-        v.extend_from_slice(&self.tag);
+        let mut v = Self::bound_fields(&self.kdf, &self.salt);
+        self.key.encode(&mut v);
         debug_assert_eq!(v.len(), PASSWORD_BODY_LEN);
         v
     }
@@ -421,24 +438,22 @@ impl PasswordSlot {
         }
         let kdf = Argon2Params { memory_kib: r.u32()?, iterations: r.u32()?, parallelism: r.u32()? };
         kdf.validate()?;
-        Ok(Self { kdf, salt: r.array()?, nonce: r.array()?, wrapped: r.array()?, tag: r.array()? })
+        Ok(Self { kdf, salt: r.array()?, key: WrappedKey::parse(&mut r)? })
     }
 }
 
 impl RecipientSlot {
-    fn bound_fields(&self) -> Vec<u8> {
+    fn bound_fields(fingerprint: &[u8; hybrid::FINGERPRINT_LEN], kem: &HybridCiphertext) -> Vec<u8> {
         let mut v = Vec::with_capacity(4 + hybrid::FINGERPRINT_LEN + hybrid::CIPHERTEXT_LEN);
         v.extend_from_slice(&[KEM_MLKEM1024_X25519, 0, 0, 0]);
-        v.extend_from_slice(&self.fingerprint);
-        v.extend_from_slice(&self.kem.to_bytes());
+        v.extend_from_slice(fingerprint);
+        v.extend_from_slice(&kem.to_bytes());
         v
     }
 
     fn body(&self) -> Vec<u8> {
-        let mut v = self.bound_fields();
-        v.extend_from_slice(&self.nonce);
-        v.extend_from_slice(&self.wrapped);
-        v.extend_from_slice(&self.tag);
+        let mut v = Self::bound_fields(&self.fingerprint, &self.kem);
+        self.key.encode(&mut v);
         debug_assert_eq!(v.len(), RECIPIENT_BODY_LEN);
         v
     }
@@ -456,7 +471,7 @@ impl RecipientSlot {
         }
         let fingerprint = r.array()?;
         let kem = HybridCiphertext::from_bytes(r.take(hybrid::CIPHERTEXT_LEN)?)?;
-        Ok(Self { fingerprint, kem, nonce: r.array()?, wrapped: r.array()?, tag: r.array()? })
+        Ok(Self { fingerprint, kem, key: WrappedKey::parse(&mut r)? })
     }
 }
 
@@ -553,6 +568,45 @@ mod tests {
         // A different keyfile does not unlock.
         let other = HybridSecretKey::generate().unwrap();
         assert!(parsed.unlock_with_keyfile(&other).unwrap().is_none());
+    }
+
+    /// Unwrapping needs both the commitment and the AEAD tag to verify under
+    /// the same KEK, so no ciphertext can "unlock" under several keys.
+    #[test]
+    fn wrapped_key_is_key_committing() {
+        let master = SecretKey::generate().unwrap();
+        let kek_a = SecretKey::generate().unwrap();
+        let kek_b = SecretKey::generate().unwrap();
+        let aad = b"slot aad";
+        let w = WrappedKey::seal(kek_a.duplicate(), aad, &master).unwrap();
+        assert_eq!(w.open(kek_a.duplicate(), aad).unwrap().expose(), master.expose());
+        assert!(w.open(kek_b.duplicate(), aad).is_err());
+        // Swap in an honest commitment for KEK B: B now passes the commitment
+        // but fails the AEAD, and A fails the commitment.
+        let mut forged = w.clone();
+        forged.commitment = key_commitment(&kek_b, &forged.nonce, aad);
+        assert!(forged.open(kek_b, aad).is_err());
+        assert!(forged.open(kek_a.duplicate(), aad).is_err());
+        // The commitment also binds nonce and AAD.
+        assert!(w.open(kek_a.duplicate(), b"other aad").is_err());
+        let mut bad = w.clone();
+        bad.commitment[0] ^= 1;
+        assert!(bad.open(kek_a, aad).is_err());
+    }
+
+    #[test]
+    fn password_slots_are_capped() {
+        let master = SecretKey::generate().unwrap();
+        let mut h = Header::new(CipherSuite::XChaCha20Poly1305, 16 * 1024, 1000).unwrap();
+        for _ in 0..MAX_PASSWORD_SLOTS {
+            h.add_password_slot(&master, b"pw", TEST_PARAMS).unwrap();
+        }
+        assert!(h.add_password_slot(&master, b"pw", TEST_PARAMS).is_err());
+        // A crafted header with more password slots is refused when parsing.
+        let extra = h.slots[0].clone();
+        h.slots.push(extra);
+        h.seal(&master).unwrap();
+        assert_eq!(Header::parse(&h.to_bytes()).unwrap_err(), HeaderError::Malformed("too many password slots"));
     }
 
     #[test]

@@ -563,7 +563,7 @@ pub fn run() -> Result<()> {
                 println!("OK: header, metadata and all data blocks are authentic.");
             } else {
                 for (path, idx, err) in &r.bad_blocks {
-                    eprintln!("BAD: {path} block {idx}: {err}");
+                    eprintln!("BAD: {} block {idx}: {err}", display_name(path.as_bytes()));
                 }
                 bail!("{} block(s) failed verification: the vault was modified or damaged", r.bad_blocks.len());
             }
@@ -589,10 +589,10 @@ pub fn run() -> Result<()> {
                     a.perm,
                     a.size,
                     fmt_time(a.mtime),
-                    String::from_utf8_lossy(&e.name)
+                    display_name(&e.name)
                 );
                 if a.kind == Kind::Symlink {
-                    line.push_str(&format!(" -> {}", String::from_utf8_lossy(&fs.readlink(e.ino)?)));
+                    line.push_str(&format!(" -> {}", display_name(&fs.readlink(e.ino)?)));
                 }
                 println!("{line}");
             }
@@ -606,7 +606,7 @@ pub fn run() -> Result<()> {
             } else {
                 dest
             };
-            let n = export(&mut fs, ino, &dest, force)?;
+            let n = export(&mut fs, ino, &dest, force, 0)?;
             println!("Copied {n} file(s) to {}.", dest.display());
         }
 
@@ -626,7 +626,7 @@ pub fn run() -> Result<()> {
                     (resolve(&fs, dir)?, name.to_owned())
                 }
             };
-            let n = import(&mut fs, &src, parent, name.as_bytes(), force)?;
+            let n = import(&mut fs, &src, parent, name.as_bytes(), force, 0)?;
             fs.commit()?;
             println!("Copied {n} file(s) into the vault.");
         }
@@ -635,7 +635,7 @@ pub fn run() -> Result<()> {
             let mut fs = open_fs(&vault, &u, false)?;
             let (dir, name) = split_path(&path)?;
             let parent = resolve(&fs, dir)?;
-            remove(&mut fs, parent, name.as_bytes(), recursive)?;
+            remove(&mut fs, parent, name.as_bytes(), recursive, 0)?;
             fs.commit()?;
             println!("Removed {path}.");
         }
@@ -691,6 +691,38 @@ fn base_name(path: &str) -> Result<&str> {
 
 const COPY_BUF: usize = 1 << 20;
 
+/// Deepest directory nesting the recursive commands (`get`, `put`, `rm -r`)
+/// follow. Bounds recursion, so a crafted directory tree can't overflow
+/// the stack.
+const MAX_DEPTH: usize = 1024;
+
+fn check_depth(depth: usize) -> Result<()> {
+    if depth > MAX_DEPTH {
+        bail!("directory tree is nested more than {MAX_DEPTH} levels deep; refusing to continue");
+    }
+    Ok(())
+}
+
+/// Render vault-controlled text (file names, symlink targets) safely for a
+/// terminal. Anyone who can write to a shared vault picks its file names,
+/// so control characters (which could inject terminal escape sequences)
+/// and Unicode bidi/invisible formatting characters (which could make one
+/// name look like another) are shown escaped.
+fn display_name(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let dangerous = c.is_control()
+            || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}');
+        if dangerous {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Whether a vault entry name can be used as a local file name without
 /// escaping the destination directory (or, on Windows, writing into an
 /// NTFS alternate data stream or a device such as `CON`).
@@ -713,20 +745,21 @@ fn safe_local_name(name: &str) -> bool {
     true
 }
 
-fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool) -> Result<u64> {
+fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool, depth: usize) -> Result<u64> {
+    check_depth(depth)?;
     let meta = std::fs::symlink_metadata(src).with_context(|| format!("reading {}", src.display()))?;
     let (uid, gid) = (crate::platform::uid(), crate::platform::gid());
     if meta.is_dir() {
         let dir = match fs.lookup(parent, name) {
             Ok(ino) if fs.attr(ino)?.kind == Kind::Dir => ino,
-            Ok(_) => bail!("{} exists in the vault and is not a directory", String::from_utf8_lossy(name)),
+            Ok(_) => bail!("{} exists in the vault and is not a directory", display_name(name)),
             Err(_) => fs.mkdir(parent, name, 0o700, uid, gid)?,
         };
         let mut n = 0;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
             let child = entry.file_name();
-            n += import(fs, &entry.path(), dir, child.to_string_lossy().as_bytes(), force)?;
+            n += import(fs, &entry.path(), dir, child.to_string_lossy().as_bytes(), force, depth + 1)?;
         }
         return Ok(n);
     }
@@ -736,10 +769,10 @@ fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool) -> Res
     }
     if let Ok(existing) = fs.lookup(parent, name) {
         if !force {
-            bail!("{} already exists in the vault (use --force to overwrite)", String::from_utf8_lossy(name));
+            bail!("{} already exists in the vault (use --force to overwrite)", display_name(name));
         }
         if fs.attr(existing)?.kind == Kind::Dir {
-            bail!("{} is a directory in the vault", String::from_utf8_lossy(name));
+            bail!("{} is a directory in the vault", display_name(name));
         }
         fs.unlink(parent, name)?;
     }
@@ -770,7 +803,8 @@ fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool) -> Res
     Ok(1)
 }
 
-fn export(fs: &mut Fs, ino: u64, dest: &Path, force: bool) -> Result<u64> {
+fn export(fs: &mut Fs, ino: u64, dest: &Path, force: bool, depth: usize) -> Result<u64> {
+    check_depth(depth)?;
     let a = fs.attr(ino)?;
     match a.kind {
         Kind::Dir => {
@@ -786,7 +820,7 @@ fn export(fs: &mut Fs, ino: u64, dest: &Path, force: bool) -> Result<u64> {
                 if !safe_local_name(&name) {
                     bail!("refusing to create a local file with the unsafe name {name:?}");
                 }
-                n += export(fs, e.ino, &dest.join(&name), force)?;
+                n += export(fs, e.ino, &dest.join(&name), force, depth + 1)?;
             }
             Ok(n)
         }
@@ -820,15 +854,16 @@ fn export(fs: &mut Fs, ino: u64, dest: &Path, force: bool) -> Result<u64> {
     }
 }
 
-fn remove(fs: &mut Fs, parent: u64, name: &[u8], recursive: bool) -> Result<()> {
+fn remove(fs: &mut Fs, parent: u64, name: &[u8], recursive: bool, depth: usize) -> Result<()> {
+    check_depth(depth)?;
     let ino = fs.lookup(parent, name)?;
     if fs.attr(ino)?.kind == Kind::Dir {
         if !recursive {
-            bail!("{} is a directory (use -r)", String::from_utf8_lossy(name));
+            bail!("{} is a directory (use -r)", display_name(name));
         }
         for e in fs.readdir(ino)? {
             if e.name != b"." && e.name != b".." {
-                remove(fs, ino, &e.name, true)?;
+                remove(fs, ino, &e.name, true, depth + 1)?;
             }
         }
         fs.rmdir(parent, name)?;
@@ -861,6 +896,26 @@ mod tests {
         assert_eq!(split_path("b").unwrap(), ("/", "b"));
         assert_eq!(split_path("/b/").unwrap(), ("/", "b"));
         assert!(split_path("/").is_err());
+    }
+
+    #[test]
+    fn displayed_names_cannot_inject_terminal_sequences() {
+        assert_eq!(display_name(b"report.pdf"), "report.pdf");
+        assert_eq!(display_name("caf\u{e9}".as_bytes()), "caf\u{e9}");
+        let evil = display_name(b"x\x1b]0;pwned\x07\x1b[2J\r\n\x7f");
+        assert!(!evil.chars().any(|c| c.is_control()), "{evil:?}");
+        assert!(evil.contains("\\u{1b}"));
+        // Bidi override ("Trojan Source"-style spoofing) is escaped too.
+        let spoof = display_name("invoice\u{202e}fdp.exe".as_bytes());
+        assert!(!spoof.contains('\u{202e}') && spoof.contains("\\u{202e}"));
+        // Invalid UTF-8 doesn't panic.
+        assert!(!display_name(&[0xff, 0xfe, b'a']).is_empty());
+    }
+
+    #[test]
+    fn recursion_is_bounded() {
+        assert!(check_depth(MAX_DEPTH).is_ok());
+        assert!(check_depth(MAX_DEPTH + 1).is_err());
     }
 
     #[test]

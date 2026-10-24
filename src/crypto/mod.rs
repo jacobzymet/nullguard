@@ -71,6 +71,27 @@ pub fn hmac_sha256_verify(key: &SecretKey, parts: &[&[u8]], tag: &[u8; 32]) -> b
     mac.verify_slice(tag).is_ok()
 }
 
+/// Length of a key commitment.
+pub const COMMITMENT_LEN: usize = 32;
+const COMMITMENT_LABEL: &[u8] = b"nullguard/v1/key-commitment";
+
+/// Key commitment for a wrapped key:
+/// `HMAC-SHA256(kek, "nullguard/v1/key-commitment" || nonce || aad)`.
+///
+/// Poly1305 and GHASH are not key-committing: one ciphertext can be built
+/// to authenticate under many keys at once, which enables "partitioning
+/// oracle" attacks on password-derived keys. HMAC-SHA256 is
+/// collision-resistant in its key, so checking this value before
+/// decrypting makes unwrapping succeed for exactly one key.
+pub fn key_commitment(kek: &SecretKey, nonce: &[u8], aad: &[u8]) -> [u8; COMMITMENT_LEN] {
+    hmac_sha256(kek, &[COMMITMENT_LABEL, nonce, aad])
+}
+
+/// Constant-time check of a [`key_commitment`].
+pub fn verify_key_commitment(kek: &SecretKey, nonce: &[u8], aad: &[u8], commitment: &[u8; COMMITMENT_LEN]) -> bool {
+    hmac_sha256_verify(kek, &[COMMITMENT_LABEL, nonce, aad], commitment)
+}
+
 /// Constant-time equality for secrets or authenticators.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;

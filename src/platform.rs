@@ -24,6 +24,15 @@ pub fn harden_process() {
             libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        // The macOS counterpart: refuse debugger attachment (lldb, dtrace
+        // and task_for_pid-based memory readers) for this process's lifetime.
+        // SAFETY: PT_DENY_ATTACH ignores the pid/addr/data arguments.
+        unsafe {
+            libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0);
+        }
+    }
 }
 
 /// Real user id of this process (0 on Windows).

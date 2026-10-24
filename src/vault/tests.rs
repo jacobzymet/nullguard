@@ -152,7 +152,7 @@ fn weak_kdf_refused_at_create() {
 fn header_tampering_is_detected() {
     let t = new_vault();
     // Flip a bit in the MAC of both copies: parses fine, unlocks, MAC fails.
-    let signed_len = 64 + 4 + 120; // core + one password slot
+    let signed_len = 64 + 4 + 152; // core + one password slot
     for base in [header::PRIMARY_OFFSET, header::BACKUP_OFFSET] {
         patch(&t.path, base + signed_len + 3, |b| b[0] ^= 0x10);
     }
@@ -162,7 +162,7 @@ fn header_tampering_is_detected() {
 #[test]
 fn tampered_primary_with_intact_backup_opens_with_security_warning() {
     let t = new_vault();
-    let signed_len = 64 + 4 + 120;
+    let signed_len = 64 + 4 + 152;
     patch(&t.path, header::PRIMARY_OFFSET + signed_len + 3, |b| b[0] ^= 0x10);
     let v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
     assert!(v.warnings.iter().any(|w| w.contains("SECURITY") && w.contains("primary")), "{:?}", v.warnings);

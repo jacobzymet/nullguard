@@ -225,7 +225,7 @@ synced to the cloud).
   when the vault closes. If the OS refuses to lock memory, nullguard says so.
   Core dumps are disabled. On Linux the process is marked non-dumpable, which
   also blocks `ptrace` and `/proc/<pid>/mem` access by other processes of the
-  same user.
+  same user. On macOS it refuses debugger attachment (`PT_DENY_ATTACH`).
 - The vault file is locked while open, so two nullguard processes can't
   corrupt it. On Windows the lock is mandatory, so other programs can't read
   the file while it's open.
@@ -246,6 +246,11 @@ nullguard can't protect you against:
   (use encrypted swap), editor temp files, thumbnails, files you `get`.
 - **Coercion.** v1 has no hidden volumes or plausible deniability. A vault is
   recognizable as a nullguard vault (it has a magic number and version).
+- **Secure deletion.** Deleting a file frees its chunks, but their old
+  ciphertext stays on disk until the space is reused. Anyone who later gets
+  the vault's key (e.g. your password) can recover deleted files from an
+  old or current copy. To truly destroy data, move what you keep into a new
+  vault and destroy the old file and key.
 
 ### What leaks
 
@@ -258,6 +263,18 @@ Even to an attacker with the vault file, these are visible by design:
   they have access.
 - With `--quick` (no random fill): which regions have ever been written, and
   so roughly how much data the vault holds. The default random fill hides this.
+
+### Trust between people sharing a vault
+
+Everyone who can unlock a vault holds the same master key, so each of them
+can read and change everything, including the header. A co-owner can add or
+remove key slots or change the password, and nullguard can't prevent that.
+Share a vault only with people you'd trust with the data itself. nullguard
+does treat a vault's *contents* as untrusted input, though. File names are
+shown with control and bidi-override characters escaped, so a planted name
+can't inject terminal escape sequences or impersonate another name. Names
+that would be unsafe on the local OS are refused by `get`. Recursive
+commands stop at 1024 levels of nesting.
 
 ### Changing a password: what it does and doesn't do
 
@@ -361,7 +378,7 @@ chunk area is filled with random bytes unless `--quick` is given.
 | 32 | 4 | chunk size: power of two, 4 KiB to 1 MiB |
 | 36 | 8 | chunk count N (≥ 16) |
 | 44 | 8 | data offset = 131 072 |
-| 52 | 2 | key slot count (1–32) |
+| 52 | 2 | key slot count (1–32, of which at most 4 password slots) |
 | 54 | 10 | reserved, must be 0 |
 | 64 | … | key slots, each `type u8 ‖ 0x00 ‖ body_len u16 ‖ body` |
 | … | 32 | header MAC |
@@ -373,7 +390,7 @@ every header has exactly one valid encoding. Argon2 parameters are capped
 when *reading* (≤ 4 GiB, ≤ 64 passes, ≤ 64 lanes), so a crafted vault can't
 exhaust memory or CPU.
 
-**Password slot** (type 1, body 120 bytes):
+**Password slot** (type 1, body 152 bytes):
 
 | Size | Field |
 |---|---|
@@ -381,11 +398,9 @@ exhaust memory or CPU.
 | 3 | reserved, 0 |
 | 4 / 4 / 4 | memory (KiB), iterations, parallelism |
 | 32 | salt |
-| 24 | nonce |
-| 32 | wrapped master key |
-| 16 | tag |
+| 104 | wrapped key: nonce (24) ‖ commitment (32) ‖ ciphertext (32) ‖ tag (16) |
 
-**Recipient (keyfile) slot** (type 2, body 1692 bytes):
+**Recipient (keyfile) slot** (type 2, body 1724 bytes):
 
 | Size | Field |
 |---|---|
@@ -394,18 +409,27 @@ exhaust memory or CPU.
 | 16 | recipient fingerprint = SHA-256("nullguard/v1/recipient-fingerprint" ‖ pk_X ‖ pk_M)[0..16] |
 | 32 | X25519 ephemeral public key (ct_X) |
 | 1568 | ML-KEM-1024 ciphertext (ct_M) |
-| 24 / 32 / 16 | nonce, wrapped master key, tag |
+| 104 | wrapped key, as in password slots |
 
 **Password encoding.** The Argon2id input is the password in Unicode
 Normalization Form C, encoded as UTF-8 (at most 4096 bytes). The KEK is
 `Argon2id(password, salt, m, t, p)` with a 32-byte output and no secret or
 associated data.
 
-**Key wrapping.** `wrapped ‖ tag = XChaCha20-Poly1305(KEK, nonce, master_key, aad)`, where
+**Key wrapping.**
 
 ```text
-aad = "nullguard/v1/keyslot" ‖ header[0..52] ‖ slot_type ‖ slot body without nonce/wrapped/tag
+aad        = "nullguard/v1/keyslot" ‖ header[0..52] ‖ slot_type ‖ slot body up to the wrapped key
+commitment = HMAC-SHA256(KEK, "nullguard/v1/key-commitment" ‖ nonce ‖ aad)
+ciphertext ‖ tag = XChaCha20-Poly1305(KEK, nonce, master_key, aad)
 ```
+
+On unlock the commitment is checked (in constant time) *before* decrypting.
+Poly1305 isn't key-committing: without this check an attacker could craft
+one slot that "unlocks" under many candidate passwords at once, and learn
+whether yours is among them from how the unlock fails (a partitioning-oracle
+attack). HMAC-SHA256 is collision-resistant in its key, so a slot opens under
+exactly one KEK.
 
 `header[0..52]` covers everything in the fixed header except the slot count
 and reserved bytes, so slots can be added or removed without re-wrapping the others.
@@ -489,12 +513,13 @@ slow), on `fsync`, and on unmount.
 ```text
 # comments ...
 nullguard-secret-key-1:<base64( x25519_secret (32) ‖ mlkem_seed d‖z (64) ‖ checksum (4) )>
-nullguard-encrypted-secret-key-1:<base64( m u32 ‖ t u32 ‖ p u32 ‖ salt (32) ‖ nonce (24) ‖ ct (96) ‖ tag (16) )>
+nullguard-encrypted-secret-key-1:<base64( m u32 ‖ t u32 ‖ p u32 ‖ salt (32) ‖ nonce (24) ‖ commitment (32) ‖ ct (96) ‖ tag (16) )>
 nullguard-public-key-1:<base64( x25519_public (32) ‖ mlkem1024_public (1568) )>
 ```
 
 Encrypted keyfiles use `XChaCha20-Poly1305(Argon2id(passphrase, salt, m, t, p), ...)`
-with the prefix and parameters as associated data. Secret keyfiles are created
+with the prefix and parameters as associated data, and the same key
+commitment as key slots. Secret keyfiles are created
 with mode 0600 and are never overwritten.
 
 ---

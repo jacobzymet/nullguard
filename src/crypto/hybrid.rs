@@ -29,7 +29,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::aead::{Aead, CipherSuite, NONCE_LEN, TAG_LEN};
 use super::kdf::{self, Argon2Params, SALT_LEN};
 use super::secret::lock_in_ram;
-use super::{CryptoError, SecretKey, random};
+use super::{COMMITMENT_LEN, CryptoError, SecretKey, key_commitment, random, verify_key_commitment};
 
 pub const X25519_LEN: usize = 32;
 pub const MLKEM_PUBLIC_LEN: usize = 1568;
@@ -118,7 +118,9 @@ impl HybridSecretKey {
     /// Serialize as keyfile text. With a passphrase, the key is encrypted
     /// with Argon2id + XChaCha20-Poly1305 (recommended).
     pub fn to_keyfile(&self, passphrase: Option<(&[u8], Argon2Params)>) -> Result<Zeroizing<String>, CryptoError> {
-        let mut text = Zeroizing::new(String::new());
+        // Sized up front so the buffer never reallocates (a reallocation
+        // would leave an unwiped copy of the encoded secret behind).
+        let mut text = Zeroizing::new(String::with_capacity(1024));
         text.push_str("# nullguard secret key (ML-KEM-1024 + X25519). KEEP THIS FILE SECRET.\n");
         text.push_str(&format!("# public key fingerprint: {}\n", self.public_key().fingerprint_hex()));
         match passphrase {
@@ -138,12 +140,15 @@ impl HybridSecretKey {
                 header.extend_from_slice(&params.parallelism.to_le_bytes());
                 header.extend_from_slice(&salt);
                 let kek = kdf::derive_key(pass, &salt, &params)?;
-                let aead = Aead::new(CipherSuite::XChaCha20Poly1305, kek);
                 let mut body = Zeroizing::new(self.seed.to_vec());
                 let aad = [ENC_SECRET_PREFIX.as_bytes(), &header].concat();
-                let (nonce, tag) = aead.seal(&aad, &mut body)?;
+                let nonce = random::array::<NONCE_LEN>()?;
+                let commitment = key_commitment(&kek, &nonce, &aad);
+                let aead = Aead::new(CipherSuite::XChaCha20Poly1305, kek);
+                let tag = aead.seal_with_nonce(&nonce, &aad, &mut body)?;
                 let mut raw = header;
                 raw.extend_from_slice(&nonce);
+                raw.extend_from_slice(&commitment);
                 raw.extend_from_slice(&body);
                 raw.extend_from_slice(&tag);
                 text.push_str(ENC_SECRET_PREFIX);
@@ -180,19 +185,25 @@ impl HybridSecretKey {
             let raw = Base64::decode_vec(b64.trim())
                 .map_err(|_| CryptoError::InvalidEncoding("keyfile is not valid base64"))?;
             let hdr_len = 12 + SALT_LEN;
-            if raw.len() != hdr_len + NONCE_LEN + SECRET_SEED_LEN + TAG_LEN {
+            if raw.len() != hdr_len + NONCE_LEN + COMMITMENT_LEN + SECRET_SEED_LEN + TAG_LEN {
                 return Err(CryptoError::InvalidEncoding("keyfile has the wrong length"));
             }
             let u32_at = |i: usize| u32::from_le_bytes(raw[i..i + 4].try_into().expect("4 bytes"));
             let params = Argon2Params { memory_kib: u32_at(0), iterations: u32_at(4), parallelism: u32_at(8) };
             let salt: [u8; SALT_LEN] = raw[12..hdr_len].try_into().expect("salt length");
             let nonce: [u8; NONCE_LEN] = raw[hdr_len..hdr_len + NONCE_LEN].try_into().expect("nonce length");
-            let body_start = hdr_len + NONCE_LEN;
+            let commit_start = hdr_len + NONCE_LEN;
+            let commitment: [u8; COMMITMENT_LEN] =
+                raw[commit_start..commit_start + COMMITMENT_LEN].try_into().expect("commitment length");
+            let body_start = commit_start + COMMITMENT_LEN;
             let tag: [u8; TAG_LEN] = raw[body_start + SECRET_SEED_LEN..].try_into().expect("tag length");
             let mut body = Zeroizing::new(raw[body_start..body_start + SECRET_SEED_LEN].to_vec());
             let kek = kdf::derive_key(pass, &salt, &params)?;
-            let aead = Aead::new(CipherSuite::XChaCha20Poly1305, kek);
             let aad = [ENC_SECRET_PREFIX.as_bytes(), &raw[..hdr_len]].concat();
+            if !verify_key_commitment(&kek, &nonce, &aad, &commitment) {
+                return Err(CryptoError::WrongPassphrase);
+            }
+            let aead = Aead::new(CipherSuite::XChaCha20Poly1305, kek);
             aead.open(&nonce, &aad, &mut body, &tag)
                 .map_err(|_| CryptoError::WrongPassphrase)?;
             return Self::from_seed_slice(&body);
