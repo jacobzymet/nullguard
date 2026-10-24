@@ -176,6 +176,69 @@ fn failed_get_leaves_no_partial_plaintext() {
     assert!(!out.exists(), "partial plaintext was left behind");
 }
 
+/// Regression for review finding NG-01: `rm -r <dir>/..` once deleted the
+/// parent's contents, then failed, and the deletion was still committed.
+#[test]
+fn rm_refuses_dot_paths_and_never_commits_on_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    ok(&[&["create", v, "--size", "4M", "--quick", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    let src = dir.path().join("d");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a.txt"), b"important").unwrap();
+    std::fs::write(src.join("sub").join("b.txt"), b"more").unwrap();
+    ok(&["put", v, s(&src), "/", "--password-stdin"], &format!("{PW}\n"));
+
+    for bad in ["/d/sub/..", "/d/.", "/.", "/..", "/d/sub/../"] {
+        let err = fails(&["rm", v, bad, "-r", "--password-stdin"], &format!("{PW}\n"));
+        assert!(err.contains("invalid path"), "{bad}: {err}");
+    }
+    let ls = ok(&["ls", v, "/d", "--password-stdin"], &format!("{PW}\n"));
+    assert!(ls.contains("a.txt") && ls.contains("sub"), "data was deleted: {ls}");
+    let ls = ok(&["ls", v, "/d/sub", "--password-stdin"], &format!("{PW}\n"));
+    assert!(ls.contains("b.txt"), "{ls}");
+}
+
+/// Regression for review finding NG-04: `verify` once printed "OK" and
+/// exited 0 although the primary header had been tampered with.
+#[test]
+fn verify_fails_when_a_header_copy_is_tampered() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    ok(&[&["create", v, "--size", "4M", "--quick", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    ok(&["verify", v, "--password-stdin"], &format!("{PW}\n"));
+    // Corrupt the primary header's MAC area; the backup stays intact.
+    let mut raw = std::fs::read(&vault).unwrap();
+    raw[64 + 4 + 152 + 5] ^= 0xFF;
+    std::fs::write(&vault, &raw).unwrap();
+    // Normal use still works (from the authentic backup), with a warning...
+    let out = ng(&["ls", v, "--password-stdin"], &format!("{PW}\n"));
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("SECURITY"), "{stderr}");
+    assert_eq!(stderr.matches("FAILED its integrity check").count(), 1, "warnings printed more than once: {stderr}");
+    // ...but verify must fail.
+    let err = fails(&["verify", v, "--password-stdin"], &format!("{PW}\n"));
+    assert!(err.contains("verification FAILED"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn exported_directories_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    ok(&[&["create", v, "--size", "4M", "--quick", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    ok(&["mkdir", v, "/secret-folder-name", "--password-stdin"], &format!("{PW}\n"));
+    let out = dir.path().join("out");
+    ok(&["get", v, "/secret-folder-name", s(&out), "--password-stdin"], &format!("{PW}\n"));
+    let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn mount_explains_platform_support() {

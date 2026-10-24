@@ -151,6 +151,10 @@ pub struct Header {
     pub data_offset: u64,
     pub slots: Vec<KeySlot>,
     pub mac: [u8; MAC_LEN],
+    /// Incremented on every header change (password change, recipient
+    /// added or removed). Covered by the MAC, and recorded in every
+    /// filesystem commit, so restoring an older header is detected.
+    pub generation: u64,
 }
 
 /// Bytes each chunk occupies on disk: nonce || ciphertext || tag.
@@ -169,6 +173,7 @@ impl Header {
             data_offset: DATA_OFFSET,
             slots: Vec::new(),
             mac: [0; MAC_LEN],
+            generation: 1,
         };
         h.validate_geometry()?;
         Ok(h)
@@ -214,7 +219,8 @@ impl Header {
         c[36..44].copy_from_slice(&self.chunk_count.to_le_bytes());
         c[44..52].copy_from_slice(&self.data_offset.to_le_bytes());
         c[52..54].copy_from_slice(&(self.slots.len() as u16).to_le_bytes());
-        // 54..64 reserved, zero
+        c[54..62].copy_from_slice(&self.generation.to_le_bytes());
+        // 62..64 reserved, zero
         c
     }
 
@@ -269,7 +275,11 @@ impl Header {
         let chunk_count = r.u64()?;
         let data_offset = r.u64()?;
         let slot_count = r.u16()? as usize;
-        if r.take(10)?.iter().any(|&b| b != 0) {
+        let generation = r.u64()?;
+        if generation == 0 {
+            return Err(HeaderError::Malformed("header generation is zero"));
+        }
+        if r.take(2)?.iter().any(|&b| b != 0) {
             return Err(HeaderError::Malformed("reserved bytes are not zero"));
         }
         if slot_count == 0 || slot_count > MAX_SLOTS {
@@ -296,7 +306,7 @@ impl Header {
         if r.rest().iter().any(|&b| b != 0) {
             return Err(HeaderError::Malformed("header padding is not zero"));
         }
-        let h = Self { cipher, vault_id, chunk_size, chunk_count, data_offset, slots, mac };
+        let h = Self { cipher, vault_id, chunk_size, chunk_count, data_offset, slots, mac, generation };
         h.validate_geometry()?;
         Ok(h)
     }
@@ -370,18 +380,33 @@ impl Header {
     ///
     /// All password slots are tried even after a match would be found, so
     /// timing does not reveal which slot matched.
+    ///
+    /// A slot whose key derivation fails (for example a tampered slot that
+    /// asks for more memory than the machine has) is skipped, not fatal. If
+    /// no slot opens, the first such error is returned.
     pub fn unlock_with_password(&self, password: &[u8]) -> Result<Option<SecretKey>, HeaderError> {
         let mut found = None;
+        let mut err = None;
         for slot in &self.slots {
             if let KeySlot::Password(p) = slot {
-                let kek = kdf::derive_key(password, &p.salt, &p.kdf)?;
+                let kek = match kdf::derive_key(password, &p.salt, &p.kdf) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        err.get_or_insert(e);
+                        continue;
+                    }
+                };
                 let aad = self.slot_aad(SLOT_PASSWORD, &PasswordSlot::bound_fields(&p.kdf, &p.salt));
                 if let Ok(k) = p.key.open(kek, &aad) {
                     found.get_or_insert(k);
                 }
             }
         }
-        Ok(found)
+        match (found, err) {
+            (Some(k), _) => Ok(Some(k)),
+            (None, Some(e)) => Err(e.into()),
+            (None, None) => Ok(None),
+        }
     }
 
     /// Try the recipient slot(s) matching `sk`'s public key.
@@ -391,7 +416,9 @@ impl Header {
             if let KeySlot::Recipient(r) = slot
                 && r.fingerprint == fp
             {
-                let kek = hybrid::decapsulate(sk, &r.kem)?;
+                // A malformed (e.g. low-order X25519) ciphertext just means this
+                // slot isn't ours; keep looking.
+                let Ok(kek) = hybrid::decapsulate(sk, &r.kem) else { continue };
                 let aad = self.slot_aad(SLOT_RECIPIENT, &RecipientSlot::bound_fields(&r.fingerprint, &r.kem));
                 if let Ok(k) = r.key.open(kek, &aad) {
                     return Ok(Some(k));
@@ -655,7 +682,7 @@ mod tests {
             (10, 99), // cipher id
             (12, 1),  // flags
             (32, 1),  // chunk size not a power of two
-            (55, 1),  // reserved
+            (62, 1),  // reserved
             (52, 0),  // slot count 1 -> 0
             (44, 1),  // data offset
         ];

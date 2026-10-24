@@ -38,7 +38,7 @@ const SUPERBLOCK_SLOTS: u64 = 2;
 const SUPER_MAGIC: &[u8; 8] = b"NGSUPER1";
 const META_MAGIC: &[u8; 8] = b"NGMETA01";
 const FS_VERSION: u32 = 1;
-const SUPER_FIXED_LEN: usize = 8 + 4 + 4 + 8 + 8 + 32 + 4;
+const SUPER_FIXED_LEN: usize = 8 + 4 + 4 + 8 + 8 + 8 + 32 + 4;
 const EXTENT_LEN: usize = 12;
 
 const CACHE_CAPACITY: usize = 256;
@@ -102,7 +102,9 @@ pub struct BlockRef {
 #[derive(Clone, Debug)]
 pub enum Node {
     /// `blocks[i]` holds bytes `i*chunk_size ..`; `None` is a hole (zeros).
-    /// Invariant: bytes past `size` in the last block are zero.
+    /// Bytes past `size` in the last block are unspecified (they may hold
+    /// data from before a truncate). They are never returned by reads, and
+    /// are zeroed before the file grows over them (`zero_past_eof`).
     File { size: u64, blocks: Vec<Option<BlockRef>> },
     Dir { parent: u64, entries: BTreeMap<Vec<u8>, u64> },
     Symlink { target: Vec<u8> },
@@ -186,6 +188,8 @@ pub struct VerifyReport {
 
 struct Superblock {
     generation: u64,
+    /// Generation of the vault header in use when this commit was made.
+    header_generation: u64,
     meta_len: u64,
     meta_hash: [u8; 32],
     meta_chunks: Vec<u64>,
@@ -200,8 +204,21 @@ struct Bitmap {
 }
 
 impl Bitmap {
+    #[cfg(test)]
     fn new(len: u64) -> Self {
-        Self { words: vec![0; len.div_ceil(64) as usize], len, free: len, cursor: 0 }
+        Self::try_new(len).expect("bitmap allocation")
+    }
+
+    /// Fallible version: a huge (e.g. sparse, petabyte-sized) vault fails
+    /// cleanly instead of aborting the process.
+    fn try_new(len: u64) -> Result<Self, Error> {
+        let n = usize::try_from(len.div_ceil(64)).map_err(|_| Error::NoSpace)?;
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(n)
+            .map_err(|_| Error::Corrupt("not enough memory for this vault's allocation map".into()))?;
+        words.resize(n, 0);
+        Ok(Self { words, len, free: len, cursor: 0 })
     }
 
     fn get(&self, i: u64) -> bool {
@@ -290,6 +307,8 @@ pub struct Fs {
     inodes: HashMap<u64, Inode>,
     next_ino: u64,
     generation: u64,
+    /// Generation of the unlocked vault header, recorded in every commit.
+    header_generation: u64,
     bitmap: Bitmap,
     meta_chunks: Vec<u64>,
     /// Chunks the last commit references but the live state no longer
@@ -307,7 +326,6 @@ pub struct Fs {
     /// Security-relevant observations made while opening (e.g. a damaged
     /// superblock). Callers must show these to the user.
     pub warnings: Vec<String>,
-    skip_drop_commit: bool,
     /// Set when a commit failed after writing its superblock (see `commit_now`).
     poisoned: bool,
 }
@@ -315,8 +333,8 @@ pub struct Fs {
 impl Fs {
     /// Create an empty filesystem (root directory only) and commit it to
     /// both superblock slots.
-    pub fn format(store: ChunkStore, uid: u32, gid: u32) -> Result<Self, Error> {
-        let mut fs = Self::empty(store);
+    pub fn format(store: ChunkStore, uid: u32, gid: u32, header_generation: u64) -> Result<Self, Error> {
+        let mut fs = Self::empty(store, header_generation)?;
         let now = Timestamp::now();
         fs.inodes.insert(
             ROOT_INO,
@@ -337,17 +355,18 @@ impl Fs {
         Ok(fs)
     }
 
-    fn empty(store: ChunkStore) -> Self {
-        let mut bitmap = Bitmap::new(store.chunk_count());
+    fn empty(store: ChunkStore, header_generation: u64) -> Result<Self, Error> {
+        let mut bitmap = Bitmap::try_new(store.chunk_count())?;
         for i in 0..SUPERBLOCK_SLOTS {
             bitmap.set(i);
         }
-        Self {
+        Ok(Self {
             chunk_size: store.chunk_size() as u64,
             store,
             inodes: HashMap::new(),
             next_ino: ROOT_INO + 1,
             generation: 0,
+            header_generation,
             bitmap,
             meta_chunks: Vec::new(),
             pending_free: Vec::new(),
@@ -359,14 +378,18 @@ impl Fs {
             last_commit: Instant::now(),
             last_commit_took: Duration::ZERO,
             warnings: Vec::new(),
-            skip_drop_commit: false,
             poisoned: false,
-        }
+        })
     }
 
     /// Open the filesystem from the newest valid superblock.
-    pub fn open(store: ChunkStore) -> Result<Self, Error> {
-        let mut fs = Self::empty(store);
+    ///
+    /// `header_generation` is the generation of the vault header that was
+    /// just unlocked. If the filesystem was last committed under a *newer*
+    /// header, this header is an old one put back (for example to undo a
+    /// password change or a recipient's removal) and opening is refused.
+    pub fn open(store: ChunkStore, header_generation: u64) -> Result<Self, Error> {
+        let mut fs = Self::empty(store, header_generation)?;
         let mut supers = Vec::new();
         for slot in 0..SUPERBLOCK_SLOTS {
             match fs.read_superblock(slot) {
@@ -380,6 +403,11 @@ impl Fs {
         supers.sort_by_key(|s| std::cmp::Reverse(s.generation));
         let mut last_err = None;
         for (i, sb) in supers.iter().enumerate() {
+            if sb.header_generation > header_generation {
+                // Don't fall back to an older superblock: that would help
+                // the rollback succeed.
+                return Err(Error::HeaderRollback { header: header_generation, recorded: sb.header_generation });
+            }
             match fs.load_metadata(sb) {
                 Ok(()) => {
                     if i > 0 {
@@ -406,6 +434,7 @@ impl Fs {
             return Err(Error::Corrupt("unknown superblock format".into()));
         }
         let generation = r.u64().map_err(bad)?;
+        let header_generation = r.u64().map_err(bad)?;
         let meta_len = r.u64().map_err(bad)?;
         let meta_hash = r.array::<32>().map_err(bad)?;
         let n = r.u32().map_err(bad)? as u64;
@@ -425,12 +454,16 @@ impl Fs {
         if r.rest().iter().any(|&b| b != 0) {
             return Err(Error::Corrupt("superblock padding is not zero".into()));
         }
-        Ok(Superblock { generation, meta_len, meta_hash, meta_chunks })
+        Ok(Superblock { generation, header_generation, meta_len, meta_hash, meta_chunks })
     }
 
     fn load_metadata(&mut self, sb: &Superblock) -> Result<(), Error> {
         let cs = self.chunk_size as usize;
-        let mut blob = Zeroizing::new(vec![0u8; sb.meta_chunks.len() * cs]);
+        let blob_len = sb.meta_chunks.len() * cs;
+        let mut blob = Zeroizing::new(Vec::new());
+        blob.try_reserve_exact(blob_len)
+            .map_err(|_| Error::Corrupt("not enough memory to load the vault's metadata".into()))?;
+        blob.resize(blob_len, 0);
         for (i, &c) in sb.meta_chunks.iter().enumerate() {
             self.store.read(c, None, &mut blob[i * cs..(i + 1) * cs])?;
         }
@@ -441,10 +474,10 @@ impl Fs {
         if !ct_eq(&Sha256::digest(blob.as_slice()), &sb.meta_hash) {
             return Err(Error::Corrupt("metadata hash mismatch: the vault was modified".into()));
         }
-        let (next_ino, inodes) = decode_metadata(&blob, self.chunk_size)?;
+        let (next_ino, inodes) = decode_metadata(&blob, self.chunk_size, self.max_file_size())?;
 
         // Rebuild the allocation bitmap; any chunk used twice is corruption.
-        let mut bitmap = Bitmap::new(self.store.chunk_count());
+        let mut bitmap = Bitmap::try_new(self.store.chunk_count())?;
         for i in 0..SUPERBLOCK_SLOTS {
             bitmap.set(i);
         }
@@ -489,6 +522,12 @@ impl Fs {
     }
 
     /// Commit if dirty.
+    /// Commit now, even with no file changes, so the superblock records the
+    /// current header generation (called right after a header change).
+    pub fn commit_header_change(&mut self) -> Result<(), Error> {
+        self.commit_now()
+    }
+
     pub fn commit(&mut self) -> Result<(), Error> {
         if self.dirty { self.commit_now() } else { Ok(()) }
     }
@@ -523,6 +562,7 @@ impl Fs {
             sb.extend_from_slice(&FS_VERSION.to_le_bytes());
             sb.extend_from_slice(&0u32.to_le_bytes());
             sb.extend_from_slice(&(self.generation + 1).to_le_bytes());
+            sb.extend_from_slice(&self.header_generation.to_le_bytes());
             sb.extend_from_slice(&(blob.len() as u64).to_le_bytes());
             sb.extend_from_slice(&Sha256::digest(blob.as_slice()));
             sb.extend_from_slice(&(extents.len() as u32).to_le_bytes());
@@ -1051,6 +1091,13 @@ impl Fs {
             return Err(Error::FileTooBig);
         }
         let cs = self.chunk_size;
+        // Writing past EOF without touching the old last block (leaving a
+        // gap): zero that block's stale tail first, since it becomes part of
+        // the file.
+        let (old_size, _) = self.file_parts(ino)?;
+        if old_size % cs != 0 && offset / cs > old_size / cs {
+            self.zero_past_eof(ino, old_size)?;
+        }
         let mut buf = Zeroizing::new(vec![0u8; cs as usize]);
         let mut pos = offset;
         while pos < end {
@@ -1061,6 +1108,11 @@ impl Fs {
             buf.fill(0);
             if !whole && let Some(b) = self.block_ref(ino, idx)? {
                 self.read_block(&b, &mut buf)?;
+                // Stale bytes past the current EOF must not resurface.
+                let (cur_size, _) = self.file_parts(ino)?;
+                if bstart < cur_size && cur_size < bstart + cs {
+                    buf[(cur_size - bstart) as usize..].fill(0);
+                }
             }
             buf[(pos - bstart) as usize..(to - bstart) as usize]
                 .copy_from_slice(&data[(pos - offset) as usize..(to - offset) as usize]);
@@ -1085,8 +1137,11 @@ impl Fs {
         }
         let (old_size, _) = self.file_parts(ino)?;
         if new_size < old_size {
-            let cs = self.chunk_size;
-            let keep = new_size.div_ceil(cs) as usize;
+            // Shrinking never writes or allocates: it can't fail halfway,
+            // can't trigger a commit mid-operation, and works on a full vault
+            // (which is when people delete things). Bytes past the new EOF in
+            // the last block stay unreadable until zeroed on growth.
+            let keep = new_size.div_ceil(self.chunk_size) as usize;
             let dropped: Vec<BlockRef> = match &mut self.inode_mut(ino)?.node {
                 Node::File { blocks, .. } if blocks.len() > keep => blocks.split_off(keep).into_iter().flatten().collect(),
                 _ => Vec::new(),
@@ -1094,22 +1149,37 @@ impl Fs {
             for b in dropped {
                 self.free_chunk(b.chunk);
             }
-            // Keep the invariant: bytes past EOF in the last block are zero.
-            let tail = (new_size % cs) as usize;
-            if tail != 0
-                && let Some(b) = self.block_ref(ino, keep as u64 - 1)?
-            {
-                let mut buf = Zeroizing::new(vec![0u8; cs as usize]);
-                self.read_block(&b, &mut buf)?;
-                buf[tail..].fill(0);
-                let new = self.write_new_block(&buf)?;
-                self.set_block(ino, keep as u64 - 1, new)?;
-            }
+        } else if new_size > old_size {
+            // Growing exposes the old last block's tail: zero it first (if
+            // this fails, the file is unchanged).
+            self.zero_past_eof(ino, old_size)?;
         }
         if let Node::File { size, .. } = &mut self.inode_mut(ino)?.node {
             *size = new_size;
         }
         self.dirty = true;
+        Ok(())
+    }
+
+    /// Zero the bytes past `size` in the file's last block, if that block
+    /// is partial and exists. Copy-on-write: the zeroed copy goes to a new
+    /// chunk, and nothing changes if that fails.
+    fn zero_past_eof(&mut self, ino: u64, size: u64) -> Result<(), Error> {
+        let cs = self.chunk_size;
+        let tail = (size % cs) as usize;
+        if tail == 0 {
+            return Ok(());
+        }
+        let idx = size / cs;
+        if let Some(b) = self.block_ref(ino, idx)? {
+            let mut buf = Zeroizing::new(vec![0u8; cs as usize]);
+            self.read_block(&b, &mut buf)?;
+            if buf[tail..].iter().any(|&x| x != 0) {
+                buf[tail..].fill(0);
+                let new = self.write_new_block(&buf)?;
+                self.set_block(ino, idx, new)?;
+            }
+        }
         Ok(())
     }
 
@@ -1177,29 +1247,26 @@ impl Fs {
 }
 
 impl Fs {
-    /// Drop without committing (simulates a crash / power loss in tests).
+    /// Drop without committing, like a crash or power loss. (Dropping never
+    /// commits; this name just makes tests read clearly.)
     #[doc(hidden)]
-    pub fn abandon(mut self) {
-        self.dirty = false;
-        self.skip_drop_commit = true;
-    }
+    pub fn abandon(self) {}
 
     /// Mark the in-memory state as untrustworthy (e.g. after a panic in the
-    /// middle of an operation): nothing more is written, not even on drop.
-    /// The vault keeps its last committed state.
+    /// middle of an operation): nothing more is written. The vault keeps its
+    /// last committed state.
     pub fn poison(&mut self) {
         self.poisoned = true;
-        self.skip_drop_commit = true;
     }
 }
 
 impl Drop for Fs {
     fn drop(&mut self) {
-        // Best effort: callers should commit explicitly to see errors. Never
-        // commit while unwinding from a panic: the state may be half-updated.
-        if !self.skip_drop_commit && !std::thread::panicking() {
-            let _ = self.commit();
-        }
+        // Dropping deliberately does NOT commit. Changes become durable only
+        // through an explicit `commit()` after an operation succeeded, so a
+        // command that fails halfway (or panics) can never persist a
+        // half-done change. The vault stays at its last commit.
+        //
         // Wipe file names and symlink targets (cached file contents are
         // already wiped by `Zeroizing`).
         for inode in self.inodes.values_mut() {
@@ -1300,7 +1367,7 @@ fn encode_metadata(next_ino: u64, inodes: &HashMap<u64, Inode>, order: Vec<u64>)
 /// Strictly decode and validate metadata. Although metadata is
 /// authenticated, it is still treated as untrusted input: no panics, no
 /// unbounded allocations, and the tree must be well formed.
-fn decode_metadata(blob: &[u8], chunk_size: u64) -> Result<(u64, HashMap<u64, Inode>), Error> {
+fn decode_metadata(blob: &[u8], chunk_size: u64, max_file_size: u64) -> Result<(u64, HashMap<u64, Inode>), Error> {
     let bad = |what: &str| Error::Corrupt(format!("malformed metadata: {what}"));
     let mut r = Reader::new(blob);
     let e = |_| bad("truncated");
@@ -1330,6 +1397,11 @@ fn decode_metadata(blob: &[u8], chunk_size: u64) -> Result<(u64, HashMap<u64, In
         let node = match kind {
             KIND_FILE => {
                 let size = r.u64().map_err(e)?;
+                // No file can be bigger than the vault (a fake huge sparse
+                // file would make `get` fill the disk with zeros).
+                if size > max_file_size {
+                    return Err(bad("file larger than the vault"));
+                }
                 let n = r.u64().map_err(e)?;
                 if n > size.div_ceil(chunk_size) || n > r.rest().len() as u64 / 8 {
                     return Err(bad("block count"));
@@ -1489,10 +1561,21 @@ mod tests {
         let (next, inodes) = sample_tree();
         let order = vec![1, 2, 3, 4];
         let blob = encode_metadata(next, &inodes, order);
-        let (n2, back) = decode_metadata(&blob, 4096).unwrap();
+        let (n2, back) = decode_metadata(&blob, 4096, 1 << 30).unwrap();
         assert_eq!(n2, next);
         assert_eq!(back.len(), 4);
         assert!(matches!(&back[&2].node, Node::File { size: 5000, blocks } if blocks[0] == Some(BlockRef { chunk: 9, nonce: [7; 24] })));
+    }
+
+    #[test]
+    fn metadata_rejects_files_larger_than_the_vault() {
+        let (next, mut inodes) = sample_tree();
+        if let Node::File { size, .. } = &mut inodes.get_mut(&2).unwrap().node {
+            *size = u64::MAX;
+        }
+        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
+        assert!(decode_metadata(&blob, 4096, u64::MAX).is_ok());
     }
 
     #[test]
@@ -1503,7 +1586,7 @@ mod tests {
             entries.insert(b"again".to_vec(), 2);
         }
         let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
-        assert!(decode_metadata(&blob, 4096).is_err());
+        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
 
         // A detached cycle.
         let (next, mut inodes) = sample_tree();
@@ -1512,7 +1595,7 @@ mod tests {
         inodes.insert(10, mk(Node::Dir { parent: 11, entries: BTreeMap::from([(b"x".to_vec(), 11)]) }));
         inodes.insert(11, mk(Node::Dir { parent: 10, entries: BTreeMap::from([(b"y".to_vec(), 10)]) }));
         let blob = encode_metadata(next.max(12), &inodes, vec![1, 2, 3, 4, 10, 11]);
-        assert!(decode_metadata(&blob, 4096).is_err());
+        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
     }
 
     #[test]
@@ -1535,7 +1618,7 @@ mod tests {
             if rnd() % 10 == 0 {
                 b.truncate((rnd() as usize) % b.len());
             }
-            let _ = decode_metadata(&b, 4096);
+            let _ = decode_metadata(&b, 4096, 1 << 30);
         }
     }
 }

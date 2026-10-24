@@ -474,10 +474,18 @@ pub fn mount(fs: Fs, mountpoint: &Path, opts: &MountOptions) -> Result<(), Error
                 if broken.load(Ordering::SeqCst) {
                     break;
                 }
-                if let Ok(mut fs) = shared.lock()
-                    && let Err(e) = fs.maybe_commit()
-                {
-                    eprintln!("nullguard: commit failed: {e}");
+                let Ok(mut fs) = shared.lock() else { break };
+                // Same rule as for FUSE operations: a panic must not leave
+                // half-updated state that a later commit could persist.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fs.maybe_commit())) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => eprintln!("nullguard: commit failed: {e}"),
+                    Err(_) => {
+                        fs.poison();
+                        broken.store(true, Ordering::SeqCst);
+                        eprintln!("nullguard: internal error while committing; refusing further operations");
+                        break;
+                    }
                 }
             }
         })

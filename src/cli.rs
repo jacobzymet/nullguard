@@ -1,7 +1,7 @@
 //! The `nullguard` command line.
 
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -206,20 +206,7 @@ impl Prompter {
     /// Read one secret, NFC-normalized (see `kdf::normalize_password`).
     fn read(&self, prompt: &str) -> Result<Zeroizing<String>> {
         let raw = if self.stdin {
-            // Bounded read into a buffer that never reallocates.
-            let mut line = Zeroizing::new(String::with_capacity(MAX_PASSWORD_BYTES + 3));
-            io::stdin()
-                .lock()
-                .take(MAX_PASSWORD_BYTES as u64 + 2)
-                .read_line(&mut line)
-                .context("reading password from stdin")?;
-            if line.is_empty() {
-                bail!("standard input ended before a password was read");
-            }
-            while line.ends_with('\n') || line.ends_with('\r') {
-                line.pop();
-            }
-            line
+            read_secret_line_from_stdin()?
         } else {
             Zeroizing::new(rpassword::prompt_password(prompt).context("reading password from terminal")?)
         };
@@ -245,6 +232,76 @@ impl Prompter {
     }
 }
 
+/// Read one line (a secret) from standard input.
+///
+/// Rust's `io::stdin()` reads through a shared 8 KiB buffer that is never
+/// wiped, so a password read that way would stay in memory for as long as
+/// the process runs (for `mount`, as long as the vault is unlocked). Instead
+/// this reads byte by byte from a duplicate of the raw stdin handle, straight
+/// into a pre-sized buffer that is wiped on drop. Only the bytes of this one
+/// line are consumed, so several secrets can be read in turn.
+fn read_secret_line_from_stdin() -> Result<Zeroizing<String>> {
+    #[cfg(unix)]
+    let mut raw = std::fs::File::from(std::os::fd::AsFd::as_fd(&io::stdin()).try_clone_to_owned()?);
+    #[cfg(windows)]
+    let mut raw = std::fs::File::from(std::os::windows::io::AsHandle::as_handle(&io::stdin()).try_clone_to_owned()?);
+    let mut line = Zeroizing::new(Vec::with_capacity(MAX_PASSWORD_BYTES + 2));
+    let mut byte = Zeroizing::new([0u8; 1]);
+    let mut got_any = false;
+    loop {
+        match raw.read(byte.as_mut_slice()) {
+            Ok(0) => break,
+            Ok(_) => {
+                got_any = true;
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if line.len() > MAX_PASSWORD_BYTES {
+                    bail!("passwords are limited to {MAX_PASSWORD_BYTES} bytes");
+                }
+                line.push(byte[0]);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("reading password from stdin"),
+        }
+    }
+    if !got_any {
+        bail!("standard input ended before a password was read");
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    let bytes = std::mem::take(&mut *line);
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(Zeroizing::new(s)),
+        Err(e) => {
+            let _wipe = Zeroizing::new(e.into_bytes());
+            bail!("the password is not valid UTF-8")
+        }
+    }
+}
+
+/// Largest keyfile accepted (real ones are well under 1 KiB).
+const MAX_KEYFILE_BYTES: u64 = 64 * 1024;
+
+/// Read a keyfile into one pre-sized, wiped-on-drop buffer, refusing
+/// anything implausibly large.
+fn read_keyfile(path: &Path) -> Result<Zeroizing<String>> {
+    let file = std::fs::File::open(path).with_context(|| format!("reading keyfile {}", path.display()))?;
+    let len = file.metadata()?.len();
+    if len > MAX_KEYFILE_BYTES {
+        bail!("{} is too large to be a nullguard keyfile", path.display());
+    }
+    let mut text = Zeroizing::new(String::with_capacity(len as usize + 1));
+    file.take(MAX_KEYFILE_BYTES + 1)
+        .read_to_string(&mut text)
+        .with_context(|| format!("reading keyfile {}", path.display()))?;
+    if text.len() as u64 > MAX_KEYFILE_BYTES {
+        bail!("{} is too large to be a nullguard keyfile", path.display());
+    }
+    Ok(text)
+}
+
 /// Holds whichever secret unlocks the vault.
 enum Unlocker {
     Password(Zeroizing<String>),
@@ -256,9 +313,7 @@ impl Unlocker {
         match &args.keyfile {
             None => Ok(Self::Password(p.read("Vault password: ")?)),
             Some(path) => {
-                let text = Zeroizing::new(
-                    std::fs::read_to_string(path).with_context(|| format!("reading keyfile {}", path.display()))?,
-                );
+                let text = read_keyfile(path)?;
                 check_keyfile_permissions(path, HybridSecretKey::keyfile_is_encrypted(&text))?;
                 let pass = if HybridSecretKey::keyfile_is_encrypted(&text) {
                     Some(p.read("Keyfile passphrase: ")?)
@@ -366,14 +421,21 @@ fn human(n: u64) -> String {
 }
 
 /// Create a file that only the current user can read (unix: mode 0600).
+///
+/// Never writes *through* a symlink at `path`. With `overwrite`, an existing
+/// regular file is replaced by a new private one (rather than truncated in
+/// place, which would keep its old, possibly world-readable, permissions).
 fn create_private(path: &Path, overwrite: bool) -> io::Result<std::fs::File> {
-    let mut o = OpenOptions::new();
-    o.write(true);
-    if overwrite {
-        o.create(true).truncate(true);
-    } else {
-        o.create_new(true);
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "refusing to write through a symbolic link"));
+        }
+        if overwrite && meta.is_file() {
+            std::fs::remove_file(path)?;
+        }
     }
+    let mut o = OpenOptions::new();
+    o.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -443,6 +505,11 @@ pub fn run() -> Result<()> {
                 bail!("mount point {} is not empty", mountpoint.display());
             }
             let fs = open_fs(&vault, &u, read_only)?;
+            // Check again: unlocking takes seconds, and something may have
+            // appeared in the folder meanwhile.
+            if std::fs::read_dir(&mountpoint)?.next().is_some() {
+                bail!("mount point {} is not empty", mountpoint.display());
+            }
             let mp = mountpoint.clone();
             let opts = MountOptions {
                 read_only,
@@ -460,6 +527,9 @@ pub fn run() -> Result<()> {
         }
 
         Command::Unmount { mountpoint } => {
+            // Hand the helper an absolute path, so a name like "-x" can never
+            // be read as an option by the (setuid) fusermount3.
+            let mountpoint = std::path::absolute(&mountpoint)?;
             mount::unmount(&mountpoint)?;
             eprintln!("Unmounted {}.", mountpoint.display());
         }
@@ -553,20 +623,38 @@ pub fn run() -> Result<()> {
         }
 
         Command::Verify { vault, unlock: u } => {
-            let mut fs = open_fs(&vault, &u, true)?;
+            // `verify` passes only if *everything* is intact: both header
+            // copies, both superblocks, the metadata and every data block.
+            // Any warning raised while opening counts as a failure.
+            let (v, _, _) = unlock(&vault, &u, true)?;
+            let mut problems: Vec<String> = v.warnings.clone();
+            for p in v.check_headers()? {
+                if !problems.contains(&p) {
+                    problems.push(p);
+                }
+            }
+            let mut fs = v.into_fs()?;
+            warn_all(&fs.warnings);
+            problems.extend(fs.warnings.iter().cloned());
             let r = fs.verify()?;
             println!(
                 "Checked {} files, {} directories, {} symlinks, {} blocks.",
                 r.files, r.dirs, r.symlinks, r.blocks_checked
             );
-            if r.bad_blocks.is_empty() {
-                println!("OK: header, metadata and all data blocks are authentic.");
-            } else {
-                for (path, idx, err) in &r.bad_blocks {
-                    eprintln!("BAD: {} block {idx}: {err}", display_name(path.as_bytes()));
-                }
-                bail!("{} block(s) failed verification: the vault was modified or damaged", r.bad_blocks.len());
+            for (path, idx, err) in &r.bad_blocks {
+                eprintln!("BAD: {} block {idx}: {err}", display_name(path.as_bytes()));
             }
+            for p in &problems {
+                eprintln!("BAD: {p}");
+            }
+            if !r.bad_blocks.is_empty() || !problems.is_empty() {
+                bail!(
+                    "verification FAILED ({} bad block(s), {} other problem(s)): the vault was modified or damaged",
+                    r.bad_blocks.len(),
+                    problems.len()
+                );
+            }
+            println!("OK: both header copies, the metadata and all data blocks are authentic.");
         }
 
         Command::Ls { vault, path, unlock: u } => {
@@ -602,7 +690,11 @@ pub fn run() -> Result<()> {
             let mut fs = open_fs(&vault, &u, true)?;
             let ino = resolve(&fs, &path)?;
             let dest = if dest.is_dir() && fs.attr(ino)?.kind != Kind::Dir {
-                dest.join(base_name(&path)?)
+                let name = base_name(&path)?;
+                if !safe_local_name(name) {
+                    bail!("refusing to create a local file with the unsafe name {name:?}");
+                }
+                dest.join(name)
             } else {
                 dest
             };
@@ -679,8 +771,10 @@ fn split_path(path: &str) -> Result<(&str, &str)> {
         Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
         None => ("/", trimmed),
     };
-    if name.is_empty() {
-        bail!("invalid path {path:?}");
+    // "." and ".." would name the parent or grandparent directory itself:
+    // `rm -r /a/b/..` must never mean "delete everything in /a".
+    if name.is_empty() || name == "." || name == ".." {
+        bail!("invalid path {path:?}: it must end in a file or directory name");
     }
     Ok((if dir.is_empty() { "/" } else { dir }, name))
 }
@@ -730,19 +824,33 @@ fn safe_local_name(name: &str) -> bool {
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
         return false;
     }
-    if cfg!(windows) {
-        let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-        let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str())
-            || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4);
-        if reserved
-            || name.contains(['<', '>', ':', '"', '|', '?', '*'])
+    if cfg!(windows) && windows_reserved(name) {
+        return false;
+    }
+    if cfg!(windows)
+        && (name.contains(['<', '>', ':', '"', '|', '?', '*'])
             || name.chars().any(|c| (c as u32) < 32)
-            || name.ends_with(['.', ' '])
-        {
-            return false;
-        }
+            || name.ends_with(['.', ' ']))
+    {
+        return false;
     }
     true
+}
+
+/// Windows device names (`CON`, `NUL`, `COM1`, `LPT¹`, `CONIN$`, ...). Windows
+/// matches them case-insensitively, ignoring any extension and trailing
+/// spaces or dots before it, so `nul .txt` is the NUL device.
+fn windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches([' ', '.']).to_ascii_uppercase();
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str()) {
+        return true;
+    }
+    let mut chars = stem.chars();
+    let prefix: String = chars.by_ref().take(3).collect();
+    let rest: Vec<char> = chars.collect();
+    (prefix == "COM" || prefix == "LPT")
+        && rest.len() == 1
+        && matches!(rest[0], '1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}')
 }
 
 fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool, depth: usize) -> Result<u64> {
@@ -808,8 +916,20 @@ fn export(fs: &mut Fs, ino: u64, dest: &Path, force: bool, depth: usize) -> Resu
     let a = fs.attr(ino)?;
     match a.kind {
         Kind::Dir => {
-            if !dest.exists() {
-                std::fs::create_dir(dest).with_context(|| format!("creating {}", dest.display()))?;
+            match std::fs::symlink_metadata(dest) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    bail!("refusing to export into {}: it is a symbolic link", dest.display())
+                }
+                Ok(m) if !m.is_dir() => bail!("{} exists and is not a directory", dest.display()),
+                Ok(_) => {}
+                Err(_) => {
+                    // Plaintext file names inside: only the owner may list it.
+                    #[allow(unused_mut)] // only mutated on unix
+                    let mut b = std::fs::DirBuilder::new();
+                    #[cfg(unix)]
+                    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+                    b.create(dest).with_context(|| format!("creating {}", dest.display()))?;
+                }
             }
             let mut n = 0;
             for e in fs.readdir(ino)? {
@@ -856,6 +976,9 @@ fn export(fs: &mut Fs, ino: u64, dest: &Path, force: bool, depth: usize) -> Resu
 
 fn remove(fs: &mut Fs, parent: u64, name: &[u8], recursive: bool, depth: usize) -> Result<()> {
     check_depth(depth)?;
+    if name.is_empty() || name == b"." || name == b".." {
+        bail!("refusing to remove {:?}", display_name(name));
+    }
     let ino = fs.lookup(parent, name)?;
     if fs.attr(ino)?.kind == Kind::Dir {
         if !recursive {
@@ -896,6 +1019,9 @@ mod tests {
         assert_eq!(split_path("b").unwrap(), ("/", "b"));
         assert_eq!(split_path("/b/").unwrap(), ("/", "b"));
         assert!(split_path("/").is_err());
+        for bad in ["/.", "/..", "/a/.", "/a/b/..", "a/../", "."] {
+            assert!(split_path(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -928,6 +1054,13 @@ mod tests {
             for bad in ["file:stream", "CON", "nul.txt", "COM1", "a?", "trailing."] {
                 assert!(!safe_local_name(bad), "{bad:?}");
             }
+        }
+        // Device-name matching is tested on every OS (it's pure string logic).
+        for dev in ["CON", "nul.txt", "NUL .txt", "aux..log", "COM1", "lpt9.dat", "COM\u{b9}", "conin$", "CONOUT$.x"] {
+            assert!(windows_reserved(dev), "{dev:?}");
+        }
+        for ok in ["comp.txt", "comm.log", "COM0", "COM10", "console.txt", "nullguard.ngv", "lpt.txt"] {
+            assert!(!windows_reserved(ok), "{ok:?}");
         }
     }
 

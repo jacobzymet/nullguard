@@ -91,6 +91,7 @@ fn aes_gcm_vault_and_random_fill() {
         let mut fs = open_fs(&t);
         let f = fs.create_file(ROOT_INO, b"a", 0o600, 0, 0).unwrap();
         fs.write(f, 0, b"gcm data").unwrap();
+        fs.commit().unwrap();
     }
     let mut fs = open_fs(&t);
     let f = fs.resolve("a").unwrap();
@@ -287,6 +288,89 @@ fn crash_before_commit_keeps_last_committed_state() {
     assert_eq!(fs.verify().unwrap().bad_blocks.len(), 0);
 }
 
+fn header_area(path: &Path) -> Vec<u8> {
+    std::fs::read(path).unwrap()[..(2 * header::HEADER_AREA) as usize].to_vec()
+}
+
+fn restore_header_area(path: &Path, saved: &[u8]) {
+    let file = OpenOptions::new().write(true).open(path).unwrap();
+    write_all_at(&file, saved, 0).unwrap();
+}
+
+/// Putting back an old (authentic) header to revive a removed recipient is
+/// detected: the data was committed under a newer header generation.
+#[test]
+fn restoring_an_old_header_to_revive_a_removed_recipient_is_detected() {
+    let bob = HybridSecretKey::generate().unwrap();
+    let mut o = opts(4 << 20);
+    o.recipients = vec![bob.public_key()];
+    let t = new_vault_with(o);
+    let old_headers = header_area(&t.path);
+    {
+        let mut v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+        v.remove_recipient(&bob.public_key().fingerprint_hex()).unwrap();
+        assert_eq!(v.header().generation, 2);
+    }
+    assert!(matches!(Vault::open(&t.path, Credential::Keyfile(&bob), true), Err(Error::WrongCredentials)));
+
+    restore_header_area(&t.path, &old_headers);
+    // The old header itself is authentic, so Bob's slot unlocks it...
+    let v = Vault::open(&t.path, Credential::Keyfile(&bob), true).unwrap();
+    // ...but the filesystem knows it was committed under generation 2.
+    assert!(matches!(v.into_fs(), Err(Error::HeaderRollback { header: 1, recorded: 2 })));
+    let v = Vault::open(&t.path, Credential::Password(PW), true).unwrap();
+    assert!(matches!(v.into_fs(), Err(Error::HeaderRollback { .. })));
+}
+
+#[test]
+fn restoring_an_old_header_to_revive_an_old_password_is_detected() {
+    let t = new_vault();
+    let old_headers = header_area(&t.path);
+    {
+        let mut v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+        v.change_password(b"a brand new long password", KDF).unwrap();
+    }
+    restore_header_area(&t.path, &old_headers);
+    let v = Vault::open(&t.path, Credential::Password(PW), true).unwrap();
+    assert!(matches!(v.into_fs(), Err(Error::HeaderRollback { .. })));
+}
+
+/// If a header change is interrupted after the backup copy was written,
+/// the newer backup wins (not the stale primary).
+#[test]
+fn newest_header_copy_wins_after_interrupted_change() {
+    let alice = HybridSecretKey::generate().unwrap();
+    let t = new_vault();
+    let gen1 = header_area(&t.path);
+    {
+        let mut v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+        v.add_recipient(&alice.public_key()).unwrap();
+    }
+    // Simulate the interruption: the primary still holds generation 1.
+    restore_header_area(&t.path, &gen1[..header::HEADER_AREA as usize]);
+    let v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    assert_eq!(v.header().generation, 2, "must use the newer backup copy");
+    assert!(v.into_fs().is_ok());
+    assert!(Vault::open(&t.path, Credential::Keyfile(&alice), true).is_ok());
+}
+
+/// Dropping a filesystem never commits: a command that fails halfway
+/// leaves the vault exactly as it was.
+#[test]
+fn uncommitted_changes_are_discarded() {
+    let t = new_vault();
+    {
+        let mut fs = open_fs(&t);
+        fs.create_file(ROOT_INO, b"kept", 0o600, 0, 0).unwrap();
+        fs.commit().unwrap();
+        fs.unlink(ROOT_INO, b"kept").unwrap();
+        fs.create_file(ROOT_INO, b"discarded", 0o600, 0, 0).unwrap();
+    }
+    let fs = open_fs(&t);
+    assert!(fs.resolve("kept").is_ok());
+    assert!(fs.resolve("discarded").is_err());
+}
+
 #[test]
 fn panic_mid_operation_never_commits() {
     let t = new_vault();
@@ -358,6 +442,7 @@ fn change_password() {
         let mut fs = open_fs(&t);
         let f = fs.create_file(ROOT_INO, b"f", 0o600, 0, 0).unwrap();
         fs.write(f, 0, b"keep me").unwrap();
+        fs.commit().unwrap();
     }
     let sk = HybridSecretKey::generate().unwrap();
     {
@@ -504,9 +589,15 @@ fn filling_the_vault_then_freeing_space() {
 /// with commits, crash-free reopens and verification.
 #[test]
 fn random_operations_match_model() {
+    for seed in [0xDEADBEEFCAFEF00Du64, 0x0123456789ABCDEF, 0x9E3779B97F4A7C15, 0xC0FFEE1234567, 42] {
+        random_operations_with_seed(seed, 1500);
+    }
+}
+
+fn random_operations_with_seed(seed: u64, steps: usize) {
     let t = new_vault_with(opts(8 << 20));
     let mut model: Vec<u8> = Vec::new();
-    let mut state = 0xDEADBEEFCAFEF00Du64;
+    let mut state = seed;
     let mut rnd = move || {
         state ^= state << 13;
         state ^= state >> 7;
@@ -515,7 +606,7 @@ fn random_operations_match_model() {
     };
     let mut fs = open_fs(&t);
     let mut f = fs.create_file(ROOT_INO, b"m", 0o600, 0, 0).unwrap();
-    for step in 0..600 {
+    for step in 0..steps {
         match rnd() % 10 {
             0..=5 => {
                 let off = (rnd() % 60_000) as usize;
@@ -556,4 +647,53 @@ fn random_operations_match_model() {
     let mut fs = open_fs(&t);
     assert_eq!(&fs.read(f, 0, 1 << 20).unwrap()[..], &model[..]);
     assert_eq!(fs.verify().unwrap().bad_blocks.len(), 0);
+}
+
+/// Shrinking a file never needs free space, so it works on a full vault
+/// and can't fail halfway (finding NG-03).
+#[test]
+fn shrinking_works_on_a_completely_full_vault() {
+    let t = new_vault_with(opts(1 << 20));
+    let mut fs = open_fs(&t);
+    let f = fs.create_file(ROOT_INO, b"big", 0o600, 0, 0).unwrap();
+    let mut written = 0u64;
+    while fs.write(f, written, &[5u8; 4096]).is_ok() {
+        written += 4096;
+    }
+    fs.commit().unwrap();
+    // Not chunk-aligned, so the last kept block keeps stale bytes.
+    let new_size = written / 2 + 1234;
+    fs.set_attr(f, &SetAttr { size: Some(new_size), ..Default::default() }).unwrap();
+    assert_eq!(fs.attr(f).unwrap().size, new_size);
+    assert!(fs.read(f, 0, usize::MAX >> 1).unwrap().iter().all(|&b| b == 5));
+    // Growing again (both by truncate and by writing past a gap) shows zeros.
+    fs.set_attr(f, &SetAttr { size: Some(new_size + 5000), ..Default::default() }).unwrap();
+    let r = fs.read(f, new_size, 5000).unwrap();
+    assert!(r.iter().all(|&b| b == 0), "stale data resurfaced after growing");
+    fs.set_attr(f, &SetAttr { size: Some(new_size), ..Default::default() }).unwrap();
+    fs.write(f, new_size + 20_000, b"x").unwrap();
+    assert!(fs.read(f, new_size, 20_000).unwrap().iter().all(|&b| b == 0), "stale data resurfaced after a gap write");
+    fs.commit().unwrap();
+}
+
+/// A file claiming to be larger than the whole vault is rejected when the
+/// metadata is loaded (finding NG-06).
+#[test]
+fn metadata_with_an_impossible_file_size_is_rejected() {
+    use crate::vault::fs::Fs;
+    let t = new_vault();
+    {
+        let mut fs = open_fs(&t);
+        let f = fs.create_file(ROOT_INO, b"f", 0o600, 0, 0).unwrap();
+        // Sparse files up to the vault's capacity are fine...
+        fs.set_attr(f, &SetAttr { size: Some(fs.max_file_size()), ..Default::default() }).unwrap();
+        // ...anything bigger is refused at the API.
+        assert!(matches!(
+            fs.set_attr(f, &SetAttr { size: Some(fs.max_file_size() + 1), ..Default::default() }),
+            Err(Error::FileTooBig)
+        ));
+        fs.commit().unwrap();
+        let _: &Fs = &fs;
+    }
+    assert!(Vault::open(&t.path, Credential::Password(PW), true).unwrap().into_fs().is_ok());
 }

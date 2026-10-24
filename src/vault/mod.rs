@@ -24,6 +24,10 @@ use header::{BACKUP_OFFSET, DATA_OFFSET, HEADER_AREA, Header, HeaderError, KeySl
 
 const LABEL_DATA_KEY: &[u8] = b"nullguard/v1/data-key";
 
+/// `FILE_SHARE_READ` from the Win32 API.
+#[cfg(windows)]
+const WIN_FILE_SHARE_READ: u32 = 0x1;
+
 /// Everything that can go wrong with a vault.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -44,6 +48,12 @@ pub enum Error {
     ChunkAuth { chunk: u64 },
     #[error("chunk {chunk} is an older version than expected: the vault was rolled back or tampered with")]
     Rollback { chunk: u64 },
+    #[error(
+        "the vault header is OLDER than the vault's contents (header generation {header}, \
+         but the data was last saved under generation {recorded}). An old header was put back, \
+         for example to undo a password change or a recipient's removal. Refusing to open"
+    )]
+    HeaderRollback { header: u64, recorded: u64 },
     #[error("vault is corrupt: {0}")]
     Corrupt(String),
     #[error("the vault is in use by another nullguard process")]
@@ -148,6 +158,8 @@ impl Vault {
         // get a copy to attack offline.
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut oo, 0o600);
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut oo, 0);
         let file = oo.open(path)?;
         let result = (|| {
             file.try_lock().map_err(|_| Error::InUse)?;
@@ -158,7 +170,7 @@ impl Vault {
             }
             write_headers(&file, &header)?;
             let store = ChunkStore::new(file.try_clone()?, &header, data_aead(&header, &master)?, false);
-            let fs = Fs::format(store, crate::platform::uid(), crate::platform::gid())?;
+            let fs = Fs::format(store, crate::platform::uid(), crate::platform::gid(), header.generation)?;
             drop(fs);
             file.sync_all()?;
             Ok(())
@@ -187,7 +199,16 @@ impl Vault {
 
     /// Unlock a vault.
     pub fn open(path: &Path, cred: Credential<'_>, read_only: bool) -> Result<Self, Error> {
-        let file = OpenOptions::new().read(true).write(!read_only).open(path)?;
+        let mut oo = OpenOptions::new();
+        oo.read(true).write(!read_only);
+        // Windows: while we write, no other process may open, rename or
+        // delete the vault; while we only read, others may read too.
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut oo, if read_only { WIN_FILE_SHARE_READ } else { 0 });
+        let file = oo.open(path).map_err(|e| {
+            // ERROR_SHARING_VIOLATION: another process has the vault open.
+            if cfg!(windows) && e.raw_os_error() == Some(32) { Error::InUse } else { e.into() }
+        })?;
         if read_only { file.try_lock_shared() } else { file.try_lock() }.map_err(|_| Error::InUse)?;
 
         let mut primary = vec![0u8; HEADER_AREA as usize];
@@ -207,6 +228,11 @@ impl Vault {
             );
         }
 
+        // Every copy that authenticates under these credentials is a
+        // candidate; the newest generation wins. (After an interrupted
+        // header change the backup is newer than the primary.)
+        let mut best: Option<(&str, Header, SecretKey)> = None;
+        let mut newest_seen = 0u64;
         for (name, bytes) in copies {
             let header = match Header::parse(bytes) {
                 Ok(h) => h,
@@ -216,9 +242,20 @@ impl Vault {
                     continue;
                 }
             };
-            let master = match &cred {
-                Credential::Password(p) => header.unlock_with_password(p)?,
-                Credential::Keyfile(k) => header.unlock_with_keyfile(k)?,
+            newest_seen = newest_seen.max(header.generation);
+            let unlocked = match &cred {
+                Credential::Password(p) => header.unlock_with_password(p),
+                Credential::Keyfile(k) => header.unlock_with_keyfile(k),
+            };
+            // An error here (e.g. a tampered slot demanding more memory than
+            // exists) must not stop us from trying the other copy.
+            let master = match unlocked {
+                Ok(m) => m,
+                Err(e) => {
+                    warnings.push(format!("the {name} header could not be processed: {e}"));
+                    first_err.get_or_insert(e.into());
+                    continue;
+                }
             };
             let Some(master) = master else {
                 first_err.get_or_insert(Error::WrongCredentials);
@@ -226,7 +263,7 @@ impl Vault {
             };
             if !header.verify_mac(&master)? {
                 // The credentials are right but the header was modified.
-                // Never use it; an untouched backup copy is still safe to use.
+                // Never use it; an untouched other copy is still safe to use.
                 warnings.push(format!(
                     "SECURITY: the {name} header unlocked but FAILED its integrity check. \
                      It has been tampered with or damaged."
@@ -234,20 +271,34 @@ impl Vault {
                 first_err = Some(Error::HeaderTampered);
                 continue;
             }
-            if name == "backup" {
-                warnings.push("the primary header did not unlock; using the backup header".into());
+            if best.as_ref().is_none_or(|(_, b, _)| header.generation > b.generation) {
+                best = Some((name, header, master));
             }
-            let actual_len = file.metadata()?.len();
-            if actual_len < header.file_len() {
-                return Err(Error::Corrupt(format!(
-                    "the vault file is truncated ({actual_len} bytes, expected {})",
-                    header.file_len()
-                )));
-            }
-            return Ok(Self { file, header, master, path: path.to_owned(), read_only, warnings });
         }
-        // A tampered header outranks "wrong password" in the report.
-        Err(first_err.unwrap_or(Error::WrongCredentials))
+
+        let Some((name, header, master)) = best else {
+            // A tampered header outranks "wrong password" in the report.
+            return Err(first_err.unwrap_or(Error::WrongCredentials));
+        };
+        if name == "backup" {
+            warnings.push("the primary header copy was not usable; using the backup copy".into());
+        }
+        if newest_seen > header.generation {
+            warnings.push(format!(
+                "a newer header copy (generation {newest_seen}) exists but does not accept these \
+                 credentials, so the older generation {} is in use. If you just changed the password \
+                 or removed a key, that change was interrupted; redo it. Otherwise this can mean tampering.",
+                header.generation
+            ));
+        }
+        let actual_len = file.metadata()?.len();
+        if actual_len < header.file_len() {
+            return Err(Error::Corrupt(format!(
+                "the vault file is truncated ({actual_len} bytes, expected {})",
+                header.file_len()
+            )));
+        }
+        Ok(Self { file, header, master, path: path.to_owned(), read_only, warnings })
     }
 
     pub fn header(&self) -> &Header {
@@ -259,21 +310,59 @@ impl Vault {
     }
 
     /// Open the filesystem inside the vault.
+    /// Open the filesystem inside the vault. The filesystem's own warnings
+    /// are in `Fs::warnings`; the vault's stay in [`Vault::warnings`].
     pub fn into_fs(self) -> Result<Fs, Error> {
         let store = ChunkStore::new(self.file.try_clone()?, &self.header, data_aead(&self.header, &self.master)?, self.read_only);
-        let mut fs = Fs::open(store)?;
-        let mut w = self.warnings.clone();
-        w.append(&mut fs.warnings);
-        fs.warnings = w;
-        Ok(fs)
+        Fs::open(store, self.header.generation)
     }
 
-    fn write_header(&mut self, new: Header) -> Result<(), Error> {
+    /// Re-read both header copies and report every problem: a copy that
+    /// doesn't parse, fails its MAC under this vault's key, or isn't the
+    /// header in use (stale or substituted). Empty means both copies are
+    /// authentic and identical. Used by `verify`.
+    pub fn check_headers(&self) -> Result<Vec<String>, Error> {
+        let mut problems = Vec::new();
+        for (name, offset) in [("primary", PRIMARY_OFFSET), ("backup", BACKUP_OFFSET)] {
+            let mut buf = vec![0u8; HEADER_AREA as usize];
+            read_exact_at(&self.file, &mut buf, offset)?;
+            match Header::parse(&buf) {
+                Err(e) => problems.push(format!("{name} header copy is unreadable: {e}")),
+                Ok(h) if !h.verify_mac(&self.master)? => {
+                    problems.push(format!("{name} header copy FAILED its integrity check (tampered or damaged)"))
+                }
+                Ok(h) if h != self.header => {
+                    problems.push(format!("{name} header copy is authentic but out of date (stale or substituted)"))
+                }
+                Ok(_) => {}
+            }
+        }
+        Ok(problems)
+    }
+
+    /// Write a changed header as the next generation, then record that
+    /// generation in a filesystem commit. From then on, putting back any
+    /// older header (to revive a removed recipient or an old password) is
+    /// detected when the vault is opened.
+    ///
+    /// Crash safety: the header is written first. If we stop before the
+    /// commit, the data still records the previous generation, and a header
+    /// *newer* than the data is accepted (the next commit catches up).
+    fn write_header(&mut self, mut new: Header) -> Result<(), Error> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
+        new.generation = self
+            .header
+            .generation
+            .checked_add(1)
+            .ok_or(Error::Corrupt("header generation overflow".into()))?;
+        new.seal(&self.master)?;
         write_headers(&self.file, &new)?;
         self.header = new;
+        let store = ChunkStore::new(self.file.try_clone()?, &self.header, data_aead(&self.header, &self.master)?, false);
+        let mut fs = Fs::open(store, self.header.generation)?;
+        fs.commit_header_change()?;
         Ok(())
     }
 

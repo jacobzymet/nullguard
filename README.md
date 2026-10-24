@@ -89,7 +89,7 @@ holds. For full revocation, copy your files into a new vault.
 | `keygen <file>` | Create a hybrid ML-KEM-1024 + X25519 keyfile (passphrase-protected by default). |
 | `add-recipient` / `remove-recipient` | Grant or revoke a keyfile's access. |
 | `info <vault>` | Show header parameters and key slots (no password; not authenticated). |
-| `verify <vault>` | Unlock and authenticate every block. Reports tampering. |
+| `verify <vault>` | Unlock and authenticate both header copies, both superblocks, the metadata and every block. Fails (non-zero exit) on *any* problem or warning. |
 | `ls`, `get`, `put`, `rm`, `mkdir` | Work with files without mounting. |
 
 Every command that needs a secret reads it from the terminal without echo.
@@ -174,20 +174,27 @@ cloud storage, an "evil maid" with access to the file, a compromised backup).
   key covers the entire header. A header copy that fails the MAC is never
   used: nullguard falls back to the other copy only if that one is authentic,
   and prints a security warning either way.
+- **An old header can't be put back.** Every header change (new password,
+  recipient added or removed) increments an authenticated header generation,
+  and every filesystem commit records the generation it was made under.
+  Restoring an older, authentic copy of the header (to revive a removed
+  recipient or an old password) is refused on open. Of two authentic header
+  copies, the newer generation is always used.
 - **Destroying the newest commit** (corrupting the newest superblock to force
   the previous one) is detected and reported as a warning. It rolls back at
   most one commit.
 - **Not prevented:** rolling the *whole* vault back to an earlier, internally
-  consistent state, for example by restoring an older copy of the file (or
-  of its newest superblock, which reverts it to the previous commit).
+  consistent state, for example by restoring an older copy of the entire file
+  (header and data together, or the header plus the previous superblock).
   Without trusted state outside the vault, no offline encryption format can
   detect that (see the roadmap). Mixing old and new parts is detected.
   Deleting or destroying the vault can't be prevented either: keep backups.
-- **Bugs fail safe.** If an operation hits an internal error (a panic) halfway
-  through, nothing more is written, not even at unmount, and the vault keeps
-  its last committed state. An I/O error at the moment of committing
-  likewise stops all further writes for that session rather than risk
-  reusing space the disk may still reference.
+- **Failures never save half-done work.** Changes become durable only through
+  an explicit commit after an operation succeeded. A command that fails
+  partway (an error, a typo'd path, a full vault) or hits an internal error
+  (a panic) leaves the vault exactly at its last commit. An I/O error at the
+  moment of committing stops all further writes for that session rather than
+  risk reusing space the disk may still reference.
 
 **3. Someone who observes the vault file over time** (e.g. every version
 synced to the cloud).
@@ -215,8 +222,11 @@ synced to the cloud).
   (`--no-exec` adds `noexec`). nullguard refuses to mount over a non-empty
   folder, which would hide its contents. Ctrl-C and SIGTERM (e.g. at shutdown)
   commit and unmount cleanly.
-- Vault files are created readable only by their owner (`0600`), so other
-  local users can't even copy them to attack offline. Unencrypted keyfiles
+- On Linux and macOS, vault files are created readable only by their owner
+  (`0600`), so other local users can't even copy them to attack offline.
+  On Windows, files get the permissions of the folder they're created in
+  (your user profile is private by default); keep vaults there or in another
+  folder only you can read. Unencrypted keyfiles
   that other users can read are refused, as ssh does with private keys.
   Passphrase-protected keyfiles with loose permissions get a warning.
 - Key material lives in memory pages locked against swapping and is wiped
@@ -227,11 +237,17 @@ synced to the cloud).
   also blocks `ptrace` and `/proc/<pid>/mem` access by other processes of the
   same user. On macOS it refuses debugger attachment (`PT_DENY_ATTACH`).
 - The vault file is locked while open, so two nullguard processes can't
-  corrupt it. On Windows the lock is mandatory, so other programs can't read
-  the file while it's open.
+  corrupt it. On Windows, while nullguard writes to a vault no other program
+  can open, rename or delete it. During read-only commands (`ls`, `get`,
+  `verify`) other programs may still read the (encrypted) file.
+- `--password-stdin` reads straight from the raw input handle into a wiped
+  buffer, so no copy of the password stays in the process's standard input
+  buffer while a vault is mounted.
 - Partial results never linger: a `get` that fails (e.g. on a tampered
   block) deletes the incomplete output file, and a `put` that fails removes
-  the incomplete file from the vault.
+  the incomplete file from the vault. `get` creates output folders readable
+  only by you (`0700`), never writes through a symbolic link, and with
+  `--force` replaces existing files with new private ones.
 
 ### Out of scope
 
@@ -379,7 +395,8 @@ chunk area is filled with random bytes unless `--quick` is given.
 | 36 | 8 | chunk count N (≥ 16) |
 | 44 | 8 | data offset = 131 072 |
 | 52 | 2 | key slot count (1–32, of which at most 4 password slots) |
-| 54 | 10 | reserved, must be 0 |
+| 54 | 8 | header generation (≥ 1; +1 on every header change) |
+| 62 | 2 | reserved, must be 0 |
 | 64 | … | key slots, each `type u8 ‖ 0x00 ‖ body_len u16 ‖ body` |
 | … | 32 | header MAC |
 | … | … | zero padding to 65 536 bytes (must be zero) |
@@ -440,8 +457,18 @@ before anything else is trusted. It detects modification of any field or
 slot, and it makes unlocking key-committing.
 
 **Two copies.** Headers are written backup first, then primary, each followed
-by an fsync. On open, the primary is tried first, then the backup (with a
-warning). If the copies differ, the user is warned.
+by an fsync. On open, every copy that parses, unlocks and passes its MAC is a
+candidate, and the one with the highest header generation is used. The user
+is warned if the copies differ, if a copy fails, or if a newer copy exists
+that these credentials don't open (an interrupted change, or tampering).
+
+**Header changes and rollback.** A header change writes generation *g + 1*
+to both copies, then immediately makes a filesystem commit that records
+*g + 1* in the superblock. On open, if the newest valid superblock records
+a header generation *greater* than the unlocked header's, the header is an
+old one that was put back, and opening fails. A header *newer* than the
+superblock is accepted: that's a change interrupted before its commit, and
+the next commit catches up.
 
 ### Chunks
 
@@ -463,6 +490,7 @@ Chunks 0 and 1 are **superblock slots**. Every other chunk is either free
 | 4 | filesystem version = 1 |
 | 4 | reserved, 0 |
 | 8 | generation (stored in slot `generation mod 2`) |
+| 8 | header generation this commit was made under |
 | 8 | metadata length in bytes |
 | 32 | SHA-256 of the metadata |
 | 4 | extent count E |
@@ -470,7 +498,10 @@ Chunks 0 and 1 are **superblock slots**. Every other chunk is either free
 
 On open, both superblocks are decrypted. The valid one with the highest
 generation whose metadata also verifies is used. If any slot fails, a warning
-is printed (damage or tampering).
+is printed (damage or tampering). Bytes past a file's end in its last block
+are unspecified (shrinking a file never rewrites data, so it works even on a
+full vault). They are never returned by reads, and are zeroed before the file
+grows over them. A file's size can't exceed the vault's capacity.
 
 **Metadata** (concatenated plaintext of the listed chunks, truncated to its
 length, zero padding enforced):
