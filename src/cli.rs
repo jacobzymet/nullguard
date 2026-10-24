@@ -40,17 +40,17 @@ enum Command {
         #[arg(long)]
         password_stdin: bool,
     },
-    /// Unlock a vault and mount it as a drive (Linux, macOS).
+    /// Unlock a vault and mount it as a drive (Linux, macOS, and Windows with WinFsp).
     Mount {
         vault: PathBuf,
-        /// Existing empty directory to mount on.
+        /// Where to mount: an existing empty directory (Linux, macOS) or a free drive letter such as X: (Windows).
         mountpoint: PathBuf,
         #[command(flatten)]
         unlock: UnlockArgs,
         /// Mount read-only.
         #[arg(long)]
         read_only: bool,
-        /// Forbid running programs stored in the vault.
+        /// Forbid running programs stored in the vault (Linux, macOS).
         #[arg(long)]
         no_exec: bool,
     },
@@ -459,22 +459,13 @@ pub fn run() -> Result<()> {
             if !mount::SUPPORTED {
                 return Err(mount::unsupported().into());
             }
-            let meta = std::fs::metadata(&mountpoint)
-                .with_context(|| format!("mount point {} does not exist", mountpoint.display()))?;
-            if !meta.is_dir() {
-                bail!("mount point {} is not a directory", mountpoint.display());
-            }
             // Mounting over files would hide them (and make it easy to save
             // something "into the vault" that actually lands outside it later).
-            if std::fs::read_dir(&mountpoint)?.next().is_some() {
-                bail!("mount point {} is not empty", mountpoint.display());
-            }
+            mount::check_mountpoint(&mountpoint)?;
             let fs = open_fs(&vault, &u, read_only)?;
             // Check again: unlocking takes seconds, and something may have
-            // appeared in the folder meanwhile.
-            if std::fs::read_dir(&mountpoint)?.next().is_some() {
-                bail!("mount point {} is not empty", mountpoint.display());
-            }
+            // appeared in the folder (or taken the drive letter) meanwhile.
+            mount::check_mountpoint(&mountpoint)?;
             let mp = mountpoint.clone();
             let opts = MountOptions {
                 read_only,
@@ -493,7 +484,9 @@ pub fn run() -> Result<()> {
 
         Command::Unmount { mountpoint } => {
             // Hand the helper an absolute path, so a name like "-x" can never
-            // be read as an option by the (setuid) fusermount3.
+            // be read as an option by the (setuid) fusermount3. (On Windows
+            // the mount point is a drive letter.)
+            #[cfg(not(windows))]
             let mountpoint = std::path::absolute(&mountpoint)?;
             mount::unmount(&mountpoint)?;
             eprintln!("Unmounted {}.", mountpoint.display());

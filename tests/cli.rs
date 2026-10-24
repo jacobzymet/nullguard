@@ -340,9 +340,14 @@ fn exported_directories_are_private() {
     assert_eq!(mode, 0o700);
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
 #[test]
-fn mount_explains_platform_support() {
-    let err = fails(&["mount", "x.ngv", "y"], "");
-    assert!(err.contains("not supported on this platform"), "{err}");
+fn windows_mounts_need_a_free_drive_letter() {
+    let err = fails(&["mount", "x.ngv", "some-folder"], "");
+    assert!(err.contains("drive letter"), "{err}");
+    // C: always exists.
+    let err = fails(&["mount", "x.ngv", "C:"], "");
+    assert!(err.contains("already in use"), "{err}");
+    let err = fails(&["unmount", "Q:"], "");
+    assert!(err.contains("no nullguard vault is mounted"), "{err}");
 }

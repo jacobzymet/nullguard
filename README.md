@@ -8,8 +8,8 @@ keyfile and it appears as a normal folder. Everything inside (file contents,
 names, sizes, directory structure) is encrypted and authenticated. Lock it,
 and it's an opaque blob that detects any tampering.
 
-- **One portable binary.** No installer, no runtime, no DLLs, no kernel
-  driver. Copy `nullguard` (or `nullguard.exe`) onto a USB stick next to
+- **One portable binary.** No installer, no runtime, no DLLs, no driver of its
+  own. Copy `nullguard` (or `nullguard.exe`) onto a USB stick next to
   your vault and go.
 - **Audited cryptography.** XChaCha20-Poly1305 for data, Argon2id for
   passwords and SHA-256 for hashing, all from audited Rust crates.
@@ -50,17 +50,17 @@ and it's an opaque blob that detects any tampering.
 # Create a 10 GiB vault (you'll be asked for a password, twice).
 nullguard create secrets.ngv --size 10G
 
-# Mount it (Linux/macOS). The vault stays unlocked until you unmount.
+# Mount it. The vault stays unlocked until you unmount.
 mkdir ~/vault
-nullguard mount secrets.ngv ~/vault
+nullguard mount secrets.ngv ~/vault      # Windows: nullguard mount secrets.ngv X:
 
 # ... use ~/vault like any folder ...
 
 # Lock it again (or press Ctrl-C in the mount terminal).
-nullguard unmount ~/vault
+nullguard unmount ~/vault                # Windows: nullguard unmount X:
 ```
 
-Without mounting (works everywhere, including Windows today):
+Without mounting (works everywhere, with nothing else installed):
 
 ```bash
 nullguard put secrets.ngv ./taxes /            # copy a folder in
@@ -108,7 +108,7 @@ keyfiles with `nullguard keygen`.
 | Command | What it does |
 |---|---|
 | `create <vault> --size <N>` | Create a vault. `--low-memory` uses 64 MiB for the password's key derivation instead of 1 GiB. |
-| `mount <vault> <dir>` | Unlock and mount. `--keyfile`, `--read-only`, `--no-exec`. Runs in the foreground; Ctrl-C unmounts. |
+| `mount <vault> <dir or X:>` | Unlock and mount on an empty folder (Linux, macOS) or a free drive letter (Windows). `--keyfile`, `--read-only`, `--no-exec` (not on Windows). Runs in the foreground; Ctrl-C unmounts. |
 | `unmount <dir>` | Unmount and lock (commits all changes first). |
 | `change-password <vault>` | Re-wrap the master key under a new password (see the caveat below). `--low-memory` as for `create`. |
 | `rekey <vault>` | Move the vault to a new master key and new password: old passwords, keyfiles and leaked keys stop working. Copies every file, so it needs free space for a second copy while it runs. Keyfiles must be added again afterwards. `--low-memory` as for `create`. |
@@ -140,7 +140,7 @@ permission bits are kept and enforced. Vaults don't store file owners, so
 |---|---|---|---|
 | Linux (x86_64, aarch64) | ✅ FUSE | ✅ | Pure-Rust FUSE: needs only `/dev/fuse` and the standard `fusermount3` helper (package `fuse3`, present on virtually all desktop distros). No libfuse. |
 | macOS | ✅ FUSE | ✅ | Requires [macFUSE](https://osxfuse.github.io/), a system extension that can't be bundled into an app. The binary links macFUSE's libfuse, so macFUSE must be installed for it to start (`--features macos-no-mount` builds an offline-only binary without it). |
-| Windows | ⏳ planned (WinFsp) | ✅ | Until then use `put`/`get`/`ls`/`rm`/`mkdir`. |
+| Windows | ✅ WinFsp | ✅ | Requires [WinFsp](https://winfsp.dev) (free), installed once. nullguard doesn't bundle it: it loads WinFsp from its install folder at run time, so `nullguard.exe` stays portable and only `mount` needs it. Mounts on a drive letter (`nullguard mount v.ngv X:`). Symbolic links in a vault, and names Windows can't represent, aren't shown. |
 
 ## Building a portable binary
 
@@ -159,7 +159,8 @@ cargo build --release
 Release builds use LTO and keep integer-overflow checks on (an overflow is a
 security bug, so it aborts instead of wrapping). Run the tests with `cargo test`
 and the real-mount test with `scripts/mount-test.sh target/release/nullguard`
-(Linux, needs FUSE).
+(Linux, needs FUSE) or `scripts/mount-test-windows.sh target/release/nullguard.exe`
+(Windows, Git Bash, needs WinFsp).
 
 The parsers for untrusted input (header, superblock, metadata, keyfile)
 have fuzz tests in `fuzz/`, which throw millions of random and malformed
@@ -179,7 +180,7 @@ The other targets are `superblock`, `metadata` and `keyfile`.
 ## Compared with VeraCrypt
 
 VeraCrypt is mature and has been audited, and it does things nullguard
-doesn't (system/boot-drive encryption, hidden volumes, Windows mounting).
+doesn't (system/boot-drive encryption, hidden volumes).
 The main differences:
 
 | | VeraCrypt | nullguard |
@@ -189,7 +190,7 @@ The main differences:
 | What a cloud observer sees between versions | Which 16-byte blocks changed (deterministic per sector) | Which chunks changed; rewritten data is indistinguishable from random |
 | Password hashing | PBKDF2 by default (not memory-hard: cheap on GPUs) | Argon2id, 1 GiB by default (memory-hard) |
 | Algorithm choice | 5 ciphers, cascades and 5 hashes; unlocking tries the combinations | One cipher, one password hash, one hash function |
-| Code base | Large C/C++ and assembly, kernel driver, bootloader | Small Rust, user space only |
+| Code base | Large C/C++ and assembly, its own kernel driver, bootloader | Small Rust, user space only (on Windows, mounting uses the separately installed WinFsp driver) |
 | Plausible deniability | Hidden volumes | Not offered (a vault is recognizable as one) |
 | Independent audit | Yes (2016, 2020) | **Not yet** |
 
@@ -281,6 +282,13 @@ synced to the cloud).
   (`--no-exec` adds `noexec`). nullguard refuses to mount over a non-empty
   folder, which would hide its contents. Ctrl-C and SIGTERM (e.g. at shutdown)
   commit and unmount cleanly.
+- On Windows, the drive is likewise only for the user who mounted it: every
+  file and folder carries a fixed permission set that gives that user full
+  access and nobody else any. (Administrators can override file
+  permissions, and can read process memory anyway: see *Out of scope*.) The
+  drive letter only exists in the mounting user's session. Closed files'
+  contents are kept out of Windows' standby cache. Ctrl-C, closing the
+  console window, logging off and shutting down commit and unmount.
 - On Linux and macOS, vault files and keyfiles are created readable only by
   their owner (`0600`), so other local users can't even copy them to attack
   offline. Keyfiles that other users can read are refused, as ssh does with
@@ -597,9 +605,11 @@ src/
     fs.rs          copy-on-write filesystem, metadata, commits
     mod.rs         create / open / change password / keyfiles
     rekey.rs       move a vault to a new master key
-  mount/         OS integration (FUSE on Linux and macOS)
+  mount/         OS integration
+    fuse.rs        FUSE (Linux, macOS)
+    winfsp.rs      WinFsp (Windows): our own minimal bindings + adapter
   cli.rs         command line
-  platform.rs    process hardening (the only module with `unsafe`)
+  platform.rs    process hardening (with mount/winfsp.rs, the only code with `unsafe`)
 tests/cli.rs     end-to-end tests of the binary
 scripts/mount-test.sh  real FUSE mount test (Linux)
 ```
@@ -607,7 +617,6 @@ scripts/mount-test.sh  real FUSE mount test (Linux)
 ## Limitations and roadmap
 
 - **An independent security audit.**
-- **Windows mounting** via WinFsp.
 - **Incremental metadata** (a B-tree instead of rewriting all metadata per
   commit). The current design is best for vaults up to some hundreds of GB
   and up to around a million blocks per commit cycle. Larger vaults

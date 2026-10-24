@@ -49,6 +49,19 @@ jobs:
       - name: Mount test (as root, adds cross-user ownership and isolation checks)
         run: sudo ./scripts/mount-test.sh target/release/nullguard
 
+  mount-test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: choco install winfsp -y --no-progress
+      - run: cargo build --release --locked
+      - name: Mount test (WinFsp)
+        shell: bash
+        run: ./scripts/mount-test-windows.sh target/release/nullguard.exe
+
   # Known-vulnerable or yanked dependencies fail the build.
   audit:
     runs-on: ubuntu-latest
@@ -61,7 +74,7 @@ jobs:
       - run: cargo audit --deny yanked
 
   release-binaries:
-    needs: [test, mount-test, audit]
+    needs: [test, mount-test, mount-test-windows, audit]
     strategy:
       matrix:
         include:
