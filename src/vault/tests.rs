@@ -585,6 +585,43 @@ fn filling_the_vault_then_freeing_space() {
     assert_eq!(fs.verify().unwrap().bad_blocks.len(), 0);
 }
 
+/// With auto-commit off (CLI commands), running out of space partway
+/// through replacing a file never commits: the original survives intact.
+/// (With auto-commit on, the space-reclaiming commit would have persisted
+/// "original deleted, replacement half-written".)
+#[test]
+fn failed_replacement_without_auto_commit_keeps_the_original() {
+    let t = new_vault_with(opts(1 << 20));
+    let original = pattern(400 << 10, 1);
+    {
+        let mut fs = open_fs(&t);
+        let f = fs.create_file(ROOT_INO, b"doc", 0o600, 0, 0).unwrap();
+        fs.write(f, 0, &original).unwrap();
+        fs.commit().unwrap();
+    }
+    {
+        let mut fs = open_fs(&t);
+        fs.set_auto_commit(false);
+        fs.unlink(ROOT_INO, b"doc").unwrap();
+        let f = fs.create_file(ROOT_INO, b"doc", 0o600, 0, 0).unwrap();
+        // Bigger than the free space; the old file's chunks are only pending.
+        let mut off = 0u64;
+        let err = loop {
+            match fs.write(f, off, &[9u8; 4096]) {
+                Ok(()) => off += 4096,
+                Err(e) => break e,
+            }
+            fs.maybe_commit().unwrap();
+            assert!(off < 2 << 20, "never ran out of space");
+        };
+        assert!(matches!(err, Error::NoSpace), "{err}");
+        // Dropped without a commit, like a failing CLI command.
+    }
+    let mut fs = open_fs(&t);
+    let f = fs.resolve("doc").unwrap();
+    assert_eq!(fs.read(f, 0, original.len() + 1).unwrap()[..], original[..]);
+}
+
 /// Differential test: random writes/truncates against an in-memory model,
 /// with commits, crash-free reopens and verification.
 #[test]

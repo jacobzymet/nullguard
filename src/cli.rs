@@ -387,8 +387,11 @@ fn unlock(path: &Path, args: &UnlockArgs, read_only: bool) -> Result<(Vault, Pro
 
 fn open_fs(path: &Path, args: &UnlockArgs, read_only: bool) -> Result<Fs> {
     let (v, _, _) = unlock(path, args, read_only)?;
-    let fs = v.into_fs()?;
+    let mut fs = v.into_fs()?;
     warn_all(&fs.warnings);
+    // Commands are all-or-nothing: nothing is committed until the whole
+    // command has succeeded (see `Fs::set_auto_commit`).
+    fs.set_auto_commit(false);
     Ok(fs)
 }
 
@@ -699,7 +702,7 @@ pub fn run() -> Result<()> {
                 dest
             };
             let n = export(&mut fs, ino, &dest, force, 0)?;
-            println!("Copied {n} file(s) to {}.", dest.display());
+            println!("Copied {n} file(s) to {}.", display_path(&dest));
         }
 
         Command::Put { vault, src, path, force, unlock: u } => {
@@ -817,6 +820,12 @@ fn display_name(raw: &[u8]) -> String {
     out
 }
 
+/// [`display_name`] for a local path that contains vault-controlled names
+/// (the destinations `get` writes to).
+fn display_path(path: &Path) -> String {
+    display_name(path.as_os_str().as_encoded_bytes())
+}
+
 /// Whether a vault entry name can be used as a local file name without
 /// escaping the destination directory (or, on Windows, writing into an
 /// NTFS alternate data stream or a device such as `CON`).
@@ -896,7 +905,6 @@ fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool, depth:
             }
             fs.write(ino, off, &buf[..n])?;
             off += n as u64;
-            fs.maybe_commit()?;
         }
         if let Ok(m) = meta.modified() {
             fs.set_attr(ino, &vault::fs::SetAttr { mtime: Some(Timestamp::from_system(m)), ..Default::default() })?;
@@ -918,9 +926,9 @@ fn export(fs: &mut Fs, ino: u64, dest: &Path, force: bool, depth: usize) -> Resu
         Kind::Dir => {
             match std::fs::symlink_metadata(dest) {
                 Ok(m) if m.file_type().is_symlink() => {
-                    bail!("refusing to export into {}: it is a symbolic link", dest.display())
+                    bail!("refusing to export into {}: it is a symbolic link", display_path(dest))
                 }
-                Ok(m) if !m.is_dir() => bail!("{} exists and is not a directory", dest.display()),
+                Ok(m) if !m.is_dir() => bail!("{} exists and is not a directory", display_path(dest)),
                 Ok(_) => {}
                 Err(_) => {
                     // Plaintext file names inside: only the owner may list it.
@@ -928,7 +936,7 @@ fn export(fs: &mut Fs, ino: u64, dest: &Path, force: bool, depth: usize) -> Resu
                     let mut b = std::fs::DirBuilder::new();
                     #[cfg(unix)]
                     std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-                    b.create(dest).with_context(|| format!("creating {}", dest.display()))?;
+                    b.create(dest).with_context(|| format!("creating {}", display_path(dest)))?;
                 }
             }
             let mut n = 0;
@@ -938,19 +946,19 @@ fn export(fs: &mut Fs, ino: u64, dest: &Path, force: bool, depth: usize) -> Resu
                 }
                 let name = String::from_utf8_lossy(&e.name).into_owned();
                 if !safe_local_name(&name) {
-                    bail!("refusing to create a local file with the unsafe name {name:?}");
+                    bail!("refusing to create a local file with the unsafe name {}", display_name(&e.name));
                 }
                 n += export(fs, e.ino, &dest.join(&name), force, depth + 1)?;
             }
             Ok(n)
         }
         Kind::Symlink => {
-            eprintln!("skipping symlink {}", dest.display());
+            eprintln!("skipping symlink {}", display_path(dest));
             Ok(0)
         }
         Kind::File => {
             let mut out = create_private(dest, force).with_context(|| {
-                format!("creating {} (use --force to overwrite existing files)", dest.display())
+                format!("creating {} (use --force to overwrite existing files)", display_path(dest))
             })?;
             let copy = (|| -> Result<()> {
                 let mut off = 0;
@@ -967,7 +975,7 @@ fn export(fs: &mut Fs, ino: u64, dest: &Path, force: bool, depth: usize) -> Resu
                 // fails authentication halfway through.
                 drop(out);
                 let _ = std::fs::remove_file(dest);
-                return Err(e.context(format!("copying out to {}", dest.display())));
+                return Err(e.context(format!("copying out to {}", display_path(dest))));
             }
             Ok(1)
         }
@@ -1036,6 +1044,9 @@ mod tests {
         assert!(!spoof.contains('\u{202e}') && spoof.contains("\\u{202e}"));
         // Invalid UTF-8 doesn't panic.
         assert!(!display_name(&[0xff, 0xfe, b'a']).is_empty());
+        // Local paths built from vault names (what `get` prints) too.
+        let p = Path::new("out").join("\x1b]0;pwned\x07name");
+        assert!(!display_path(&p).chars().any(|c| c.is_control()), "{:?}", display_path(&p));
     }
 
     #[test]

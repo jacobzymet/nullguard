@@ -182,17 +182,24 @@ cloud storage, an "evil maid" with access to the file, a compromised backup).
   copies, the newer generation is always used.
 - **Destroying the newest commit** (corrupting the newest superblock to force
   the previous one) is detected and reported as a warning. It rolls back at
-  most one commit.
+  most one commit. Putting an *older copy* of that superblock back instead
+  is not detected: the result is exactly the vault as it was one commit
+  earlier, so it falls under the next point.
 - **Not prevented:** rolling the *whole* vault back to an earlier, internally
   consistent state, for example by restoring an older copy of the entire file
   (header and data together, or the header plus the previous superblock).
   Without trusted state outside the vault, no offline encryption format can
-  detect that (see the roadmap). Mixing old and new parts is detected.
+  detect that (see the roadmap). Mixing old and new parts below the
+  superblock (metadata, data blocks) is detected.
   Deleting or destroying the vault can't be prevented either: keep backups.
 - **Failures never save half-done work.** Changes become durable only through
   an explicit commit after an operation succeeded. A command that fails
   partway (an error, a typo'd path, a full vault) or hits an internal error
-  (a panic) leaves the vault exactly at its last commit. An I/O error at the
+  (a panic) leaves the vault exactly at its last commit: `put`, `rm` and
+  `mkdir` are all-or-nothing, so a failed `put --force` keeps the original
+  file. (Replacing a file therefore needs room for both copies until the
+  command finishes.) A mounted vault commits every few seconds, like a
+  normal drive. An I/O error at the
   moment of committing stops all further writes for that session rather than
   risk reusing space the disk may still reference.
 
@@ -229,10 +236,11 @@ synced to the cloud).
   folder only you can read. Unencrypted keyfiles
   that other users can read are refused, as ssh does with private keys.
   Passphrase-protected keyfiles with loose permissions get a warning.
-- Key material lives in memory pages locked against swapping and is wiped
-  (`zeroize`) when no longer needed. That includes Argon2's working memory,
-  from which the derived key could otherwise be recomputed, and file names
-  when the vault closes. If the OS refuses to lock memory, nullguard says so.
+- Keys live in memory pages locked against swapping and are wiped
+  (`zeroize`) when no longer needed. If the OS refuses to lock memory,
+  nullguard says so. Argon2's working memory (from which the derived key
+  could otherwise be recomputed) and file names are wiped too, but they are
+  too large to lock, so they can reach unencrypted swap: use encrypted swap.
   Core dumps are disabled. On Linux the process is marked non-dumpable, which
   also blocks `ptrace` and `/proc/<pid>/mem` access by other processes of the
   same user. On macOS it refuses debugger attachment (`PT_DENY_ATTACH`).

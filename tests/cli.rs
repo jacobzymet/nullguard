@@ -176,6 +176,28 @@ fn failed_get_leaves_no_partial_plaintext() {
     assert!(!out.exists(), "partial plaintext was left behind");
 }
 
+/// A `put --force` that fails partway (here: the replacement doesn't fit)
+/// once committed mid-copy to reclaim the old file's space, leaving a
+/// truncated replacement in the vault and the original gone.
+#[test]
+fn failed_put_force_keeps_the_original_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    ok(&[&["create", v, "--size", "8M", "--quick", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    let src = dir.path().join("f.bin");
+    let original = vec![0x11u8; 5_000_000];
+    std::fs::write(&src, &original).unwrap();
+    ok(&["put", v, s(&src), "/", "--password-stdin"], &format!("{PW}\n"));
+
+    std::fs::write(&src, vec![0x22u8; 7_000_000]).unwrap();
+    fails(&["put", v, s(&src), "/", "--force", "--password-stdin"], &format!("{PW}\n"));
+
+    let out = dir.path().join("out.bin");
+    ok(&["get", v, "/f.bin", s(&out), "--password-stdin"], &format!("{PW}\n"));
+    assert!(std::fs::read(&out).unwrap() == original, "the original file was lost or altered");
+}
+
 /// Regression for review finding NG-01: `rm -r <dir>/..` once deleted the
 /// parent's contents, then failed, and the deletion was still committed.
 #[test]

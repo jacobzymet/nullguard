@@ -328,6 +328,11 @@ pub struct Fs {
     pub warnings: Vec<String>,
     /// Set when a commit failed after writing its superblock (see `commit_now`).
     poisoned: bool,
+    /// Whether the filesystem may commit on its own: timed commits in
+    /// `maybe_commit`, and commits that reclaim space when the vault is
+    /// full. On for mounts; off for CLI commands, which must be
+    /// all-or-nothing (see [`Fs::set_auto_commit`]).
+    auto_commit: bool,
 }
 
 impl Fs {
@@ -379,6 +384,7 @@ impl Fs {
             last_commit_took: Duration::ZERO,
             warnings: Vec::new(),
             poisoned: false,
+            auto_commit: true,
         })
     }
 
@@ -511,11 +517,23 @@ impl Fs {
         self.dirty
     }
 
+    /// Allow or forbid commits the caller didn't ask for (on by default).
+    ///
+    /// With auto-commit off, nothing becomes durable until an explicit
+    /// [`Fs::commit`], so an operation that fails partway (for example a
+    /// `put --force` that runs out of space after replacing a file) leaves
+    /// the vault exactly as it was. The cost: space held by chunks freed
+    /// since the last commit can't be reused until that commit.
+    pub fn set_auto_commit(&mut self, enabled: bool) {
+        self.auto_commit = enabled;
+    }
+
     /// Commit if dirty and enough time has passed (adaptive: never spend
-    /// more than ~10% of the time committing).
+    /// more than ~10% of the time committing). Does nothing with
+    /// auto-commit off.
     pub fn maybe_commit(&mut self) -> Result<(), Error> {
         let wait = COMMIT_INTERVAL.max(self.last_commit_took * 10);
-        if self.dirty && self.last_commit.elapsed() >= wait {
+        if self.auto_commit && self.dirty && self.last_commit.elapsed() >= wait {
             self.commit_now()?;
         }
         Ok(())
@@ -669,8 +687,9 @@ impl Fs {
     }
 
     fn alloc_data_chunk(&mut self) -> Result<u64, Error> {
-        if self.bitmap.free <= self.reserve() && !self.pending_free.is_empty() {
+        if self.auto_commit && self.bitmap.free <= self.reserve() && !self.pending_free.is_empty() {
             // Free space is held by superseded chunks: commit to reclaim it.
+            // (This commits mid-operation, so it's only allowed with auto-commit.)
             self.commit_now()?;
         }
         if self.bitmap.free <= self.reserve() {
@@ -1387,6 +1406,11 @@ fn decode_metadata(blob: &[u8], chunk_size: u64, max_file_size: u64) -> Result<(
         let perm = r.u16().map_err(e)?;
         let uid = r.u32().map_err(e)?;
         let gid = r.u32().map_err(e)?;
+        // Only permission bits: anything higher would be OR-ed into the
+        // file type reported to the OS (e.g. a file shown as a socket).
+        if perm & !0o7777 != 0 {
+            return Err(bad("permission bits"));
+        }
         let mut ts = [Timestamp { secs: 0, nanos: 0 }; 4];
         for t in &mut ts {
             *t = Timestamp { secs: r.i64().map_err(e)?, nanos: r.u32().map_err(e)? };
@@ -1440,7 +1464,12 @@ fn decode_metadata(blob: &[u8], chunk_size: u64, max_file_size: u64) -> Result<(
                 if len == 0 || len > MAX_SYMLINK_LEN {
                     return Err(bad("symlink length"));
                 }
-                Node::Symlink { target: r.take(len).map_err(e)?.to_vec() }
+                let target = r.take(len).map_err(e)?;
+                // Same rule as `Fs::symlink`.
+                if target.contains(&0) {
+                    return Err(bad("symlink target"));
+                }
+                Node::Symlink { target: target.to_vec() }
             }
             _ => return Err(bad("inode kind")),
         };
@@ -1595,6 +1624,25 @@ mod tests {
         inodes.insert(10, mk(Node::Dir { parent: 11, entries: BTreeMap::from([(b"x".to_vec(), 11)]) }));
         inodes.insert(11, mk(Node::Dir { parent: 10, entries: BTreeMap::from([(b"y".to_vec(), 10)]) }));
         let blob = encode_metadata(next.max(12), &inodes, vec![1, 2, 3, 4, 10, 11]);
+        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
+    }
+
+    #[test]
+    fn metadata_rejects_file_type_bits_and_nul_in_symlinks() {
+        // perm with S_IFSOCK-style type bits.
+        let (next, mut inodes) = sample_tree();
+        inodes.get_mut(&2).unwrap().perm = 0o140644;
+        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
+        // Setuid/setgid/sticky are ordinary permission bits and stay allowed.
+        let (next, mut inodes) = sample_tree();
+        inodes.get_mut(&2).unwrap().perm = 0o7777;
+        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, 4096, 1 << 30).is_ok());
+
+        let (next, mut inodes) = sample_tree();
+        inodes.get_mut(&4).unwrap().node = Node::Symlink { target: b"a\0b".to_vec() };
+        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
         assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
     }
 
