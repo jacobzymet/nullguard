@@ -118,8 +118,6 @@ pub enum Node {
 #[derive(Clone, Debug)]
 pub struct Inode {
     pub perm: u16,
-    pub uid: u32,
-    pub gid: u32,
     pub atime: Timestamp,
     pub mtime: Timestamp,
     pub ctime: Timestamp,
@@ -147,8 +145,6 @@ pub struct Attr {
     pub blocks: u64,
     pub perm: u16,
     pub nlink: u32,
-    pub uid: u32,
-    pub gid: u32,
     pub atime: Timestamp,
     pub mtime: Timestamp,
     pub ctime: Timestamp,
@@ -166,8 +162,6 @@ pub struct DirEntry {
 #[derive(Clone, Debug, Default)]
 pub struct SetAttr {
     pub perm: Option<u16>,
-    pub uid: Option<u32>,
-    pub gid: Option<u32>,
     pub size: Option<u64>,
     pub atime: Option<Timestamp>,
     pub mtime: Option<Timestamp>,
@@ -343,15 +337,13 @@ pub struct Fs {
 impl Fs {
     /// Create an empty filesystem (root directory only) and commit it to
     /// both superblock slots.
-    pub fn format(store: ChunkStore, uid: u32, gid: u32, header_hash: [u8; 32]) -> Result<Self, Error> {
+    pub fn format(store: ChunkStore, header_hash: [u8; 32]) -> Result<Self, Error> {
         let mut fs = Self::empty(store, header_hash)?;
         let now = Timestamp::now();
         fs.inodes.insert(
             ROOT_INO,
             Inode {
                 perm: 0o700,
-                uid,
-                gid,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -769,8 +761,6 @@ impl Fs {
             blocks: used / 512,
             perm: i.perm,
             nlink,
-            uid: i.uid,
-            gid: i.gid,
             atime: i.atime,
             mtime: i.mtime,
             ctime: i.ctime,
@@ -842,7 +832,7 @@ impl Fs {
         }
     }
 
-    fn add_entry(&mut self, parent: u64, name: &[u8], perm: u16, uid: u32, gid: u32, node: Node) -> Result<u64, Error> {
+    fn add_entry(&mut self, parent: u64, name: &[u8], perm: u16, node: Node) -> Result<u64, Error> {
         self.check_writable()?;
         validate_name(name)?;
         if self.dir_entries(parent)?.contains_key(name) {
@@ -853,7 +843,7 @@ impl Fs {
         let now = Timestamp::now();
         self.inodes.insert(
             ino,
-            Inode { perm: perm & 0o7777, uid, gid, atime: now, mtime: now, ctime: now, crtime: now, node },
+            Inode { perm: perm & 0o7777, atime: now, mtime: now, ctime: now, crtime: now, node },
         );
         if let Node::Dir { entries, .. } = &mut self.inode_mut(parent)?.node {
             entries.insert(name.to_vec(), ino);
@@ -863,19 +853,19 @@ impl Fs {
         Ok(ino)
     }
 
-    pub fn create_file(&mut self, parent: u64, name: &[u8], perm: u16, uid: u32, gid: u32) -> Result<u64, Error> {
-        self.add_entry(parent, name, perm, uid, gid, Node::File { size: 0, blocks: Vec::new() })
+    pub fn create_file(&mut self, parent: u64, name: &[u8], perm: u16) -> Result<u64, Error> {
+        self.add_entry(parent, name, perm, Node::File { size: 0, blocks: Vec::new() })
     }
 
-    pub fn mkdir(&mut self, parent: u64, name: &[u8], perm: u16, uid: u32, gid: u32) -> Result<u64, Error> {
-        self.add_entry(parent, name, perm, uid, gid, Node::Dir { parent, entries: BTreeMap::new() })
+    pub fn mkdir(&mut self, parent: u64, name: &[u8], perm: u16) -> Result<u64, Error> {
+        self.add_entry(parent, name, perm, Node::Dir { parent, entries: BTreeMap::new() })
     }
 
-    pub fn symlink(&mut self, parent: u64, name: &[u8], target: &[u8], uid: u32, gid: u32) -> Result<u64, Error> {
+    pub fn symlink(&mut self, parent: u64, name: &[u8], target: &[u8]) -> Result<u64, Error> {
         if target.is_empty() || target.len() > MAX_SYMLINK_LEN || target.contains(&0) {
             return Err(Error::InvalidArgument);
         }
-        self.add_entry(parent, name, 0o777, uid, gid, Node::Symlink { target: target.to_vec() })
+        self.add_entry(parent, name, 0o777, Node::Symlink { target: target.to_vec() })
     }
 
     /// Remove the entry `name` from `parent` and dispose of the inode
@@ -1189,12 +1179,6 @@ impl Fs {
         if let Some(p) = set.perm {
             i.perm = p & 0o7777;
         }
-        if let Some(u) = set.uid {
-            i.uid = u;
-        }
-        if let Some(g) = set.gid {
-            i.gid = g;
-        }
         if let Some(t) = set.atime {
             i.atime = t;
         }
@@ -1420,8 +1404,6 @@ fn encode_metadata(next_ino: u64, inodes: &HashMap<u64, Inode>, order: Vec<u64>)
             Node::Symlink { .. } => KIND_SYMLINK,
         });
         out.extend_from_slice(&i.perm.to_le_bytes());
-        out.extend_from_slice(&i.uid.to_le_bytes());
-        out.extend_from_slice(&i.gid.to_le_bytes());
         for t in [i.atime, i.mtime, i.ctime, i.crtime] {
             put_ts(&mut out, t);
         }
@@ -1469,8 +1451,9 @@ fn decode_metadata(blob: &[u8], chunk_size: u64, max_file_size: u64) -> Result<(
     }
     let next_ino = r.u64().map_err(e)?;
     let count = r.u64().map_err(e)?;
-    // Each inode takes at least 63 bytes, which bounds `count` by the blob.
-    if count == 0 || count > blob.len() as u64 / 63 {
+    // Each inode takes at least 59 bytes (its fixed fields), which bounds
+    // `count` by the blob.
+    if count == 0 || count > blob.len() as u64 / 59 {
         return Err(bad("inode count"));
     }
     let mut inodes = HashMap::with_capacity(count as usize);
@@ -1478,8 +1461,6 @@ fn decode_metadata(blob: &[u8], chunk_size: u64, max_file_size: u64) -> Result<(
         let ino = r.u64().map_err(e)?;
         let kind = r.u8().map_err(e)?;
         let perm = r.u16().map_err(e)?;
-        let uid = r.u32().map_err(e)?;
-        let gid = r.u32().map_err(e)?;
         // Only permission bits: anything higher would be OR-ed into the
         // file type reported to the OS (e.g. a file shown as a socket).
         if perm & !0o7777 != 0 {
@@ -1550,7 +1531,7 @@ fn decode_metadata(blob: &[u8], chunk_size: u64, max_file_size: u64) -> Result<(
         if ino == 0 || ino >= next_ino {
             return Err(bad("inode number"));
         }
-        let inode = Inode { perm, uid, gid, atime: ts[0], mtime: ts[1], ctime: ts[2], crtime: ts[3], node };
+        let inode = Inode { perm, atime: ts[0], mtime: ts[1], ctime: ts[2], crtime: ts[3], node };
         if inodes.insert(ino, inode).is_some() {
             return Err(bad("duplicate inode"));
         }
@@ -1650,7 +1631,7 @@ mod tests {
 
     fn sample_tree() -> (u64, HashMap<u64, Inode>) {
         let ts = Timestamp { secs: 1, nanos: 2 };
-        let mk = |node| Inode { perm: 0o644, uid: 1, gid: 2, atime: ts, mtime: ts, ctime: ts, crtime: ts, node };
+        let mk = |node| Inode { perm: 0o644, atime: ts, mtime: ts, ctime: ts, crtime: ts, node };
         let mut inodes = HashMap::new();
         inodes.insert(ROOT_INO, mk(Node::Dir { parent: ROOT_INO, entries: BTreeMap::from([(b"f".to_vec(), 2), (b"d".to_vec(), 3)]) }));
         inodes.insert(2, mk(Node::File { size: 5000, blocks: vec![Some(BlockRef { chunk: 9, nonce: [7; 24] })] }));
@@ -1694,7 +1675,7 @@ mod tests {
         // A detached cycle.
         let (next, mut inodes) = sample_tree();
         let ts = Timestamp { secs: 0, nanos: 0 };
-        let mk = |node| Inode { perm: 0, uid: 0, gid: 0, atime: ts, mtime: ts, ctime: ts, crtime: ts, node };
+        let mk = |node| Inode { perm: 0, atime: ts, mtime: ts, ctime: ts, crtime: ts, node };
         inodes.insert(10, mk(Node::Dir { parent: 11, entries: BTreeMap::from([(b"x".to_vec(), 11)]) }));
         inodes.insert(11, mk(Node::Dir { parent: 10, entries: BTreeMap::from([(b"y".to_vec(), 10)]) }));
         let blob = encode_metadata(next.max(12), &inodes, vec![1, 2, 3, 4, 10, 11]);

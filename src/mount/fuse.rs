@@ -27,7 +27,8 @@ struct NullguardFs {
     broken: Arc<AtomicBool>,
     /// Every file is presented as owned by the user who mounted the vault.
     /// A vault is a personal container that moves between machines (and
-    /// OSes), where stored uids are meaningless: like a USB stick.
+    /// OSes), where user ids mean nothing, so it doesn't store any: like a
+    /// USB stick.
     uid: u32,
     gid: u32,
 }
@@ -182,10 +183,8 @@ impl Filesystem for NullguardFs {
     ) {
         let set = SetAttr {
             perm: mode.map(|m| (m & 0o7777) as u16),
-            // Ownership is always the mounting user (see `NullguardFs::uid`),
-            // so chown is accepted but has no effect, as on a FAT drive.
-            uid: None,
-            gid: None,
+            // Ownership is always the mounting user (see `NullguardFs::uid`) and
+            // isn't stored, so chown is accepted but has no effect, as on a FAT drive.
             size,
             atime: atime.map(ts),
             mtime: mtime.map(ts),
@@ -203,10 +202,10 @@ impl Filesystem for NullguardFs {
         }
     }
 
-    fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
+    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
         let perm = (mode & !umask & 0o7777) as u16;
         match self.run(|fs| {
-            let ino = fs.mkdir(parent.0, name.as_bytes(), perm, req.uid(), req.gid())?;
+            let ino = fs.mkdir(parent.0, name.as_bytes(), perm)?;
             fs.attr(ino)
         }) {
             Ok(a) => reply.entry(&TTL, &self.attr(&a), Generation(0)),
@@ -228,9 +227,9 @@ impl Filesystem for NullguardFs {
         }
     }
 
-    fn symlink(&self, req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
+    fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
         match self.run(|fs| {
-            let ino = fs.symlink(parent.0, link_name.as_bytes(), target.as_os_str().as_bytes(), req.uid(), req.gid())?;
+            let ino = fs.symlink(parent.0, link_name.as_bytes(), target.as_os_str().as_bytes())?;
             fs.attr(ino)
         }) {
             Ok(a) => reply.entry(&TTL, &self.attr(&a), Generation(0)),
@@ -386,7 +385,7 @@ impl Filesystem for NullguardFs {
 
     fn create(
         &self,
-        req: &Request,
+        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -404,7 +403,7 @@ impl Filesystem for NullguardFs {
         }
         let perm = (mode & !umask & 0o7777) as u16;
         match self.run(|fs| {
-            let ino = fs.create_file(parent.0, name.as_bytes(), perm, req.uid(), req.gid())?;
+            let ino = fs.create_file(parent.0, name.as_bytes(), perm)?;
             fs.open_file(ino)?;
             fs.attr(ino)
         }) {

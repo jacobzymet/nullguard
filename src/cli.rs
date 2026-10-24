@@ -718,7 +718,7 @@ pub fn run() -> Result<()> {
             let mut fs = open_fs(&vault, &u, false)?;
             let (dir, name) = split_path(&path)?;
             let parent = resolve(&fs, dir)?;
-            fs.mkdir(parent, name.as_bytes(), 0o700, crate::platform::uid(), crate::platform::gid())?;
+            fs.mkdir(parent, name.as_bytes(), 0o700)?;
             fs.commit()?;
             println!("Created {path}.");
         }
@@ -844,12 +844,11 @@ fn windows_reserved(name: &str) -> bool {
 fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool, depth: usize) -> Result<u64> {
     check_depth(depth)?;
     let meta = std::fs::symlink_metadata(src).with_context(|| format!("reading {}", src.display()))?;
-    let (uid, gid) = (crate::platform::uid(), crate::platform::gid());
     if meta.is_dir() {
         let dir = match fs.lookup(parent, name) {
             Ok(ino) if fs.attr(ino)?.kind == Kind::Dir => ino,
             Ok(_) => bail!("{} exists in the vault and is not a directory", display_name(name)),
-            Err(_) => fs.mkdir(parent, name, 0o700, uid, gid)?,
+            Err(_) => fs.mkdir(parent, name, 0o700)?,
         };
         let mut n = 0;
         for entry in std::fs::read_dir(src)? {
@@ -873,7 +872,7 @@ fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool, depth:
         fs.unlink(parent, name)?;
     }
     let mut f = std::fs::File::open(src).with_context(|| format!("opening {}", src.display()))?;
-    let ino = fs.create_file(parent, name, 0o600, uid, gid)?;
+    let ino = fs.create_file(parent, name, 0o600)?;
     let copy = (|| -> Result<()> {
         let mut buf = Zeroizing::new(vec![0u8; COPY_BUF]);
         let mut off = 0u64;

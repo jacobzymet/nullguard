@@ -131,7 +131,8 @@ on every OS and keyboard.
 
 Inside a mounted vault, every file appears owned by you, the user who
 mounted it, whatever machine or OS created it (like a USB stick). File
-permission bits are kept and enforced. `chown` has no effect.
+permission bits are kept and enforced. Vaults don't store file owners, so
+`chown` has no effect.
 
 ## Platform support
 
@@ -446,7 +447,7 @@ chunk area is filled with random bytes.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | magic `NULLGARD` |
-| 8 | 2 | version = 2 |
+| 8 | 2 | version = 3 |
 | 10 | 16 | vault ID (random) |
 | 26 | 4 | chunk size: power of two, 4 KiB to 1 MiB |
 | 30 | 8 | chunk count N (≥ 16) |
@@ -512,7 +513,7 @@ length, zero padding enforced):
 ```text
 "NGMETA02" ‖ next_inode u64 ‖ inode_count u64 ‖ inode*
 
-inode = ino u64 ‖ kind u8 (1 file, 2 dir, 3 symlink) ‖ perm u16 ‖ uid u32 ‖ gid u32
+inode = ino u64 ‖ kind u8 (1 file, 2 dir, 3 symlink) ‖ perm u16
         ‖ (atime, mtime, ctime, crtime) each as secs i64 ‖ nanos u32
         ‖ file:    size u64 ‖ block_count u64 ‖ block*      block = 0 u64 (hole)
                                                                   | chunk u64 ‖ nonce (24)

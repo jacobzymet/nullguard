@@ -111,7 +111,7 @@ pub fn rekey(
 }
 
 /// Copy everything under the root of `from` into the root of `to`,
-/// keeping names, permissions, owners and access/modification times.
+/// keeping names, permissions and access/modification times.
 /// Blocks that are all zeros are left as holes. Iterative, so deep trees
 /// can't overflow the stack.
 fn copy_tree(from: &mut Fs, to: &mut Fs, report: &mut RekeyReport) -> Result<(), Error> {
@@ -131,17 +131,17 @@ fn copy_tree(from: &mut Fs, to: &mut Fs, report: &mut RekeyReport) -> Result<(),
             let a = from.attr(e.ino)?;
             let new = match a.kind {
                 Kind::Dir => {
-                    let d = to.mkdir(dst_dir, &e.name, a.perm, a.uid, a.gid)?;
+                    let d = to.mkdir(dst_dir, &e.name, a.perm)?;
                     stack.push((e.ino, d));
                     continue; // times are set once its contents are copied
                 }
                 Kind::Symlink => {
                     report.symlinks += 1;
-                    to.symlink(dst_dir, &e.name, &from.readlink(e.ino)?, a.uid, a.gid)?
+                    to.symlink(dst_dir, &e.name, &from.readlink(e.ino)?)?
                 }
                 Kind::File => {
                     report.files += 1;
-                    let f = to.create_file(dst_dir, &e.name, a.perm, a.uid, a.gid)?;
+                    let f = to.create_file(dst_dir, &e.name, a.perm)?;
                     let block = a.blksize as usize;
                     let mut off = 0;
                     while off < a.size {

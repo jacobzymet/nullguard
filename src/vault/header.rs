@@ -6,7 +6,7 @@
 //! ```text
 //! offset  size   field
 //!      0     8   magic "NULLGARD"
-//!      8     2   version = 2
+//!      8     2   version = 3
 //!     10    16   vault id (random)
 //!     26     4   chunk size (power of two, 4 KiB to 1 MiB)
 //!     30     8   chunk count (>= 16)
@@ -39,7 +39,7 @@ use crate::crypto::{
 };
 
 pub const MAGIC: [u8; 8] = *b"NULLGARD";
-pub const FORMAT_VERSION: u16 = 2;
+pub const FORMAT_VERSION: u16 = 3;
 
 /// Size of one header copy on disk.
 pub const HEADER_AREA: u64 = 4096;
@@ -73,8 +73,8 @@ pub enum HeaderError {
     NotAVault,
     #[error(
         "this vault was made by a different version of nullguard (vault version {0}) and can't be \
-         opened by this one. For vaults made by nullguard 0.1: copy the files out with nullguard 0.1 \
-         (`get`), then into a new vault (`put`)"
+         opened by this one. Copy the files out with the nullguard version that made it (`get`), \
+         then into a new vault made by this one (`put`)"
     )]
     UnsupportedVersion(u16),
     #[error("malformed vault header: {0}")]
@@ -497,7 +497,7 @@ mod tests {
         b[0] ^= 1;
         assert_eq!(Header::parse(&b).unwrap_err(), HeaderError::NotAVault);
 
-        // A nullguard 0.1 vault.
+        // A vault from an older nullguard.
         let mut b = h.to_bytes();
         b[8] = 1;
         assert_eq!(Header::parse(&b).unwrap_err(), HeaderError::UnsupportedVersion(1));

@@ -165,7 +165,7 @@ impl Vault {
             write_all_at(&file, &bytes, PRIMARY_OFFSET)?;
             write_all_at(&file, &bytes, BACKUP_OFFSET)?;
             let store = ChunkStore::new(file.try_clone()?, &header, data_aead(&master)?, false);
-            let fs = Fs::format(store, crate::platform::uid(), crate::platform::gid(), header.hash())?;
+            let fs = Fs::format(store, header.hash())?;
             drop(fs);
             file.sync_all()?;
             Ok(())
