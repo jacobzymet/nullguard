@@ -107,6 +107,10 @@ if [ "$(id -u)" = 0 ] && command -v useradd >/dev/null && command -v su >/dev/nu
   echo "== ownership: a vault written by another uid mounts for the current user"
   useradd -m ngtester 2>/dev/null || true
   chmod 755 "$WORK"
+  # The test user may not be able to reach the build directory (e.g. under
+  # /home/runner on CI), so give it its own copy of the binary.
+  cp "$NG" "$WORK/ng" && chmod 755 "$WORK/ng"
+  UNG="$WORK/ng"
   printf '%s\n' "$PW" | "$NG" create other.ngv --size 16M --quick --password-stdin "${KDF[@]}"
   echo "written by root" > rootfile.txt
   printf '%s\n' "$PW" | "$NG" put other.ngv rootfile.txt / --password-stdin
@@ -114,7 +118,7 @@ if [ "$(id -u)" = 0 ] && command -v useradd >/dev/null && command -v su >/dev/nu
   chown ngtester other.ngv
   M=/home/ngtester/m
   su ngtester -c "mkdir -p $M"
-  su ngtester -c "printf '%s\n' '$PW' | $NG mount $WORK/other.ngv $M --password-stdin" 2> other.log &
+  su ngtester -c "printf '%s\n' '$PW' | $UNG mount $WORK/other.ngv $M --password-stdin" 2> other.log &
   for _ in $(seq 100); do grep -q " $M " /proc/mounts && break; sleep 0.1; done
   grep -q " $M " /proc/mounts || { cat other.log; echo "user mount failed"; exit 1; }
   [ "$(su ngtester -c "cat $M/rootfile.txt")" = "written by root" ]
@@ -122,7 +126,7 @@ if [ "$(id -u)" = 0 ] && command -v useradd >/dev/null && command -v su >/dev/nu
   su ngtester -c "echo mine > $M/new.txt"
   echo "== isolation: not even root can read another user's mounted vault"
   if cat "$M/rootfile.txt" 2>/dev/null; then echo "root could read the mount"; exit 1; fi
-  su ngtester -c "$NG unmount $M"
+  su ngtester -c "$UNG unmount $M"
   for _ in $(seq 50); do grep -q " $M " /proc/mounts || break; sleep 0.1; done
   ! grep -q " $M " /proc/mounts
 fi
