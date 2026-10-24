@@ -825,3 +825,119 @@ fn metadata_with_an_impossible_file_size_is_rejected() {
     }
     assert!(Vault::open(&t.path, Credential::Password(PW), true).unwrap().into_fs().is_ok());
 }
+
+// ----------------------------------------------------------------------
+// Rekey
+// ----------------------------------------------------------------------
+
+#[test]
+fn rekey_moves_everything_to_a_new_master_key() {
+    use crate::vault::fs::Timestamp;
+    let t = new_vault();
+    let kf = Keyfile::generate().unwrap();
+    let big = pattern(20_000, 7);
+    let mtime = Timestamp { secs: 1_600_000_000, nanos: 5 };
+    {
+        let mut fs = open_fs(&t);
+        let docs = fs.mkdir(ROOT_INO, b"docs", 0o750, 0, 0).unwrap();
+        let deep = fs.mkdir(docs, b"deep", 0o700, 0, 0).unwrap();
+        let f = fs.create_file(deep, b"big.bin", 0o640, 0, 0).unwrap();
+        fs.write(f, 0, &big).unwrap();
+        fs.set_attr(f, &SetAttr { mtime: Some(mtime), ..Default::default() }).unwrap();
+        let s = fs.create_file(ROOT_INO, b"sparse", 0o600, 0, 0).unwrap();
+        fs.write(s, 1_000_000, b"end").unwrap();
+        fs.create_file(ROOT_INO, b"empty", 0o600, 0, 0).unwrap();
+        fs.symlink(ROOT_INO, b"link", b"docs/deep/big.bin", 0, 0).unwrap();
+        let gone = fs.create_file(ROOT_INO, b"deleted", 0o600, 0, 0).unwrap();
+        fs.write(gone, 0, b"bye").unwrap();
+        fs.commit().unwrap();
+        fs.unlink(ROOT_INO, b"deleted").unwrap();
+        fs.commit().unwrap();
+    }
+    Vault::open(&t.path, Credential::Password(PW), false).unwrap().add_keyfile(&kf).unwrap();
+    let old_file = std::fs::read(&t.path).unwrap();
+
+    let r = rekey::rekey(&t.path, Credential::Password(PW), PW2, KDF, &mut |_, _| {}).unwrap();
+    assert_eq!((r.files, r.dirs, r.symlinks, r.keyfiles_dropped), (3, 3, 1, 1));
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert!(!rekey::temp_path(&t.path).exists(), "temporary file left behind");
+    assert_eq!(std::fs::metadata(&t.path).unwrap().len(), old_file.len() as u64, "same capacity");
+
+    // Only the new password opens it.
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), true), Err(Error::WrongCredentials)));
+    assert!(matches!(Vault::open(&t.path, Credential::Keyfile(&kf), true), Err(Error::WrongCredentials)));
+    assert_ne!(Vault::peek_header(&t.path).unwrap().vault_id, Header::parse(&old_file).unwrap().vault_id);
+
+    // The old master key opens nothing: someone with an old copy of the
+    // header and the old password gets a key the new data ignores.
+    let new_headers = header_area(&t.path);
+    write_at(&t.path, 0, &old_file[..2 * HEADER_AREA as usize]);
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), true), Err(Error::Corrupt(_))));
+    write_at(&t.path, 0, &new_headers);
+
+    let mut fs = Vault::open(&t.path, Credential::Password(PW2), true).unwrap().into_fs().unwrap();
+    assert!(fs.warnings.is_empty(), "{:?}", fs.warnings);
+    let f = fs.resolve("/docs/deep/big.bin").unwrap();
+    assert_eq!(&fs.read(f, 0, 100_000).unwrap()[..], &big[..]);
+    let a = fs.attr(f).unwrap();
+    assert_eq!((a.perm, a.mtime), (0o640, mtime));
+    assert_eq!(fs.attr(fs.resolve("/docs").unwrap()).unwrap().perm, 0o750);
+    let s = fs.resolve("/sparse").unwrap();
+    assert_eq!(fs.attr(s).unwrap().size, 1_000_003);
+    assert_eq!(&fs.read(s, 1_000_000, 10).unwrap()[..], b"end");
+    assert_eq!(fs.chunks_of(s).len(), 1, "holes stay holes");
+    assert_eq!(fs.attr(fs.resolve("/empty").unwrap()).unwrap().size, 0);
+    assert_eq!(fs.readlink(fs.resolve("/link").unwrap()).unwrap(), b"docs/deep/big.bin");
+    assert!(fs.resolve("/deleted").is_err());
+    assert_eq!(fs.verify().unwrap().bad_blocks.len(), 0);
+}
+
+/// A rekey that fails partway (here: a tampered block in the old vault)
+/// leaves the original byte-for-byte untouched and no temporary file.
+#[test]
+fn failed_rekey_leaves_the_vault_untouched() {
+    let t = new_vault();
+    let chunk = {
+        let mut fs = open_fs(&t);
+        let f = fs.create_file(ROOT_INO, b"f", 0o600, 0, 0).unwrap();
+        fs.write(f, 0, &pattern(4096, 1)).unwrap();
+        fs.commit().unwrap();
+        fs.chunks_of(f)[0]
+    };
+    patch(&t.path, chunk_offset(&t, chunk) + 24 + 10, |b| b[0] ^= 1);
+    let before = std::fs::read(&t.path).unwrap();
+    let err = rekey::rekey(&t.path, Credential::Password(PW), PW2, KDF, &mut |_, _| {}).unwrap_err();
+    assert!(matches!(err, Error::ChunkAuth { .. }), "{err}");
+    assert_eq!(std::fs::read(&t.path).unwrap(), before);
+    assert!(!rekey::temp_path(&t.path).exists());
+
+    let err = rekey::rekey(&t.path, Credential::Password(b"wrong password!"), PW2, KDF, &mut |_, _| {}).unwrap_err();
+    assert!(matches!(err, Error::WrongCredentials), "{err}");
+    assert!(!rekey::temp_path(&t.path).exists());
+}
+
+/// Rekeying through a symbolic link replaces the vault it points to, not
+/// the link (which would leave the old-key vault in place).
+#[cfg(unix)]
+#[test]
+fn rekey_through_a_symlink_replaces_the_real_vault() {
+    let t = new_vault();
+    let link = t.path.with_file_name("link.ngv");
+    std::os::unix::fs::symlink(&t.path, &link).unwrap();
+    rekey::rekey(&link, Credential::Password(PW), PW2, KDF, &mut |_, _| {}).unwrap();
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(Vault::open(&t.path, Credential::Password(PW2), true).is_ok());
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), true), Err(Error::WrongCredentials)));
+}
+
+/// A file left by an interrupted rekey is never overwritten or deleted.
+#[test]
+fn rekey_refuses_to_touch_a_leftover_temporary_file() {
+    let t = new_vault();
+    let tmp = rekey::temp_path(&t.path);
+    std::fs::write(&tmp, b"leftover").unwrap();
+    let err = rekey::rekey(&t.path, Credential::Password(PW), PW2, KDF, &mut |_, _| {}).unwrap_err();
+    assert!(matches!(err, Error::Usage(_)), "{err}");
+    assert_eq!(std::fs::read(&tmp).unwrap(), b"leftover");
+    assert!(Vault::open(&t.path, Credential::Password(PW), true).is_ok());
+}

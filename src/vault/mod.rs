@@ -17,6 +17,7 @@
 pub mod chunks;
 pub mod fs;
 pub mod header;
+pub mod rekey;
 
 use std::fs::{File, OpenOptions};
 use std::io;

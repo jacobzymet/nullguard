@@ -64,6 +64,16 @@ enum Command {
         #[command(flatten)]
         kdf: KdfArgs,
     },
+    /// Move the vault to a new master key and password, so old passwords,
+    /// keyfiles and leaked keys stop working. Copies every file, so it needs
+    /// free disk space for a second copy of the vault while it runs.
+    Rekey {
+        vault: PathBuf,
+        #[command(flatten)]
+        unlock: UnlockArgs,
+        #[command(flatten)]
+        kdf: KdfArgs,
+    },
     /// Generate a new keyfile (a random 256-bit key).
     Keygen {
         /// Where to write the keyfile (must not exist).
@@ -375,6 +385,21 @@ pub fn parse_size(s: &str) -> Result<u64> {
     n.checked_mul(mult).ok_or_else(|| anyhow!("size {s:?} is too large"))
 }
 
+/// Progress display for filling a new vault with random data.
+fn fill_progress() -> impl FnMut(u64, u64) {
+    let mut last = 0;
+    move |done, total| {
+        let pct = done * 100 / total.max(1);
+        if pct != last {
+            last = pct;
+            eprint!("\rFilling with random data: {pct:3}%");
+            if pct == 100 {
+                eprintln!();
+            }
+        }
+    }
+}
+
 fn human(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
@@ -419,18 +444,8 @@ pub fn run() -> Result<()> {
             let opts = CreateOptions { size, kdf: kdf.params(), chunk_size: None, fill_random: true };
             let pw = Prompter { stdin: password_stdin }.new_password("vault password")?;
             eprintln!("Creating vault (deriving key, {} MiB of memory)...", opts.kdf.memory_kib / 1024);
-            let mut last = 0;
-            Vault::create(&vault, pw.as_bytes(), &opts, &mut |done, total| {
-                let pct = done * 100 / total.max(1);
-                if pct != last {
-                    last = pct;
-                    eprint!("\rFilling with random data: {pct:3}%");
-                    if pct == 100 {
-                        eprintln!();
-                    }
-                }
-            })
-            .with_context(|| format!("creating {}", vault.display()))?;
+            Vault::create(&vault, pw.as_bytes(), &opts, &mut fill_progress())
+                .with_context(|| format!("creating {}", vault.display()))?;
             let h = Vault::peek_header(&vault)?;
             println!(
                 "Created {} ({} usable, {} chunks).",
@@ -500,6 +515,34 @@ pub fn run() -> Result<()> {
                 "Note: the master key is unchanged. Anyone holding an OLD copy of this vault file \
                  and the OLD password can still decrypt that copy. If the old password was compromised, \
                  create a new vault and copy your files over."
+            );
+        }
+
+        Command::Rekey { vault, unlock: u, kdf } => {
+            let p = Prompter { stdin: u.password_stdin };
+            let current = Unlocker::from_args(&u, &p)?;
+            let pw = p.new_password("vault password")?;
+            eprintln!("Unlocking, then creating the new vault next to the old one...");
+            let r = vault::rekey::rekey(&vault, current.credential(), pw.as_bytes(), kdf.params(), &mut fill_progress())
+                .with_context(|| format!("rekeying {}", vault.display()))?;
+            warn_all(&r.warnings);
+            println!(
+                "Rekeyed {}: {} files, {} directories and {} symlinks moved to a new master key.",
+                vault.display(),
+                r.files,
+                r.dirs,
+                r.symlinks
+            );
+            if r.keyfiles_dropped > 0 {
+                eprintln!(
+                    "{} keyfile(s) no longer unlock the vault. Add back the ones you still trust with \
+                     `nullguard add-keyfile`.",
+                    r.keyfiles_dropped
+                );
+            }
+            eprintln!(
+                "Note: copies of the vault file made before the rekey still open with the old password \
+                 or keyfiles, and still contain what they contained then."
             );
         }
 

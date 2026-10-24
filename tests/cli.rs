@@ -259,6 +259,35 @@ fn verify_fails_when_a_header_copy_is_tampered() {
     ok(&["verify", v, "--password-stdin"], &format!("{PW}\n"));
 }
 
+#[test]
+fn rekey_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    let key = dir.path().join("k");
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    let src = dir.path().join("notes.txt");
+    std::fs::write(&src, b"keep these notes").unwrap();
+    ok(&["put", v, s(&src), "/", "--password-stdin"], &format!("{PW}\n"));
+    ok(&["keygen", s(&key)], "");
+    ok(&["add-keyfile", v, s(&key), "--password-stdin"], &format!("{PW}\n"));
+
+    // Unlock with the current password, then give the new one.
+    let out = ok(&[&["rekey", v, "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n{PW2}\n"));
+    assert!(out.contains("Rekeyed") && out.contains("1 files"), "{out}");
+
+    fails(&["ls", v, "--password-stdin"], &format!("{PW}\n"));
+    fails(&["ls", v, "--keyfile", s(&key)], "");
+    let out = dir.path().join("out.txt");
+    ok(&["get", v, "/notes.txt", s(&out), "--password-stdin"], &format!("{PW2}\n"));
+    assert_eq!(std::fs::read(&out).unwrap(), b"keep these notes");
+    ok(&["verify", v, "--password-stdin"], &format!("{PW2}\n"));
+    // Rekeying with a keyfile works too (after adding it back).
+    ok(&["add-keyfile", v, s(&key), "--password-stdin"], &format!("{PW2}\n"));
+    ok(&[&["rekey", v, "--keyfile", s(&key), "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    ok(&["ls", v, "--password-stdin"], &format!("{PW}\n"));
+}
+
 /// Settings that used to make weaker vaults no longer exist.
 #[test]
 fn removed_options_are_rejected() {

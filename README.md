@@ -87,7 +87,7 @@ as well, which keyfile changes never touch.
 Removing a keyfile stops it from unlocking this vault file from now on. It
 doesn't change the master key, so someone who already unlocked the vault,
 or kept an older copy of the file, can still read what that copy holds. For
-full revocation, copy your files into a new vault.
+full revocation, run `nullguard rekey` (see below).
 
 ## Upgrading from 0.1
 
@@ -111,6 +111,7 @@ keyfiles with `nullguard keygen`.
 | `mount <vault> <dir>` | Unlock and mount. `--keyfile`, `--read-only`, `--no-exec`. Runs in the foreground; Ctrl-C unmounts. |
 | `unmount <dir>` | Unmount and lock (commits all changes first). |
 | `change-password <vault>` | Re-wrap the master key under a new password (see the caveat below). `--low-memory` as for `create`. |
+| `rekey <vault>` | Move the vault to a new master key and new password: old passwords, keyfiles and leaked keys stop working. Copies every file, so it needs free space for a second copy while it runs. Keyfiles must be added again afterwards. `--low-memory` as for `create`. |
 | `keygen <file>` | Create a keyfile (never overwrites). |
 | `add-keyfile <vault> <keyfile>` | Let a keyfile unlock the vault (up to 16). |
 | `remove-keyfile <vault> <keyfile>` | Stop a keyfile from unlocking the vault. `--all` removes every keyfile. |
@@ -322,8 +323,10 @@ nullguard can't protect you against:
 - **Secure deletion.** Deleting a file frees its chunks, but their old
   ciphertext stays on disk until the space is reused. Anyone who later gets
   the vault's key (e.g. your password) can recover deleted files from an
-  old or current copy. To truly destroy data, move what you keep into a new
-  vault and destroy the old file and key.
+  old or current copy. `rekey` copies only the files you still have into a
+  new vault file, so deleted files don't come along; the old file's bytes
+  may still survive on the disk itself (SSDs, copy-on-write filesystems,
+  backups).
 
 ### What leaks
 
@@ -351,10 +354,26 @@ commands stop at 1024 levels of nesting.
 `change-password` re-wraps the master key; it doesn't re-encrypt data. Anyone
 who has an **old copy** of the vault file *and* the **old password** can still
 decrypt that old copy, and with it, recover the master key. If you change
-your password because it was compromised, create a new vault and copy your
-files into it. (A built-in `rekey` is on the roadmap.) Also note that
-overwriting the header on SSDs and copy-on-write filesystems doesn't
+your password because it was compromised, use `rekey` instead. Also note
+that overwriting the header on SSDs and copy-on-write filesystems doesn't
 guarantee the old bytes are physically erased.
+
+### Rekeying
+
+`rekey` replaces the master key itself. It creates a new vault next to the
+old one (`<vault>.rekey-tmp`, same capacity, new random master key, your
+new password), copies every file, directory and symlink across with their
+permissions and times, authenticates every block of the copy, and then
+replaces the old vault file with the new one in a single rename. If
+anything fails before that rename, the new file is deleted and the old
+vault is unchanged. The vault stays locked against other nullguard
+processes for the whole copy.
+
+Afterwards the old password, the old keyfiles and the old master key no
+longer open the vault file. Copies of the file made *before* the rekey are
+unaffected: they still open with the old credentials and still hold what
+they held then. Nothing about the file format changes; a rekeyed vault is
+simply a new vault with the same files.
 
 ---
 
@@ -575,6 +594,7 @@ src/
     chunks.rs      authenticated chunk store
     fs.rs          copy-on-write filesystem, metadata, commits
     mod.rs         create / open / change password / keyfiles
+    rekey.rs       move a vault to a new master key
   mount/         OS integration (FUSE on Linux and macOS)
   cli.rs         command line
   platform.rs    process hardening (the only module with `unsafe`)
@@ -586,7 +606,6 @@ scripts/mount-test.sh  real FUSE mount test (Linux)
 
 - **An independent security audit.**
 - **Windows mounting** via WinFsp.
-- **`rekey`**: re-encrypt everything under a new master key (for compromised passwords).
 - **Anti-rollback state**: an optional local record of the last seen
   commit, to detect whole-vault rollback.
 - **Incremental metadata** (a B-tree instead of rewriting all metadata per
