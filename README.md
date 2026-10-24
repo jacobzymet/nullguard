@@ -242,7 +242,8 @@ cloud storage, an "evil maid" with access to the file, a compromised backup).
 - **Not prevented:** rolling the *whole* vault back to an earlier, internally
   consistent state, for example by restoring an older copy of the entire
   file. Without trusted state outside the vault, no offline encryption
-  format can detect that (see the roadmap). Mixing old and new parts
+  format can detect that, and nullguard deliberately keeps no such state:
+  it would tie a vault to one computer. Mixing old and new parts
   (header, superblocks, metadata, data blocks) is detected.
   Deleting or destroying the vault can't be prevented either: keep backups.
 - **Failures never save half-done work.** Changes become durable only through
@@ -607,14 +608,15 @@ scripts/mount-test.sh  real FUSE mount test (Linux)
 
 - **An independent security audit.**
 - **Windows mounting** via WinFsp.
-- **Anti-rollback state**: an optional local record of the last seen
-  commit, to detect whole-vault rollback.
 - **Incremental metadata** (a B-tree instead of rewriting all metadata per
   commit). The current design is best for vaults up to some hundreds of GB
   and up to around a million blocks per commit cycle. Larger vaults
   automatically get bigger chunks (16 KiB up to 1 MiB).
-- **Resize**, hard links, extended attributes.
-- Hidden volumes / plausible deniability (under consideration).
+- **Resize.**
+
+Not planned, to keep nullguard small: hidden volumes (plausible
+deniability), hard links, extended attributes, and a local anti-rollback
+record.
 
 Security issues: please report them privately; see [SECURITY.md](SECURITY.md).
 
