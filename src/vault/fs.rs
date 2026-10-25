@@ -43,10 +43,8 @@ pub const MAX_SYMLINK_LEN: usize = 4095;
 
 const SUPERBLOCK_SLOTS: u64 = 2;
 const SUPER_MAGIC: &[u8; 8] = b"NGSUPER2";
-/// Metadata of format version 3: every block listed, holes as zero.
-const META_MAGIC_V3: &[u8; 8] = b"NGMETA02";
-/// Metadata of format version 4: only a file's stored blocks are listed.
-const META_MAGIC_V4: &[u8; 8] = b"NGMETA03";
+/// Metadata: only a file's stored blocks are listed.
+const META_MAGIC: &[u8; 8] = b"NGMETA03";
 const SUPER_FIXED_LEN: usize = 8 + 8 + 32 + 8 + 32 + 4;
 const EXTENT_LEN: usize = 12;
 
@@ -162,8 +160,8 @@ impl std::fmt::Debug for Name {
 #[derive(Clone, Debug)]
 pub enum Node {
     /// `blocks[i]` holds bytes `i*chunk_size ..`; a missing index is a hole
-    /// (zeros), which costs nothing in memory (or, in format version 4, in
-    /// the metadata). No block lies wholly past `size`. Bytes past `size` in
+    /// (zeros), which costs nothing in memory or in the
+    /// metadata. No block lies wholly past `size`. Bytes past `size` in
     /// the last block are unspecified (they may hold data from before a
     /// truncate). They are never returned by reads, and are zeroed before
     /// the file grows over them (`zero_past_eof`).
@@ -524,7 +522,7 @@ impl Fs {
         if !ct_eq(&Sha256::digest(blob.as_slice()), &sb.meta_hash) {
             return Err(Error::Corrupt("metadata hash mismatch: the vault was modified".into()));
         }
-        let (next_ino, inodes) = decode_metadata(&blob, self.store.version(), self.chunk_size, self.max_file_size())?;
+        let (next_ino, inodes) = decode_metadata(&blob, self.chunk_size, self.max_file_size())?;
 
         // Rebuild the allocation bitmap; any chunk used twice is corruption.
         let mut bitmap = Bitmap::try_new(self.store.chunk_count())?;
@@ -610,7 +608,7 @@ impl Fs {
         }
         self.check_writable()?;
         let started = Instant::now();
-        let blob = encode_metadata(self.store.version(), self.next_ino, &self.inodes, self.reachable());
+        let blob = encode_metadata(self.next_ino, &self.inodes, self.reachable());
         let cs = self.chunk_size as usize;
         let nchunks = blob.len().div_ceil(cs).max(1);
 
@@ -1475,28 +1473,24 @@ pub mod fuzzing {
         let _ = parse_superblock(&buf, chunk_count);
     }
 
-    /// Metadata parser, for both format versions. Whatever it accepts must
-    /// encode and decode again to the same bytes (the validator and the
-    /// encoder agree).
+    /// Metadata parser. Whatever it accepts must encode and decode again to
+    /// the same bytes (the validator and the encoder agree).
     pub fn metadata(data: &[u8]) {
-        for version in [3, 4] {
-            let Ok((next_ino, inodes)) = decode_metadata(data, version, 4096, 1 << 40) else { continue };
-            let encode = |inodes: &HashMap<u64, Inode>| {
-                let mut order = vec![ROOT_INO];
-                let mut i = 0;
-                while i < order.len() {
-                    if let Node::Dir { entries, .. } = &inodes[&order[i]].node {
-                        order.extend(entries.values().copied());
-                    }
-                    i += 1;
+        let Ok((next_ino, inodes)) = decode_metadata(data, 4096, 1 << 40) else { return };
+        let encode = |inodes: &HashMap<u64, Inode>| {
+            let mut order = vec![ROOT_INO];
+            let mut i = 0;
+            while i < order.len() {
+                if let Node::Dir { entries, .. } = &inodes[&order[i]].node {
+                    order.extend(entries.values().copied());
                 }
-                encode_metadata(version, next_ino, inodes, order)
-            };
-            let once = encode(&inodes);
-            let (_, again) =
-                decode_metadata(&once, version, 4096, 1 << 40).expect("re-encoded metadata must decode");
-            assert_eq!(*once, *encode(&again), "metadata encoding is not stable");
-        }
+                i += 1;
+            }
+            encode_metadata(next_ino, inodes, order)
+        };
+        let once = encode(&inodes);
+        let (_, again) = decode_metadata(&once, 4096, 1 << 40).expect("re-encoded metadata must decode");
+        assert_eq!(*once, *encode(&again), "metadata encoding is not stable");
     }
 }
 
@@ -1530,23 +1524,15 @@ fn put_ts(out: &mut Vec<u8>, t: Timestamp) {
     out.extend_from_slice(&t.nanos.to_le_bytes());
 }
 
-fn meta_magic(version: u16) -> &'static [u8; 8] {
-    if version >= 4 { META_MAGIC_V4 } else { META_MAGIC_V3 }
-}
-
 /// The exact length [`encode_metadata`] produces, so its buffer can be
 /// allocated once: a growing buffer would move, leaving unwiped copies of
 /// the name table behind.
-fn metadata_len(version: u16, inodes: &HashMap<u64, Inode>, order: &[u64]) -> usize {
+fn metadata_len(inodes: &HashMap<u64, Inode>, order: &[u64]) -> usize {
     let mut len = 8 + 8 + 8;
     for ino in order {
         len += 8 + 1 + 2 + 4 * 12;
         len += match &inodes[ino].node {
-            Node::File { blocks, .. } if version >= 4 => 8 + 8 + 40 * blocks.len(),
-            Node::File { blocks, .. } => {
-                let count = blocks.last_key_value().map_or(0, |(&idx, _)| idx as usize + 1);
-                8 + 8 + 32 * blocks.len() + 8 * (count - blocks.len())
-            }
+            Node::File { blocks, .. } => 8 + 8 + 40 * blocks.len(),
             Node::Dir { entries, .. } => 8 + 4 + entries.keys().map(|n| 2 + n.len() + 8).sum::<usize>(),
             Node::Symlink { target } => 4 + target.len(),
         };
@@ -1554,10 +1540,10 @@ fn metadata_len(version: u16, inodes: &HashMap<u64, Inode>, order: &[u64]) -> us
     len
 }
 
-fn encode_metadata(version: u16, next_ino: u64, inodes: &HashMap<u64, Inode>, order: Vec<u64>) -> Zeroizing<Vec<u8>> {
-    let len = metadata_len(version, inodes, &order);
+fn encode_metadata(next_ino: u64, inodes: &HashMap<u64, Inode>, order: Vec<u64>) -> Zeroizing<Vec<u8>> {
+    let len = metadata_len(inodes, &order);
     let mut out = Zeroizing::new(Vec::with_capacity(len));
-    out.extend_from_slice(meta_magic(version));
+    out.extend_from_slice(META_MAGIC);
     out.extend_from_slice(&next_ino.to_le_bytes());
     out.extend_from_slice(&(order.len() as u64).to_le_bytes());
     for ino in order {
@@ -1575,27 +1561,12 @@ fn encode_metadata(version: u16, next_ino: u64, inodes: &HashMap<u64, Inode>, or
         match &i.node {
             Node::File { size, blocks } => {
                 out.extend_from_slice(&size.to_le_bytes());
-                if version >= 4 {
-                    // Sparse: (index, chunk, nonce) for each stored block.
-                    out.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
-                    for (idx, b) in blocks {
-                        out.extend_from_slice(&idx.to_le_bytes());
-                        out.extend_from_slice(&b.chunk.to_le_bytes());
-                        out.extend_from_slice(&b.nonce);
-                    }
-                } else {
-                    // Dense: every block up to the last stored one, holes as 0.
-                    let count = blocks.last_key_value().map_or(0, |(&idx, _)| idx + 1);
-                    out.extend_from_slice(&count.to_le_bytes());
-                    for idx in 0..count {
-                        match blocks.get(&idx) {
-                            Some(b) => {
-                                out.extend_from_slice(&b.chunk.to_le_bytes());
-                                out.extend_from_slice(&b.nonce);
-                            }
-                            None => out.extend_from_slice(&0u64.to_le_bytes()),
-                        }
-                    }
+                // Sparse: (index, chunk, nonce) for each stored block.
+                out.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
+                for (idx, b) in blocks {
+                    out.extend_from_slice(&idx.to_le_bytes());
+                    out.extend_from_slice(&b.chunk.to_le_bytes());
+                    out.extend_from_slice(&b.nonce);
                 }
             }
             Node::Dir { parent, entries } => {
@@ -1620,18 +1591,16 @@ fn encode_metadata(version: u16, next_ino: u64, inodes: &HashMap<u64, Inode>, or
 
 /// Strictly decode and validate metadata. Although metadata is
 /// authenticated, it is still treated as untrusted input: no panics, no
-/// unbounded allocations, and the tree must be well formed. The encoding
-/// must be the one of the vault's format `version`.
+/// unbounded allocations, and the tree must be well formed.
 fn decode_metadata(
     blob: &[u8],
-    version: u16,
     chunk_size: u64,
     max_file_size: u64,
 ) -> Result<(u64, HashMap<u64, Inode>), Error> {
     let bad = |what: &str| Error::Corrupt(format!("malformed metadata: {what}"));
     let mut r = Reader::new(blob);
     let e = |_| bad("truncated");
-    if r.take(8).map_err(e)? != meta_magic(version) {
+    if r.take(8).map_err(e)? != META_MAGIC {
         return Err(bad("bad magic"));
     }
     let next_ino = r.u64().map_err(e)?;
@@ -1667,28 +1636,19 @@ fn decode_metadata(
                     return Err(bad("file larger than the vault"));
                 }
                 let n = r.u64().map_err(e)?;
-                // Each listed block takes at least 8 bytes (a hole in version
-                // 3), which bounds `n` by the blob.
-                if n > size.div_ceil(chunk_size) || n > r.rest().len() as u64 / 8 {
+                // Each listed block takes 40 bytes, which bounds `n` by the blob.
+                if n > size.div_ceil(chunk_size) || n > r.rest().len() as u64 / 40 {
                     return Err(bad("block count"));
                 }
                 let mut blocks = BTreeMap::new();
-                for i in 0..n {
-                    let idx = if version >= 4 {
-                        let idx = r.u64().map_err(e)?;
-                        // Strictly increasing and inside the file: one encoding.
-                        let after_last = blocks.last_key_value().is_none_or(|(&last, _)| idx > last);
-                        if !after_last || idx >= size.div_ceil(chunk_size) {
-                            return Err(bad("block index"));
-                        }
-                        idx
-                    } else {
-                        i
-                    };
-                    let chunk = r.u64().map_err(e)?;
-                    if chunk == 0 && version < 4 {
-                        continue; // a hole (only version 3 lists those)
+                for _ in 0..n {
+                    let idx = r.u64().map_err(e)?;
+                    // Strictly increasing and inside the file: one encoding.
+                    let after_last = blocks.last_key_value().is_none_or(|(&last, _)| idx > last);
+                    if !after_last || idx >= size.div_ceil(chunk_size) {
+                        return Err(bad("block index"));
                     }
+                    let chunk = r.u64().map_err(e)?;
                     if chunk < SUPERBLOCK_SLOTS {
                         return Err(bad("block points at a superblock"));
                     }
@@ -1793,9 +1753,6 @@ impl Fs {
 mod tests {
     use super::*;
 
-    /// The format version most tests encode metadata for.
-    const V: u16 = 4;
-
     #[test]
     fn timestamps_roundtrip() {
         for t in [UNIX_EPOCH, SystemTime::now(), UNIX_EPOCH - Duration::new(5, 250)] {
@@ -1851,8 +1808,8 @@ mod tests {
     fn metadata_roundtrip() {
         let (next, inodes) = sample_tree();
         let order = vec![1, 2, 3, 4];
-        let blob = encode_metadata(V, next, &inodes, order);
-        let (n2, back) = decode_metadata(&blob, V, 4096, 1 << 30).unwrap();
+        let blob = encode_metadata(next, &inodes, order);
+        let (n2, back) = decode_metadata(&blob, 4096, 1 << 30).unwrap();
         assert_eq!(n2, next);
         assert_eq!(back.len(), 4);
         assert!(matches!(&back[&2].node, Node::File { size: 5000, blocks } if blocks.get(&0) == Some(&BlockRef { chunk: 9, nonce: [7; 24] })));
@@ -1864,9 +1821,9 @@ mod tests {
         if let Node::File { size, .. } = &mut inodes.get_mut(&2).unwrap().node {
             *size = u64::MAX;
         }
-        let blob = encode_metadata(V, next, &inodes, vec![1, 2, 3, 4]);
-        assert!(decode_metadata(&blob, V, 4096, 1 << 30).is_err());
-        assert!(decode_metadata(&blob, V, 4096, u64::MAX).is_ok());
+        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
+        assert!(decode_metadata(&blob, 4096, u64::MAX).is_ok());
     }
 
     #[test]
@@ -1876,8 +1833,8 @@ mod tests {
         if let Node::Dir { entries, .. } = &mut inodes.get_mut(&3).unwrap().node {
             entries.insert(Name::new(b"again"), 2);
         }
-        let blob = encode_metadata(V, next, &inodes, vec![1, 2, 3, 4]);
-        assert!(decode_metadata(&blob, V, 4096, 1 << 30).is_err());
+        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
 
         // A detached cycle.
         let (next, mut inodes) = sample_tree();
@@ -1885,8 +1842,8 @@ mod tests {
         let mk = |node| Inode { perm: 0, atime: ts, mtime: ts, ctime: ts, crtime: ts, node };
         inodes.insert(10, mk(Node::Dir { parent: 11, entries: BTreeMap::from([(Name::new(b"x"), 11)]) }));
         inodes.insert(11, mk(Node::Dir { parent: 10, entries: BTreeMap::from([(Name::new(b"y"), 10)]) }));
-        let blob = encode_metadata(V, next.max(12), &inodes, vec![1, 2, 3, 4, 10, 11]);
-        assert!(decode_metadata(&blob, V, 4096, 1 << 30).is_err());
+        let blob = encode_metadata(next.max(12), &inodes, vec![1, 2, 3, 4, 10, 11]);
+        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
     }
 
     #[test]
@@ -1894,59 +1851,50 @@ mod tests {
         // perm with S_IFSOCK-style type bits.
         let (next, mut inodes) = sample_tree();
         inodes.get_mut(&2).unwrap().perm = 0o140644;
-        let blob = encode_metadata(V, next, &inodes, vec![1, 2, 3, 4]);
-        assert!(decode_metadata(&blob, V, 4096, 1 << 30).is_err());
+        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
         // Setuid/setgid/sticky are ordinary permission bits and stay allowed.
         let (next, mut inodes) = sample_tree();
         inodes.get_mut(&2).unwrap().perm = 0o7777;
-        let blob = encode_metadata(V, next, &inodes, vec![1, 2, 3, 4]);
-        assert!(decode_metadata(&blob, V, 4096, 1 << 30).is_ok());
+        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, 4096, 1 << 30).is_ok());
 
         let (next, mut inodes) = sample_tree();
         inodes.get_mut(&4).unwrap().node = Node::Symlink { target: Zeroizing::new(b"a\0b".to_vec()) };
-        let blob = encode_metadata(V, next, &inodes, vec![1, 2, 3, 4]);
-        assert!(decode_metadata(&blob, V, 4096, 1 << 30).is_err());
+        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
     }
 
-    /// Version 3 lists every block (holes as zero), version 4 only the
-    /// stored ones. Both decode to the same sparse file, and each version
-    /// only accepts its own encoding.
+    /// Only a file's stored blocks are listed, so holes cost nothing.
     #[test]
-    fn sparse_files_in_both_metadata_versions() {
+    fn sparse_files_list_only_stored_blocks() {
         let (next, mut inodes) = sample_tree();
         // A 4 KiB-chunk file with blocks 0 and 1000: 999 holes in between.
         if let Node::File { size, blocks } = &mut inodes.get_mut(&2).unwrap().node {
             *size = 1001 * 4096;
             blocks.insert(1000, BlockRef { chunk: 10, nonce: [8; 24] });
         }
-        let order = vec![1, 2, 3, 4];
-        let v3 = encode_metadata(3, next, &inodes, order.clone());
-        let v4 = encode_metadata(4, next, &inodes, order);
-        // Version 3: 2 blocks of 32 bytes + 999 holes of 8. Version 4: 2 x 40.
-        assert_eq!(v3.len() - v4.len(), 2 * 32 + 999 * 8 - 2 * 40);
+        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
+        assert_eq!(blob.len(), metadata_len(&inodes, &[1, 2, 3, 4]));
         let blocks_of = |m: &HashMap<u64, Inode>| match &m[&2].node {
             Node::File { blocks, .. } => blocks.clone(),
             _ => panic!("not a file"),
         };
-        let (_, back3) = decode_metadata(&v3, 3, 4096, 1 << 30).unwrap();
-        let (_, back4) = decode_metadata(&v4, 4, 4096, 1 << 30).unwrap();
-        assert_eq!(blocks_of(&back3), blocks_of(&inodes));
-        assert_eq!(blocks_of(&back4), blocks_of(&inodes));
-        assert!(decode_metadata(&v3, 4, 4096, 1 << 30).is_err());
-        assert!(decode_metadata(&v4, 3, 4096, 1 << 30).is_err());
+        let (_, back) = decode_metadata(&blob, 4096, 1 << 30).unwrap();
+        assert_eq!(blocks_of(&back), blocks_of(&inodes));
 
-        // Version 4 block lists must be strictly increasing, inside the
+        // Block lists must be strictly increasing, inside the
         // file, and never point at chunk 0.
         let entry = [1000u64.to_le_bytes(), 10u64.to_le_bytes()].concat();
-        let at = v4.windows(16).position(|w| w == entry).unwrap();
+        let at = blob.windows(16).position(|w| w == entry).unwrap();
         for (patch, why) in [
             ([0u64.to_le_bytes(), 10u64.to_le_bytes()].concat(), "repeated index"),
             ([1001u64.to_le_bytes(), 10u64.to_le_bytes()].concat(), "index past the end of the file"),
             ([1000u64.to_le_bytes(), 0u64.to_le_bytes()].concat(), "chunk 0"),
         ] {
-            let mut b = v4.to_vec();
+            let mut b = blob.to_vec();
             b[at..at + 16].copy_from_slice(&patch);
-            assert!(decode_metadata(&b, 4, 4096, 1 << 30).is_err(), "{why}");
+            assert!(decode_metadata(&b, 4096, 1 << 30).is_err(), "{why}");
         }
     }
 
@@ -1959,11 +1907,9 @@ mod tests {
             *size = 50 * 4096;
             blocks.insert(40, BlockRef { chunk: 11, nonce: [3; 24] }); // with holes before it
         }
-        for version in [3, 4] {
-            let blob = encode_metadata(version, next, &inodes, vec![1, 2, 3, 4]);
-            assert_eq!(blob.len(), metadata_len(version, &inodes, &[1, 2, 3, 4]));
-            assert_eq!(blob.capacity(), blob.len(), "version {version}");
-        }
+        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
+        assert_eq!(blob.len(), metadata_len(&inodes, &[1, 2, 3, 4]));
+        assert_eq!(blob.capacity(), blob.len());
     }
 
     fn superblock_bytes(meta_len: u64, extents: &[(u64, u32)]) -> Vec<u8> {
@@ -2019,19 +1965,17 @@ mod tests {
             state ^= state << 17;
             state
         };
-        for version in [3, 4] {
-            let base = encode_metadata(version, next, &inodes, vec![1, 2, 3, 4]);
-            for _ in 0..20_000 {
-                let mut b = base.to_vec();
-                for _ in 0..(rnd() % 4 + 1) {
-                    let pos = (rnd() as usize) % b.len();
-                    b[pos] = rnd() as u8;
-                }
-                if rnd() % 10 == 0 {
-                    b.truncate((rnd() as usize) % b.len());
-                }
-                let _ = decode_metadata(&b, version, 4096, 1 << 30);
+        let base = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
+        for _ in 0..20_000 {
+            let mut b = base.to_vec();
+            for _ in 0..(rnd() % 4 + 1) {
+                let pos = (rnd() as usize) % b.len();
+                b[pos] = rnd() as u8;
             }
+            if rnd() % 10 == 0 {
+                b.truncate((rnd() as usize) % b.len());
+            }
+            let _ = decode_metadata(&b, 4096, 1 << 30);
         }
     }
 }

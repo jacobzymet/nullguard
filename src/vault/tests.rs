@@ -394,7 +394,7 @@ fn restoring_an_old_header_to_revive_an_old_password_is_refused() {
     assert!(matches!(Vault::open(&t.path, Credential::Password(PW), true), Err(Error::StaleHeader)));
 }
 
-/// Regression test: nullguard 0.1 recorded a header change in only one
+/// Regression test: a header change was once recorded in only one
 /// superblock, so destroying that superblock made the vault fall back to
 /// the older one, which accepted the old header (and with it a removed
 /// keyfile). A header change now commits to both slots.
@@ -1023,72 +1023,6 @@ fn rekey_refuses_to_touch_a_leftover_temporary_file() {
     assert!(matches!(err, Error::Usage(_)), "{err}");
     assert_eq!(std::fs::read(&tmp).unwrap(), b"leftover");
     assert!(Vault::open(&t.path, Credential::Password(PW), true).is_ok());
-}
-
-// ----------------------------------------------------------------------
-// Format versions
-// ----------------------------------------------------------------------
-
-fn new_v3_vault() -> Tmp {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("v3.ngv");
-    Vault::create_versioned(&path, PW, &opts(4 << 20), header::OLDEST_VERSION, &mut |_, _| {}).unwrap();
-    Tmp { _dir: dir, path }
-}
-
-#[test]
-fn new_vaults_use_the_current_format() {
-    let t = new_vault();
-    assert_eq!(Vault::peek_header(&t.path).unwrap().version, header::FORMAT_VERSION);
-}
-
-/// Version 3 vaults (made before format 4) keep working in every way, and
-/// stay version 3: nothing rewrites them into a format older nullguard
-/// versions can't read.
-#[test]
-fn version_3_vaults_keep_working() {
-    let t = new_v3_vault();
-    let kf = Keyfile::generate().unwrap();
-    {
-        let mut fs = open_fs(&t);
-        let f = fs.create_file(ROOT_INO, b"f", 0o600).unwrap();
-        fs.write(f, 0, &pattern(10_000, 3)).unwrap();
-        let s = fs.create_file(ROOT_INO, b"sparse", 0o600).unwrap();
-        fs.write(s, 200_000, b"end").unwrap();
-        fs.commit().unwrap();
-    }
-    let mut v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
-    v.add_keyfile(&kf).unwrap();
-    v.change_password(PW2, KDF).unwrap();
-    drop(v);
-    assert_eq!(Vault::peek_header(&t.path).unwrap().version, header::OLDEST_VERSION);
-    for cred in [Credential::Password(PW2), Credential::Keyfile(&kf)] {
-        let mut fs = Vault::open(&t.path, cred, true).unwrap().into_fs().unwrap();
-        assert!(fs.warnings.is_empty(), "{:?}", fs.warnings);
-        let f = fs.resolve("/f").unwrap();
-        assert_eq!(&fs.read(f, 0, 20_000).unwrap()[..], &pattern(10_000, 3)[..]);
-        let s = fs.resolve("/sparse").unwrap();
-        assert_eq!(&fs.read(s, 200_000, 10).unwrap()[..], b"end");
-        assert!(fs.read(s, 0, 4096).unwrap().iter().all(|&b| b == 0));
-        assert_eq!(fs.verify().unwrap().bad_blocks.len(), 0);
-    }
-}
-
-/// `rekey` is the way to move a version 3 vault to the current format.
-#[test]
-fn rekey_upgrades_a_version_3_vault() {
-    let t = new_v3_vault();
-    {
-        let mut fs = open_fs(&t);
-        let f = fs.create_file(ROOT_INO, b"f", 0o600).unwrap();
-        fs.write(f, 0, b"hello").unwrap();
-        fs.commit().unwrap();
-    }
-    rekey::rekey(&t.path, Credential::Password(PW), PW2, KDF, &mut |_, _| {}).unwrap();
-    assert_eq!(Vault::peek_header(&t.path).unwrap().version, header::FORMAT_VERSION);
-    let mut fs = Vault::open(&t.path, Credential::Password(PW2), true).unwrap().into_fs().unwrap();
-    let f = fs.resolve("/f").unwrap();
-    assert_eq!(&fs.read(f, 0, 100).unwrap()[..], b"hello");
 }
 
 /// A tiny write far past the end of a file costs one block, not one entry

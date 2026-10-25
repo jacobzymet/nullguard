@@ -36,8 +36,6 @@ pub struct ChunkStore {
     vault_id: [u8; VAULT_ID_LEN],
     chunk_size: u32,
     chunk_count: u64,
-    /// The vault's format version (decides the metadata encoding).
-    version: u16,
     read_only: bool,
 }
 
@@ -49,7 +47,6 @@ impl ChunkStore {
             vault_id: header.vault_id,
             chunk_size: header.chunk_size,
             chunk_count: header.chunk_count,
-            version: header.version,
             read_only,
         }
     }
@@ -60,10 +57,6 @@ impl ChunkStore {
 
     pub fn chunk_count(&self) -> u64 {
         self.chunk_count
-    }
-
-    pub fn version(&self) -> u16 {
-        self.version
     }
 
     pub fn is_read_only(&self) -> bool {

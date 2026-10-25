@@ -638,7 +638,7 @@ pub fn run() -> Result<()> {
 
         Command::Info { vault } => {
             let h = Vault::peek_header(&vault)?;
-            println!("nullguard vault (version {})", h.version);
+            println!("nullguard vault (version {})", vault::header::FORMAT_VERSION);
             println!("  cipher:      {}", crate::crypto::aead::CIPHER_NAME);
             println!("  chunk size:  {}", human(h.chunk_size as u64));
             println!("  capacity:    {} ({} chunks)", human(h.chunk_count * h.chunk_size as u64), h.chunk_count);
@@ -650,12 +650,6 @@ pub fn run() -> Result<()> {
                 h.kdf.parallelism
             );
             println!("  keyfiles:    {}", h.keyfiles.len());
-            if h.version < vault::header::FORMAT_VERSION {
-                println!(
-                    "(An older vault format. It keeps working; `nullguard rekey` moves it to version {}.)",
-                    vault::header::FORMAT_VERSION
-                );
-            }
             println!("(Header values are not authenticated until the vault is unlocked.)");
         }
 

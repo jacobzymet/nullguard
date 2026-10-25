@@ -60,7 +60,7 @@ impl Keyfile {
         let b64 = line
             .strip_prefix(PREFIX)
             .ok_or(CryptoError::InvalidEncoding(
-                "not a nullguard keyfile (keyfiles from nullguard 0.1 don't work with this version)",
+                "not a nullguard keyfile",
             ))?;
         let mut raw = Zeroizing::new([0u8; KEY_LEN]);
         let decoded = Base64::decode(b64, raw.as_mut_slice())
@@ -123,7 +123,7 @@ mod tests {
         for bad in [
             "",
             "# only a comment\n",
-            "nullguard-secret-key-1:AAAA\n", // a nullguard 0.1 keyfile
+            "nullguard-secret-key-1:AAAA\n", // a different prefix
             &line[..line.len() - 4],          // truncated
             &format!("{line}AAAA"),           // too long
             &line.replace(PREFIX, "nullguard-keyfile-v1:"),

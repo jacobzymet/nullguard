@@ -72,13 +72,6 @@ impl SecretKey {
     pub(crate) fn expose_mut(&mut self) -> &mut [u8; KEY_LEN] {
         &mut self.bytes
     }
-
-    /// Duplicate the key into a second locked, zeroizing allocation.
-    pub fn duplicate(&self) -> Self {
-        let mut key = Self::zeroed();
-        key.bytes.copy_from_slice(self.bytes.as_slice());
-        key
-    }
 }
 
 impl Drop for SecretKey {

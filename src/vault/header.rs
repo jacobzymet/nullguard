@@ -6,7 +6,7 @@
 //! ```text
 //! offset  size   field
 //!      0     8   magic "NULLGARD"
-//!      8     2   version = 4 (3 is still read and written, see below)
+//!      8     2   version = 4
 //!     10    16   vault id (random)
 //!     26     4   chunk size (power of two, 4 KiB to 1 MiB)
 //!     30     8   chunk count (>= 16)
@@ -21,13 +21,6 @@
 //! Every vault has exactly one password and up to 16 keyfiles. Parsing is
 //! strict (unknown versions, out-of-range values and non-zero padding are
 //! refused), so every header has exactly one valid encoding.
-//!
-//! **Versions.** Version 4 (all new vaults) derives two independent keys
-//! from each slot's KEK, one for the key commitment and one for the AEAD,
-//! and stores files' block lists sparsely in the metadata. Version 3 used
-//! the KEK directly for both and lists every block, including holes.
-//! Version 3 vaults keep working unchanged; `rekey` turns one into a
-//! version 4 vault.
 //!
 //! **Integrity.** Each slot wraps the master key with an AEAD whose
 //! associated data is the header's first 38 bytes (magic, version, vault
@@ -46,10 +39,8 @@ use crate::crypto::{
 };
 
 pub const MAGIC: [u8; 8] = *b"NULLGARD";
-/// The format of new vaults.
+/// The vault format: the only one this version reads or writes.
 pub const FORMAT_VERSION: u16 = 4;
-/// The oldest format this version still opens (and keeps writing).
-pub const OLDEST_VERSION: u16 = 3;
 
 /// Size of one header copy on disk.
 pub const HEADER_AREA: u64 = 4096;
@@ -80,15 +71,10 @@ const LABEL_SLOT_COMMITMENT: &[u8] = b"nullguard/v4/slot-commitment-key";
 
 /// The keys a slot's KEK is used through: `(encryption, commitment)`.
 ///
-/// Version 4 derives two independent keys with HKDF, so no key is ever
-/// used by two different primitives. Version 3 used the KEK itself for
-/// both, which is kept so version 3 vaults still open.
-fn slot_keys(kek: &SecretKey, version: u16) -> Result<(SecretKey, SecretKey), CryptoError> {
-    if version >= 4 {
-        Ok((derive_subkey(kek, LABEL_SLOT_ENCRYPTION)?, derive_subkey(kek, LABEL_SLOT_COMMITMENT)?))
-    } else {
-        Ok((kek.duplicate(), kek.duplicate()))
-    }
+/// Two independent keys derived with HKDF, so no key is ever used by two
+/// different primitives.
+fn slot_keys(kek: &SecretKey) -> Result<(SecretKey, SecretKey), CryptoError> {
+    Ok((derive_subkey(kek, LABEL_SLOT_ENCRYPTION)?, derive_subkey(kek, LABEL_SLOT_COMMITMENT)?))
 }
 
 /// Why a header could not be parsed or changed.
@@ -122,8 +108,8 @@ pub struct WrappedKey {
 }
 
 impl WrappedKey {
-    fn seal(kek: &SecretKey, version: u16, aad: &[u8], master: &SecretKey) -> Result<Self, CryptoError> {
-        let (enc, commit) = slot_keys(kek, version)?;
+    fn seal(kek: &SecretKey, aad: &[u8], master: &SecretKey) -> Result<Self, CryptoError> {
+        let (enc, commit) = slot_keys(kek)?;
         let mut buf = zeroize::Zeroizing::new(*master.expose());
         let nonce = random::array::<NONCE_LEN>()?;
         let commitment = key_commitment(&commit, &nonce, aad);
@@ -133,8 +119,8 @@ impl WrappedKey {
 
     /// Recover the master key. The commitment is checked first (in constant
     /// time), so this succeeds under at most one KEK.
-    fn open(&self, kek: &SecretKey, version: u16, aad: &[u8]) -> Result<SecretKey, CryptoError> {
-        let (enc, commit) = slot_keys(kek, version)?;
+    fn open(&self, kek: &SecretKey, aad: &[u8]) -> Result<SecretKey, CryptoError> {
+        let (enc, commit) = slot_keys(kek)?;
         if !verify_key_commitment(&commit, &self.nonce, aad, &self.commitment) {
             return Err(CryptoError::AuthFailed);
         }
@@ -158,8 +144,6 @@ impl WrappedKey {
 /// The parsed vault header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
-    /// Format version: [`FORMAT_VERSION`] for new vaults, or [`OLDEST_VERSION`].
-    pub version: u16,
     pub vault_id: [u8; VAULT_ID_LEN],
     pub chunk_size: u32,
     pub chunk_count: u64,
@@ -184,24 +168,7 @@ impl Header {
         password: &[u8],
         kdf: Argon2Params,
     ) -> Result<Self, HeaderError> {
-        Self::create_versioned(FORMAT_VERSION, chunk_size, chunk_count, master, password, kdf)
-    }
-
-    /// [`Header::create`] for a given format version (tests make version 3
-    /// vaults with it).
-    pub(crate) fn create_versioned(
-        version: u16,
-        chunk_size: u32,
-        chunk_count: u64,
-        master: &SecretKey,
-        password: &[u8],
-        kdf: Argon2Params,
-    ) -> Result<Self, HeaderError> {
-        if !(OLDEST_VERSION..=FORMAT_VERSION).contains(&version) {
-            return Err(HeaderError::UnsupportedVersion(version));
-        }
         let mut h = Self {
-            version,
             vault_id: random::array()?,
             chunk_size,
             chunk_count,
@@ -244,7 +211,7 @@ impl Header {
     fn core_bytes(&self) -> [u8; CORE_LEN] {
         let mut c = [0u8; CORE_LEN];
         c[0..8].copy_from_slice(&MAGIC);
-        c[8..10].copy_from_slice(&self.version.to_le_bytes());
+        c[8..10].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         c[10..26].copy_from_slice(&self.vault_id);
         c[26..30].copy_from_slice(&self.chunk_size.to_le_bytes());
         c[30..38].copy_from_slice(&self.chunk_count.to_le_bytes());
@@ -288,7 +255,7 @@ impl Header {
         }
         let mut r = Reader::new(&bytes[8..]);
         let version = r.u16()?;
-        if !(OLDEST_VERSION..=FORMAT_VERSION).contains(&version) {
+        if version != FORMAT_VERSION {
             return Err(HeaderError::UnsupportedVersion(version));
         }
         let vault_id = r.array()?;
@@ -306,7 +273,7 @@ impl Header {
         if r.rest().iter().any(|&b| b != 0) {
             return Err(HeaderError::Malformed("header padding is not zero"));
         }
-        let h = Self { version, vault_id, chunk_size, chunk_count, kdf, salt, password, keyfiles };
+        let h = Self { vault_id, chunk_size, chunk_count, kdf, salt, password, keyfiles };
         h.validate_geometry()?;
         Ok(h)
     }
@@ -322,7 +289,7 @@ impl Header {
         kdf.validate()?;
         let salt = random::array::<SALT_LEN>()?;
         let kek = kdf::derive_key(password, &salt, &kdf)?;
-        self.password = WrappedKey::seal(&kek, self.version, &self.slot_aad(), master)?;
+        self.password = WrappedKey::seal(&kek, &self.slot_aad(), master)?;
         self.kdf = kdf;
         self.salt = salt;
         Ok(())
@@ -337,7 +304,7 @@ impl Header {
             return Err(HeaderError::Slots("that keyfile can already unlock this vault"));
         }
         let kek = keyfile.kek(&self.vault_id)?;
-        self.keyfiles.push(WrappedKey::seal(&kek, self.version, &self.slot_aad(), master)?);
+        self.keyfiles.push(WrappedKey::seal(&kek, &self.slot_aad(), master)?);
         Ok(())
     }
 
@@ -358,7 +325,7 @@ impl Header {
     fn keyfile_slot(&self, keyfile: &Keyfile) -> Result<Option<usize>, HeaderError> {
         let kek = keyfile.kek(&self.vault_id)?;
         let aad = self.slot_aad();
-        Ok(self.keyfiles.iter().position(|k| k.open(&kek, self.version, &aad).is_ok()))
+        Ok(self.keyfiles.iter().position(|k| k.open(&kek, &aad).is_ok()))
     }
 
     /// Unlock with the password. `Ok(None)` means it's the wrong password.
@@ -366,14 +333,14 @@ impl Header {
     /// tampered header asking for more memory than the machine has).
     pub fn unlock_with_password(&self, password: &[u8]) -> Result<Option<SecretKey>, HeaderError> {
         let kek = kdf::derive_key(password, &self.salt, &self.kdf)?;
-        Ok(self.password.open(&kek, self.version, &self.slot_aad()).ok())
+        Ok(self.password.open(&kek, &self.slot_aad()).ok())
     }
 
     /// Unlock with a keyfile. `Ok(None)` means no slot accepts it.
     pub fn unlock_with_keyfile(&self, keyfile: &Keyfile) -> Result<Option<SecretKey>, HeaderError> {
         let kek = keyfile.kek(&self.vault_id)?;
         let aad = self.slot_aad();
-        Ok(self.keyfiles.iter().find_map(|k| k.open(&kek, self.version, &aad).ok()))
+        Ok(self.keyfiles.iter().find_map(|k| k.open(&kek, &aad).ok()))
     }
 }
 
@@ -516,78 +483,36 @@ mod tests {
     /// the same KEK, so no ciphertext can "unlock" under several keys.
     #[test]
     fn wrapped_key_is_key_committing() {
-        for version in [OLDEST_VERSION, FORMAT_VERSION] {
-            let master = SecretKey::generate().unwrap();
-            let kek_a = SecretKey::generate().unwrap();
-            let kek_b = SecretKey::generate().unwrap();
-            let aad = b"slot aad";
-            let w = WrappedKey::seal(&kek_a, version, aad, &master).unwrap();
-            assert_eq!(w.open(&kek_a, version, aad).unwrap().expose(), master.expose());
-            assert!(w.open(&kek_b, version, aad).is_err());
-            // Swap in an honest commitment for KEK B: B now passes the
-            // commitment but fails the AEAD, and A fails the commitment.
-            let mut forged = w.clone();
-            let (_, commit_b) = slot_keys(&kek_b, version).unwrap();
-            forged.commitment = key_commitment(&commit_b, &forged.nonce, aad);
-            assert!(forged.open(&kek_b, version, aad).is_err());
-            assert!(forged.open(&kek_a, version, aad).is_err());
-            // The commitment also binds nonce and AAD.
-            assert!(w.open(&kek_a, version, b"other aad").is_err());
-            let mut bad = w.clone();
-            bad.commitment[0] ^= 1;
-            assert!(bad.open(&kek_a, version, aad).is_err());
-        }
+        let master = SecretKey::generate().unwrap();
+        let kek_a = SecretKey::generate().unwrap();
+        let kek_b = SecretKey::generate().unwrap();
+        let aad = b"slot aad";
+        let w = WrappedKey::seal(&kek_a, aad, &master).unwrap();
+        assert_eq!(w.open(&kek_a, aad).unwrap().expose(), master.expose());
+        assert!(w.open(&kek_b, aad).is_err());
+        // Swap in an honest commitment for KEK B: B now passes the
+        // commitment but fails the AEAD, and A fails the commitment.
+        let mut forged = w.clone();
+        let (_, commit_b) = slot_keys(&kek_b).unwrap();
+        forged.commitment = key_commitment(&commit_b, &forged.nonce, aad);
+        assert!(forged.open(&kek_b, aad).is_err());
+        assert!(forged.open(&kek_a, aad).is_err());
+        // The commitment also binds nonce and AAD.
+        assert!(w.open(&kek_a, b"other aad").is_err());
+        let mut bad = w.clone();
+        bad.commitment[0] ^= 1;
+        assert!(bad.open(&kek_a, aad).is_err());
     }
 
-    /// Version 4 never uses the KEK itself: the commitment and the AEAD use
-    /// two different keys derived from it, and neither is the KEK.
+    /// A slot never uses the KEK itself: the commitment and the AEAD use two
+    /// different keys derived from it, and neither is the KEK.
     #[test]
-    fn version_4_separates_slot_keys() {
+    fn slot_keys_are_separate() {
         let kek = SecretKey::generate().unwrap();
-        let (enc, commit) = slot_keys(&kek, FORMAT_VERSION).unwrap();
+        let (enc, commit) = slot_keys(&kek).unwrap();
         assert_ne!(enc.expose(), commit.expose());
         assert_ne!(enc.expose(), kek.expose());
         assert_ne!(commit.expose(), kek.expose());
-        // A version 3 slot doesn't open as version 4, or the other way round.
-        let master = SecretKey::generate().unwrap();
-        let w3 = WrappedKey::seal(&kek, OLDEST_VERSION, b"aad", &master).unwrap();
-        let w4 = WrappedKey::seal(&kek, FORMAT_VERSION, b"aad", &master).unwrap();
-        assert!(w3.open(&kek, FORMAT_VERSION, b"aad").is_err());
-        assert!(w4.open(&kek, OLDEST_VERSION, b"aad").is_err());
-    }
-
-    /// Version 3 headers still parse, unlock and accept new slots.
-    #[test]
-    fn version_3_headers_still_work() {
-        let master = SecretKey::generate().unwrap();
-        let mut h = Header::create(16 * 1024, 1000, &master, PW, TEST_PARAMS).unwrap();
-        assert_eq!(h.version, FORMAT_VERSION);
-        h.version = OLDEST_VERSION;
-        h.set_password(&master, PW, TEST_PARAMS).unwrap();
-        let kf = Keyfile::generate().unwrap();
-        h.add_keyfile(&master, &kf).unwrap();
-        let parsed = Header::parse(&h.to_bytes()).unwrap();
-        assert_eq!(parsed.version, OLDEST_VERSION);
-        assert_eq!(parsed.unlock_with_password(PW).unwrap().unwrap().expose(), master.expose());
-        assert_eq!(parsed.unlock_with_keyfile(&kf).unwrap().unwrap().expose(), master.expose());
-    }
-
-    /// Relabelling a header's version (either way) breaks every slot.
-    #[test]
-    fn changing_the_version_breaks_unlock() {
-        let kf = Keyfile::generate().unwrap();
-        for (from, to) in [(FORMAT_VERSION, OLDEST_VERSION), (OLDEST_VERSION, FORMAT_VERSION)] {
-            let master = SecretKey::generate().unwrap();
-            let mut h = Header::create(16 * 1024, 1000, &master, PW, TEST_PARAMS).unwrap();
-            h.version = from;
-            h.set_password(&master, PW, TEST_PARAMS).unwrap();
-            h.add_keyfile(&master, &kf).unwrap();
-            let mut b = h.to_bytes();
-            b[8..10].copy_from_slice(&to.to_le_bytes());
-            let relabelled = Header::parse(&b).unwrap();
-            assert!(relabelled.unlock_with_password(PW).unwrap().is_none());
-            assert!(relabelled.unlock_with_keyfile(&kf).unwrap().is_none());
-        }
     }
 
     #[test]
@@ -598,7 +523,7 @@ mod tests {
         assert_eq!(Header::parse(&b).unwrap_err(), HeaderError::NotAVault);
 
         // A vault from an older or newer nullguard.
-        for v in [1u16, 2, FORMAT_VERSION + 1] {
+        for v in [1u16, 2, 3, FORMAT_VERSION + 1] {
             let mut b = h.to_bytes();
             b[8..10].copy_from_slice(&v.to_le_bytes());
             assert_eq!(Header::parse(&b).unwrap_err(), HeaderError::UnsupportedVersion(v));
