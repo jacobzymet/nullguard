@@ -3,6 +3,7 @@
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -31,6 +32,10 @@ struct NullguardFs {
     /// USB stick.
     uid: u32,
     gid: u32,
+    /// Follow symbolic links that lead out of the vault (see `MountOptions`).
+    allow_outside_links: bool,
+    /// Links already reported as refused (each is reported once).
+    refused_links: Mutex<HashSet<u64>>,
 }
 
 fn errno(e: &Error) -> Errno {
@@ -196,8 +201,21 @@ impl Filesystem for NullguardFs {
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        match self.run(|fs| fs.readlink(ino.0)) {
-            Ok(t) => reply.data(&t),
+        let allow = self.allow_outside_links;
+        match self.run(|fs| Ok((fs.readlink(ino.0)?, !allow && fs.link_leaves_vault(ino.0)?))) {
+            Ok((target, false)) => reply.data(&target),
+            // The kernel follows a link by asking for its target: refusing
+            // to give it keeps the link from leading out of the vault.
+            Ok((target, true)) => {
+                if self.refused_links.lock().is_ok_and(|mut seen| seen.insert(ino.0)) {
+                    eprintln!(
+                        "nullguard: not following a symbolic link that leads out of the vault (to {}). \
+                         Mount with --allow-outside-links to follow such links.",
+                        crate::cli::display_name(&target)
+                    );
+                }
+                reply.error(Errno::from_i32(libc::EACCES));
+            }
             Err(e) => reply.error(e),
         }
     }
@@ -422,6 +440,8 @@ pub fn mount(fs: Fs, mountpoint: &Path, opts: &MountOptions) -> Result<(), Error
         broken: broken.clone(),
         uid: crate::platform::uid(),
         gid: crate::platform::gid(),
+        allow_outside_links: opts.allow_outside_links,
+        refused_links: Mutex::new(HashSet::new()),
     };
 
     let mut config = Config::default();

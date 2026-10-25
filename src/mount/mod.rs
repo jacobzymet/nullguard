@@ -22,6 +22,10 @@ pub struct MountOptions {
     pub read_only: bool,
     /// Forbid executing programs stored in the vault (not on Windows).
     pub no_exec: bool,
+    /// Follow symbolic links that lead out of the vault (Linux, macOS).
+    /// Off by default: in a vault someone else can write to, such a link
+    /// could send files you save "into the vault" somewhere outside it.
+    pub allow_outside_links: bool,
     /// Called once the filesystem is mounted.
     pub on_ready: Option<Box<dyn Fn() + Send>>,
 }

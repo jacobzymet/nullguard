@@ -251,6 +251,17 @@ struct Superblock {
     meta_chunks: Vec<u64>,
 }
 
+/// Where resolving a symbolic link leads (see [`Fs::link_leaves_vault`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Walk {
+    /// To this inode, inside the vault.
+    Inside(u64),
+    /// Out of the vault.
+    Leaves,
+    /// Nowhere: a missing name, a file used as a folder, or a loop.
+    Nowhere,
+}
+
 /// Allocation bitmap over chunk indices.
 struct Bitmap {
     words: Vec<u64>,
@@ -376,6 +387,9 @@ pub struct Fs {
     open_counts: HashMap<u64, u32>,
     /// Unlinked inodes that are still open.
     orphans: HashSet<u64>,
+    /// The directory each linked inode is in (inodes are linked exactly
+    /// once). Lets a symbolic link be resolved from where it is.
+    parents: HashMap<u64, u64>,
     dirty: bool,
     last_commit: Instant,
     last_commit_took: Duration,
@@ -433,6 +447,7 @@ impl Fs {
             cache: Cache::new(),
             open_counts: HashMap::new(),
             orphans: HashSet::new(),
+            parents: HashMap::from([(ROOT_INO, ROOT_INO)]),
             dirty: false,
             last_commit: Instant::now(),
             last_commit_took: Duration::ZERO,
@@ -521,6 +536,12 @@ impl Fs {
                         return Err(Error::Corrupt("data chunk out of range or referenced twice".into()));
                     }
                 }
+            }
+        }
+        self.parents = HashMap::from([(ROOT_INO, ROOT_INO)]);
+        for (&dir, inode) in &inodes {
+            if let Node::Dir { entries, .. } = &inode.node {
+                self.parents.extend(entries.values().map(|&child| (child, dir)));
             }
         }
         self.inodes = inodes;
@@ -839,6 +860,64 @@ impl Fs {
         Ok(out)
     }
 
+    /// Whether following the symbolic link `ino` would lead out of the
+    /// vault: its target is absolute, or resolving it step by step from
+    /// where it is (following every link on the way, as the kernel does)
+    /// climbs above the vault's root. A link that can't be resolved (a
+    /// missing name, a loop) leads nowhere, so not out of the vault.
+    ///
+    /// Checking the target's text alone isn't enough: a link to `..` that
+    /// stays inside, followed by another link going `..` from there, can
+    /// together climb out.
+    pub fn link_leaves_vault(&self, ino: u64) -> Result<bool, Error> {
+        let Node::Symlink { target } = &self.inode(ino)?.node else {
+            return Err(Error::InvalidArgument);
+        };
+        let parent = self.parents.get(&ino).copied().ok_or(Error::NotFound)?;
+        let mut hops = 0;
+        Ok(self.walk_link(parent, target, &mut hops) == Walk::Leaves)
+    }
+
+    /// Resolve a link's `target` from the directory `dir`; see
+    /// [`Fs::link_leaves_vault`]. `hops` counts links followed, with the
+    /// same limit as Linux (40).
+    fn walk_link(&self, dir: u64, target: &[u8], hops: &mut u32) -> Walk {
+        if target.first() == Some(&b'/') {
+            return Walk::Leaves;
+        }
+        let mut cur = dir;
+        for part in target.split(|&b| b == b'/').filter(|p| !p.is_empty() && *p != b".") {
+            let Some(Inode { node: Node::Dir { parent, entries }, .. }) = self.inodes.get(&cur) else {
+                return Walk::Nowhere; // a file in the middle of a path
+            };
+            if part == b".." {
+                if cur == ROOT_INO {
+                    return Walk::Leaves; // `..` of the mount's root is outside
+                }
+                cur = *parent;
+                continue;
+            }
+            let Some(&child) = entries.get(part) else {
+                return Walk::Nowhere;
+            };
+            match self.inodes.get(&child).map(|i| &i.node) {
+                Some(Node::Symlink { target }) => {
+                    *hops += 1;
+                    if *hops > 40 {
+                        return Walk::Nowhere; // a loop (ELOOP)
+                    }
+                    match self.walk_link(cur, target, hops) {
+                        Walk::Inside(to) => cur = to,
+                        other => return other,
+                    }
+                }
+                Some(_) => cur = child,
+                None => return Walk::Nowhere,
+            }
+        }
+        Walk::Inside(cur)
+    }
+
     pub fn readlink(&self, ino: u64) -> Result<Zeroizing<Vec<u8>>, Error> {
         match &self.inode(ino)?.node {
             Node::Symlink { target } => Ok(target.clone()),
@@ -905,6 +984,7 @@ impl Fs {
         if let Node::Dir { entries, .. } = &mut self.inode_mut(parent)?.node {
             entries.insert(Name::new(name), ino);
         }
+        self.parents.insert(ino, parent);
         self.touch_dir(parent);
         self.dirty = true;
         Ok(ino)
@@ -932,6 +1012,7 @@ impl Fs {
         if let Node::Dir { entries, .. } = &mut self.inode_mut(parent)?.node {
             entries.remove(name);
         }
+        self.parents.remove(&ino);
         self.touch_dir(parent);
         if self.open_counts.get(&ino).copied().unwrap_or(0) > 0 {
             self.orphans.insert(ino);
@@ -1025,6 +1106,7 @@ impl Fs {
         if let Node::Dir { entries, .. } = &mut self.inode_mut(new_parent)?.node {
             entries.insert(Name::new(new_name), ino);
         }
+        self.parents.insert(ino, new_parent);
         let now = Timestamp::now();
         let moved = self.inode_mut(ino)?;
         moved.ctime = now;

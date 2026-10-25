@@ -1037,6 +1037,11 @@ pub fn mount(fs: Fs, mountpoint: &Path, opts: &MountOptions) -> Result<(), Error
     if opts.no_exec {
         return Err(Error::Usage("--no-exec isn't available on Windows".into()));
     }
+    if opts.allow_outside_links {
+        return Err(Error::Usage(
+            "--allow-outside-links has no effect on Windows, where symbolic links in a vault aren't shown".into(),
+        ));
+    }
     check_mountpoint(mountpoint)?;
     let letter = drive_letter(mountpoint).expect("checked above");
     let api = Api::load()?;

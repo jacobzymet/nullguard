@@ -117,7 +117,7 @@ Older builds can't open version 4 vaults.
 | Command | What it does |
 |---|---|
 | `create <vault> --size <N>` | Create a vault. `--low-memory` uses 64 MiB for the password's key derivation instead of 1 GiB. |
-| `mount <vault> <dir or X:>` | Unlock and mount on an empty folder (Linux, macOS) or a free drive letter (Windows). `--keyfile`, `--read-only`, `--no-exec` (not on Windows). Runs in the foreground; Ctrl-C unmounts. |
+| `mount <vault> <dir or X:>` | Unlock and mount on an empty folder (Linux, macOS) or a free drive letter (Windows). `--keyfile`, `--read-only`, `--no-exec` and `--allow-outside-links` (not on Windows). Runs in the foreground; Ctrl-C unmounts. |
 | `unmount <dir>` | Unmount and lock (commits all changes first). |
 | `change-password <vault>` | Re-wrap the master key under a new password (see the caveat below). `--low-memory` as for `create`. |
 | `rekey <vault>` | Move the vault to a new master key and new password: old passwords, keyfiles and leaked keys stop working. Copies every file, so it needs free space for a second copy while it runs. Keyfiles must be added again afterwards. `--low-memory` as for `create`. |
@@ -402,7 +402,14 @@ treat a vault's *contents* as untrusted input, though. File names are
 shown with control and bidi-override characters escaped, so a planted name
 can't inject terminal escape sequences or impersonate another name. Names
 that would be unsafe on the local OS are refused by `get`. Recursive
-commands stop at 1024 levels of nesting.
+commands stop at 1024 levels of nesting. A mounted vault doesn't follow
+symbolic links that lead out of it (to an absolute path, or up past the
+vault's root, also by way of other links): otherwise someone who can write
+to the vault could plant a link such as `Documents -> /tmp/drop`, and what
+you save "into the vault" would land outside it in plaintext, or editing a
+vault file would change one of your own. `mount --allow-outside-links`
+follows them anyway, for links you made on purpose. (`get` and `put` never
+follow links, and Windows doesn't show them.)
 
 ### Changing a password: what it does and doesn't do
 

@@ -1042,3 +1042,66 @@ fn far_writes_stay_cheap() {
     let f = fs.resolve("/far").unwrap();
     assert_eq!(&fs.read(f, end - 1, 10).unwrap()[..], b"x");
 }
+
+// ----------------------------------------------------------------------
+// Symbolic links that lead out of the vault
+// ----------------------------------------------------------------------
+
+/// Whether following each link leads out of the vault: resolved from where
+/// the link is, following links on the way, as the kernel would.
+#[test]
+fn links_leading_out_of_the_vault_are_recognized() {
+    let t = new_vault();
+    let mut fs = open_fs(&t);
+    let d = fs.mkdir(ROOT_INO, b"d", 0o700).unwrap();
+    let e = fs.mkdir(d, b"e", 0o700).unwrap();
+    fs.create_file(e, b"f", 0o600).unwrap();
+    let mut link = |dir, name: &[u8], target: &[u8]| fs.symlink(dir, name, target).unwrap();
+    let cases = [
+        (link(ROOT_INO, b"abs", b"/etc/passwd"), true, "absolute"),
+        (link(ROOT_INO, b"up", b"../outside"), true, "above the root"),
+        (link(e, b"up3", b"../../../x"), true, "above the root from deeper"),
+        (link(e, b"up2", b"../../d/e/f"), false, "up to the root and back down"),
+        (link(d, b"down", b"e/f"), false, "down"),
+        (link(e, b"dots", b"./../e/./f"), false, "dots"),
+        (link(d, b"missing", b"nope/../../.."), false, "a missing name leads nowhere"),
+        (link(d, b"through-file", b"e/f/../../.."), false, "a file used as a folder leads nowhere"),
+        // Each harmless on its own, together they climb out: `toroot`
+        // leads to the root, and `.. ` from there is outside.
+        (link(d, b"toroot", b".."), false, "a link to the root"),
+        (link(d, b"chain", b"toroot/.."), true, "a link through a link to the root, then up"),
+        (link(d, b"chain2", b"chain/x"), true, "through a link that leads out"),
+        (link(d, b"loop1", b"loop2"), false, "a loop leads nowhere"),
+        (link(d, b"loop2", b"loop1"), false, "a loop leads nowhere"),
+    ];
+    for (ino, leaves, why) in cases {
+        assert_eq!(fs.link_leaves_vault(ino).unwrap(), leaves, "{why}");
+    }
+    assert!(fs.link_leaves_vault(e).is_err(), "not a link");
+}
+
+/// The verdict follows the link where it is now: moving it changes what
+/// `..` means. The parents are rebuilt when the vault is opened again.
+#[test]
+fn moving_a_link_changes_where_it_leads() {
+    let t = new_vault();
+    let mut fs = open_fs(&t);
+    let d = fs.mkdir(ROOT_INO, b"d", 0o700).unwrap();
+    let l = fs.symlink(d, b"l", b"../x").unwrap();
+    assert!(!fs.link_leaves_vault(l).unwrap());
+    fs.rename(d, b"l", ROOT_INO, b"l", false).unwrap();
+    assert!(fs.link_leaves_vault(l).unwrap(), "moved to the root, `..` is outside");
+    // Moving the folder a link is in moves the link with it.
+    let l2 = fs.symlink(d, b"l2", b"../../x").unwrap();
+    assert!(fs.link_leaves_vault(l2).unwrap());
+    let deeper = fs.mkdir(ROOT_INO, b"deeper", 0o700).unwrap();
+    fs.rename(ROOT_INO, b"d", deeper, b"d", false).unwrap();
+    assert!(!fs.link_leaves_vault(l2).unwrap());
+    fs.commit().unwrap();
+    drop(fs);
+    let fs = open_fs(&t);
+    let l = fs.resolve("/l").unwrap();
+    let l2 = fs.resolve("/deeper/d/l2").unwrap();
+    assert!(fs.link_leaves_vault(l).unwrap());
+    assert!(!fs.link_leaves_vault(l2).unwrap());
+}

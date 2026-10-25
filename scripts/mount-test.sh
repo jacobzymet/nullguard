@@ -41,6 +41,16 @@ cmp big.bin mnt/a/b/c/big.bin
 mv mnt/hello.txt mnt/a/greeting.txt
 ln -s a/greeting.txt mnt/link
 [ "$(cat mnt/link)" = "hello vault" ]
+
+echo "== links that lead out of the vault aren't followed"
+echo "outside" > outside.txt
+ln -s "$WORK/outside.txt" mnt/out-abs
+ln -s ../outside.txt mnt/out-rel            # mnt/.. is $WORK
+mkdir mnt/d && ln -s .. mnt/d/toroot && ln -s toroot/.. mnt/d/chain
+for l in mnt/out-abs mnt/out-rel mnt/d/chain/outside.txt; do
+  if cat "$l" 2>/dev/null; then echo "followed a link out of the vault: $l"; exit 1; fi
+done
+[ "$(cat mnt/d/toroot/link)" = "hello vault" ]   # links inside still work
 dd if=/dev/zero of=mnt/sparse bs=1 count=1 seek=10000000 status=none
 [ "$(stat -c %s mnt/sparse)" = 10000001 ]
 truncate -s 5 mnt/a/greeting.txt
@@ -68,6 +78,7 @@ grep " $WORK/mnt " /proc/mounts | grep -q nodev
 
 echo "== unmount"
 unmount_vault
+grep -q "not following a symbolic link that leads out of the vault" mount.log
 grep -q "unmounted and locked" mount.log
 if strings v.ngv | grep -q "hello vault"; then echo "PLAINTEXT LEAKED"; exit 1; fi
 if strings v.ngv | grep -q "greeting"; then echo "FILE NAME LEAKED"; exit 1; fi
@@ -75,9 +86,11 @@ if strings v.ngv | grep -q "greeting"; then echo "FILE NAME LEAKED"; exit 1; fi
 echo "== verify"
 printf '%s\n' "$PW" | "$NG" verify v.ngv --password-stdin
 
-echo "== remount read-only, check persistence"
-mount_vault --read-only
+echo "== remount read-only (following outside links), check persistence"
+mount_vault --read-only --allow-outside-links
 cmp big.bin mnt/a/b/c/big.bin
+[ "$(cat mnt/out-abs)" = "outside" ]
+[ "$(cat mnt/d/chain/outside.txt)" = "outside" ]
 [ "$(cat mnt/a/greeting.txt)" = "hello" ]
 if touch mnt/nope 2>/dev/null; then echo "read-only mount accepted a write"; exit 1; fi
 unmount_vault

@@ -55,6 +55,11 @@ enum Command {
         /// Forbid running programs stored in the vault (Linux, macOS).
         #[arg(long)]
         no_exec: bool,
+        /// Follow symbolic links that lead out of the vault (Linux, macOS). By
+        /// default they aren't followed: in a vault someone else can write to,
+        /// such a link could send what you save "into the vault" elsewhere.
+        #[arg(long)]
+        allow_outside_links: bool,
     },
     /// Unmount (lock) a mounted vault.
     Unmount { mountpoint: PathBuf },
@@ -500,7 +505,7 @@ pub fn run() -> Result<()> {
             );
         }
 
-        Command::Mount { vault, mountpoint, unlock: u, read_only, no_exec } => {
+        Command::Mount { vault, mountpoint, unlock: u, read_only, no_exec, allow_outside_links } => {
             if !mount::SUPPORTED {
                 return Err(mount::unsupported().into());
             }
@@ -515,6 +520,7 @@ pub fn run() -> Result<()> {
             let opts = MountOptions {
                 read_only,
                 no_exec,
+                allow_outside_links,
                 on_ready: Some(Box::new(move || {
                     eprintln!(
                         "Vault mounted at {}. Press Ctrl-C here, or run `nullguard unmount {}`, to lock it.",
@@ -830,7 +836,7 @@ fn check_depth(depth: usize) -> Result<()> {
 /// so control characters (which could inject terminal escape sequences)
 /// and Unicode bidi/invisible formatting characters (which could make one
 /// name look like another) are shown escaped.
-fn display_name(raw: &[u8]) -> String {
+pub(crate) fn display_name(raw: &[u8]) -> String {
     let s = String::from_utf8_lossy(raw);
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
