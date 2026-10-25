@@ -432,8 +432,7 @@ Afterwards the old password, the old keyfiles and the old master key no
 longer open the vault file. Copies of the file made *before* the rekey are
 unaffected: they still open with the old credentials and still hold what
 they held then. A rekeyed vault is simply a new vault with the same files,
-in the current format (so rekeying also moves a version 3 vault to
-version 4).
+in the current format.
 
 ---
 
@@ -482,9 +481,9 @@ and learn whether yours is among them from how the unlock fails (a
 partitioning-oracle attack). Every wrapped key therefore carries an
 HMAC-SHA256 commitment to its KEK, checked in constant time *before*
 decrypting. HMAC-SHA256 is collision-resistant in its key, so a slot opens
-under exactly one KEK. In format version 4 the commitment and the
-encryption each use their own key derived from the KEK (HKDF-SHA256), so
-no key is used by two different primitives.
+under exactly one KEK. The commitment and the encryption each use their
+own key derived from the KEK (HKDF-SHA256), so no key is used by two
+different primitives.
 
 ---
 
@@ -534,8 +533,6 @@ aad              = "nullguard/v2/keyslot" ‖ header[0..38]
 commitment       = HMAC-SHA256(commit_key, "nullguard/v2/key-commitment" ‖ nonce ‖ aad)
 ciphertext ‖ tag = XChaCha20-Poly1305(enc_key, nonce, master_key, aad)
 ```
-
-(Version 3 used the KEK itself as both `enc_key` and `commit_key`.)
 
 `header[0..38]` is the magic, version, vault ID and geometry, so a slot
 works only in the vault, and with the geometry, it was made for.
@@ -587,9 +584,7 @@ inode = ino u64 ‖ kind u8 (1 file, 2 dir, 3 symlink) ‖ perm u16
 
 A file lists only the blocks it stores, by strictly increasing index; the
 rest are holes (zeros). So a small write far past the end of a file costs
-one entry, not one per block in between. Version 3 vaults use `"NGMETA02"`,
-which lists every block up to the last one, holes as `0 u64`:
-`block_count u64 ‖ (0 u64 | chunk u64 ‖ nonce (24))*`.
+one entry, not one per block in between.
 
 The metadata is validated as untrusted input even though it's
 authenticated: the root is inode 1, every inode is linked exactly once,
