@@ -25,6 +25,8 @@ pub fn harden_process() {
             libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
         }
     }
+    #[cfg(windows)]
+    win::suppress_crash_reports();
     #[cfg(target_os = "macos")]
     {
         // The macOS counterpart: refuse debugger attachment (lldb, dtrace
@@ -371,6 +373,54 @@ pub mod win {
         s
     }
 
+    /// Keep keys and decrypted data out of crash reports (the Windows
+    /// counterpart of disabling core dumps), for this process only:
+    ///
+    /// * no "program stopped working" dialog or critical-error boxes;
+    /// * any Windows Error Reporting report leaves out heap memory, where
+    ///   keys, file names and cached plaintext live;
+    /// * a crash that reaches the last-chance handler ends the process at
+    ///   once, before Windows Error Reporting can take a dump.
+    pub fn suppress_crash_reports() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX, SetErrorMode,
+            SetUnhandledExceptionFilter,
+        };
+        use windows_sys::Win32::System::ErrorReporting::{WER_FAULT_REPORTING_FLAG_NOHEAP, WerSetFlags};
+        // SAFETY: process-wide settings with no pointers; the filter is a
+        // plain function that only ends the process.
+        unsafe {
+            SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+            WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP);
+            SetUnhandledExceptionFilter(Some(end_without_dump));
+        }
+    }
+
+    /// Last-chance exception filter: end the process now, so no crash dump
+    /// (with keys in it) is written.
+    unsafe extern "system" fn end_without_dump(
+        _: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+    ) -> i32 {
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        // SAFETY: ends this process.
+        unsafe { TerminateProcess(GetCurrentProcess(), 0xC000_0409) };
+        1 // EXCEPTION_EXECUTE_HANDLER (not reached)
+    }
+
+    /// Exclude this program (by its path) from Windows Error Reporting for
+    /// the current user, so it never collects a report or dump of it, even
+    /// for failures no handler sees. This is a per-user setting that stays
+    /// (in HKCU\Software\Microsoft\Windows\Windows Error Reporting    /// ExcludedApplications); `mount` sets it, since a mounted vault keeps
+    /// keys in memory for a long time.
+    pub fn exclude_from_crash_reports() -> io::Result<()> {
+        use windows_sys::Win32::System::ErrorReporting::WerAddExcludedApplication;
+        let exe = std::env::current_exe()?;
+        let name = wide_path(&exe)?;
+        // SAFETY: a NUL-terminated path; FALSE = current user only.
+        let hr = unsafe { WerAddExcludedApplication(name.as_ptr(), 0) };
+        if hr < 0 { Err(io::Error::from_raw_os_error(hr)) } else { Ok(()) }
+    }
+
     /// The user an access token belongs to, as a SID string.
     ///
     /// # Safety
@@ -505,7 +555,19 @@ pub mod win {
         let handle = with_attributes(sddl, |sa| {
             // SAFETY: a NUL-terminated path and valid security attributes.
             unsafe {
-                CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE, share, sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, null_mut())
+                // FILE_FLAG_OPEN_REPARSE_POINT: a link at `path` (even a
+                // dangling one, planted after any check) counts as an
+                // existing file, so CREATE_NEW fails instead of creating the
+                // file wherever the link points.
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    share,
+                    sa,
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                    null_mut(),
+                )
             }
         })?;
         if handle == INVALID_HANDLE_VALUE {
@@ -778,6 +840,38 @@ pub mod win {
                 let f = create_file_with(&dir.path().join(name), FILE_SHARE_READ, &format!("D:P(A;;FA;;;{me}){grant}")).unwrap();
                 assert!(readable_by_others(&f).unwrap(), "{name}");
             }
+        }
+
+        /// Crash reports leave out heap memory (where keys live), and no
+        /// crash dialog is shown.
+        #[test]
+        fn crash_reports_leave_out_keys() {
+            use windows_sys::Win32::System::Diagnostics::Debug::{GetErrorMode, SEM_NOGPFAULTERRORBOX};
+            use windows_sys::Win32::System::ErrorReporting::{WER_FAULT_REPORTING_FLAG_NOHEAP, WerGetFlags};
+            suppress_crash_reports();
+            let mut flags = 0u32;
+            // SAFETY: queries this process's settings into a local.
+            unsafe {
+                assert!(WerGetFlags(GetCurrentProcess(), &mut flags) >= 0);
+                assert_ne!(flags & WER_FAULT_REPORTING_FLAG_NOHEAP, 0);
+                assert_ne!(GetErrorMode() & SEM_NOGPFAULTERRORBOX, 0);
+            }
+        }
+
+        /// A new file is never created through a link at its name, even a
+        /// dangling one (which is how a planted link would redirect it).
+        #[test]
+        fn new_files_are_never_created_through_a_link() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("elsewhere.txt");
+            let link = dir.path().join("out.txt");
+            if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+                eprintln!("skipped: creating symbolic links needs Developer Mode or an administrator");
+                return;
+            }
+            let err = create_private_file(&link, 0).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+            assert!(!target.exists(), "the file was created where the link points");
         }
 
         #[test]

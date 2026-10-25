@@ -374,6 +374,11 @@ fn check_keyfile_permissions(path: &Path, file: &std::fs::File) -> Result<()> {
 fn unlock(path: &Path, args: &UnlockArgs, read_only: bool) -> Result<(Vault, Prompter, Unlocker)> {
     let p = Prompter { stdin: args.password_stdin };
     let u = Unlocker::from_args(args, &p)?;
+    if let Unlocker::Password(_) = u
+        && let Some(w) = vault::unusual_kdf_warning(path)
+    {
+        eprintln!("WARNING: {w}");
+    }
     eprintln!("Unlocking (deriving key)...");
     let v = Vault::open(path, u.credential(), read_only).with_context(|| format!("opening {}", path.display()))?;
     warn_all(&v.warnings);

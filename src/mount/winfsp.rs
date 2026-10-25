@@ -182,6 +182,23 @@ type StartDispatcherFn = unsafe extern "C" fn(FspFs, u32) -> NTSTATUS;
 type StopDispatcherFn = unsafe extern "C" fn(FspFs);
 type AddDirInfoFn = unsafe extern "C" fn(*mut DirInfo, *mut c_void, u32, *mut u32) -> u8;
 type GetOperationContextFn = unsafe extern "C" fn() -> *const OperationContext;
+type FspVersionFn = unsafe extern "C" fn(*mut u32) -> NTSTATUS;
+
+/// The WinFsp major version these bindings are written for.
+const WINFSP_MAJOR: u32 = 2;
+
+/// Accept only WinFsp 2.x (`version` is `major << 16 | minor`, as
+/// `FspVersion` reports it).
+fn check_winfsp_version(version: u32) -> Result<(), Error> {
+    let (major, minor) = (version >> 16, version & 0xffff);
+    if major == WINFSP_MAJOR {
+        return Ok(());
+    }
+    Err(Error::Usage(format!(
+        "WinFsp {major}.{minor} is installed, but nullguard works with WinFsp {WINFSP_MAJOR}.x only. \
+         Install WinFsp {WINFSP_MAJOR}.x from https://winfsp.dev, or use a nullguard version made for yours."
+    )))
+}
 
 /// `FSP_FILE_SYSTEM_OPERATION_CONTEXT`: the request the current thread is
 /// serving.
@@ -231,6 +248,20 @@ impl Api {
             unsafe { GetProcAddress(module, name.as_ptr()) }
                 .ok_or_else(|| Error::Usage(format!("{} is too old; update WinFsp", dll.display())))
         };
+        // The bindings below (signatures, structure layouts, request offsets)
+        // are WinFsp 2.x's. Refuse any other major version rather than guess:
+        // a different layout would be memory-unsafe, and could misread the
+        // fields the per-open caller check relies on.
+        // SAFETY: `FspVersion(PUINT32) -> NTSTATUS` in every WinFsp version.
+        let version = unsafe {
+            let fsp_version = std::mem::transmute::<RawFn, FspVersionFn>(sym(b"FspVersion\0")?);
+            let mut v = 0u32;
+            if fsp_version(&mut v) != STATUS_SUCCESS {
+                return Err(Error::Usage(format!("could not read the version of {}", dll.display())));
+            }
+            v
+        };
+        check_winfsp_version(version)?;
         // SAFETY: each symbol has exactly this signature in WinFsp 2.x
         // (winfsp.h), and on the platforms we build for "system" and "C"
         // are the same calling convention.
@@ -550,8 +581,10 @@ fn current_open_request(state: &State) -> Option<*const u8> {
 
 /// Whether an open request comes from the user `owner` (a SID string).
 ///
-/// Requests from kernel mode come from drivers, not from users, and WinFsp
-/// itself skips its access checks for them; they are allowed.
+/// Requests marked as coming from kernel mode come from drivers, not from
+/// users (WinFsp skips its own access checks for them). They are still
+/// allowed only for the owner's or the system's (SYSTEM) token: if the mark
+/// were ever misread, another user's request must fail, not pass.
 ///
 /// # Safety
 /// `req` must point to a WinFsp Create request (`current_open_request`).
@@ -563,14 +596,17 @@ unsafe fn open_request_from(req: *const u8, owner: &str) -> bool {
             std::ptr::read_unaligned(req.add(REQ_CREATE_TOKEN).cast::<u64>()),
         )
     };
-    if flags & 1 == 0 {
-        return true;
-    }
     // The low 32 bits are a handle to the requester's token, duplicated into
     // this process by WinFsp for the duration of the request.
     let handle = (token & 0xffff_ffff) as usize as HANDLE;
     // SAFETY: a token handle WinFsp opened for us (a bad one fails the call).
-    if !matches!(unsafe { crate::platform::win::token_user(handle) }, Ok(sid) if sid == owner) {
+    let Ok(user) = (unsafe { crate::platform::win::token_user(handle) }) else {
+        return false;
+    };
+    if flags & 1 == 0 {
+        return user == owner || user == "S-1-5-18";
+    }
+    if user != owner {
         return false;
     }
     // The owner's own sandboxed processes (low integrity, app containers,
@@ -1045,6 +1081,11 @@ pub fn mount(fs: Fs, mountpoint: &Path, opts: &MountOptions) -> Result<(), Error
     check_mountpoint(mountpoint)?;
     let letter = drive_letter(mountpoint).expect("checked above");
     let api = Api::load()?;
+    // Keys stay in memory for as long as the vault is mounted: make sure no
+    // crash report of this program is ever collected (see `platform`).
+    if let Err(e) = crate::platform::win::exclude_from_crash_reports() {
+        eprintln!("nullguard: WARNING: could not exclude nullguard from Windows Error Reporting ({e})");
+    }
     let owner_sid = crate::platform::win::current_user_sid()?;
     let state = State {
         fs: Mutex::new(Some(fs)),
@@ -1277,6 +1318,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_winfsp_2_is_accepted() {
+        assert!(check_winfsp_version(0x0002_0000).is_ok());
+        assert!(check_winfsp_version(0x0002_0001).is_ok());
+        for other in [0x0001_000c, 0x0003_0000, 0] {
+            let err = check_winfsp_version(other).unwrap_err().to_string();
+            assert!(err.contains("works with WinFsp 2.x only"), "{err}");
+        }
+    }
+
+    #[test]
     fn drive_letters() {
         for (s, want) in [("X:", Some('X')), ("x:\\", Some('X')), ("q:/", Some('Q'))] {
             assert_eq!(drive_letter(Path::new(s)), want, "{s}");
@@ -1383,8 +1434,12 @@ mod tests {
             let low = crate::platform::win::low_integrity_token();
             assert!(!open_request_from(open_request(low, true).as_ptr(), &me), "a sandboxed process was served");
             CloseHandle(low);
-            // Kernel-mode requests (from drivers) carry no user to check.
-            assert!(open_request_from(open_request(anonymous, false).as_ptr(), &me));
+            // Kernel-mode requests (from drivers) pass for the owner's or
+            // SYSTEM's token only: a request misread as kernel-mode fails
+            // for anyone else.
+            assert!(open_request_from(open_request(mine, false).as_ptr(), &me));
+            assert!(!open_request_from(open_request(anonymous, false).as_ptr(), &me), "failed open");
+            assert!(!open_request_from(open_request(0x1234 as HANDLE, false).as_ptr(), &me), "failed open");
             CloseHandle(mine);
             CloseHandle(anonymous);
         }

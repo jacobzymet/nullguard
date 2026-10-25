@@ -205,6 +205,30 @@ fn damaged_primary_is_reported_and_restored_from_backup() {
     }
 }
 
+/// A primary copy tampered to demand the costliest key derivation nullguard
+/// accepts (4 GiB, 64 passes) doesn't stall unlocking: the cheaper backup is
+/// tried first. The tampering is warned about before deriving anything.
+#[test]
+fn costly_tampered_header_copy_is_tried_last() {
+    let t = new_vault();
+    assert_eq!(unusual_kdf_warning(&t.path), None);
+    let mut kdf = Vec::new();
+    for v in [Argon2Params::MAX_MEMORY_KIB, Argon2Params::MAX_ITERATIONS, 4] {
+        kdf.extend_from_slice(&v.to_le_bytes());
+    }
+    write_at(&t.path, PRIMARY_OFFSET + 38, &kdf);
+    let w = unusual_kdf_warning(&t.path).expect("a warning");
+    assert!(w.contains("4096 MiB, 64 passes"), "{w}");
+
+    let started = std::time::Instant::now();
+    let v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "derived the costly copy first");
+    assert!(v.warnings.iter().any(|w| w.contains("primary") && w.contains("restored")), "{:?}", v.warnings);
+    drop(v);
+    assert!(copies_match(&t.path));
+    assert_eq!(unusual_kdf_warning(&t.path), None);
+}
+
 #[test]
 fn damaged_backup_is_restored_from_primary() {
     let t = new_vault();
@@ -390,6 +414,50 @@ fn old_header_stays_refused_even_if_a_superblock_is_destroyed() {
             matches!(Vault::open(&t.path, Credential::Keyfile(&bob), true), Err(Error::StaleHeader)),
             "superblock {slot} destroyed: the removed keyfile must stay removed"
         );
+    }
+}
+
+/// A crash between the two commits of a header change: one superblock names
+/// the new header, the other still the old one. Destroying the newest would
+/// bring the old header back, so the next writable open finishes the change;
+/// after that, the old header stays refused whichever superblock is lost.
+#[test]
+fn header_change_interrupted_between_its_two_commits_is_finished() {
+    let t = new_vault();
+    let old_headers = header_area(&t.path);
+    {
+        // The first half of a password change: new header in the backup
+        // copy, then one commit naming it, then a crash.
+        let v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+        let mut new = v.header.clone();
+        new.set_password(&v.master, PW2, KDF).unwrap();
+        write_all_at(&v.file, &new.to_bytes(), BACKUP_OFFSET).unwrap();
+        let store = ChunkStore::new(v.file.try_clone().unwrap(), &v.header, data_aead(&v.master).unwrap(), false);
+        let mut fs = Fs::open(store, v.header.hash()).unwrap();
+        fs.commit_once_under(new.hash()).unwrap();
+        fs.abandon();
+    }
+    let interrupted = std::fs::read(&t.path).unwrap();
+    // The window: with the newest superblock destroyed, the old header (put
+    // back by someone who kept a copy) opens again.
+    let reopened = (0..2).any(|slot| {
+        std::fs::write(&t.path, &interrupted).unwrap();
+        write_at(&t.path, 0, &old_headers);
+        patch(&t.path, chunk_offset(&t, slot) + 30, |b| b[0] ^= 1);
+        Vault::open(&t.path, Credential::Password(PW), true).is_ok()
+    });
+    assert!(reopened, "the interrupted change should leave this window");
+
+    // A writable open (the new password is in effect) finishes the change...
+    std::fs::write(&t.path, &interrupted).unwrap();
+    drop(Vault::open(&t.path, Credential::Password(PW2), false).unwrap().into_fs().unwrap());
+    let finished = std::fs::read(&t.path).unwrap();
+    // ...after which the old header stays refused, whichever superblock is lost.
+    for slot in 0..2 {
+        std::fs::write(&t.path, &finished).unwrap();
+        write_at(&t.path, 0, &old_headers);
+        patch(&t.path, chunk_offset(&t, slot) + 30, |b| b[0] ^= 1);
+        assert!(Vault::open(&t.path, Credential::Password(PW), true).is_err(), "superblock {slot} destroyed");
     }
 }
 

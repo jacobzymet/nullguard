@@ -245,18 +245,24 @@ impl Vault {
                 err = Some(e);
             }
         };
-        let mut found = None;
+        // Parse both copies (one if they are identical), then try the one
+        // whose password key derivation is cheaper first. Someone who can
+        // write the file could set one copy's Argon2 cost to the maximum
+        // nullguard accepts; trying that copy last means it only costs time
+        // when the other copy doesn't open.
+        let mut candidates = Vec::new();
         for (i, bytes) in [&primary, &backup].into_iter().enumerate() {
             if i == 1 && primary == backup {
-                break; // identical: already tried
+                break; // identical: already parsed
             }
-            let header = match Header::parse(bytes) {
-                Ok(h) => h,
-                Err(e) => {
-                    note(e.into());
-                    continue;
-                }
-            };
+            match Header::parse(bytes) {
+                Ok(h) => candidates.push((i, h)),
+                Err(e) => note(e.into()),
+            }
+        }
+        candidates.sort_by_key(|(i, h)| (kdf_cost(&h.kdf), *i));
+        let mut found = None;
+        for (i, header) in candidates {
             let unlocked = match &cred {
                 Credential::Password(p) => header.unlock_with_password(p),
                 Credential::Keyfile(k) => header.unlock_with_keyfile(k),
@@ -409,6 +415,43 @@ impl Vault {
         self.write_header(h)?;
         Ok(n)
     }
+}
+
+/// How much work a password key derivation with `kdf` takes (memory times
+/// passes), for ordering only.
+fn kdf_cost(kdf: &Argon2Params) -> u64 {
+    kdf.memory_kib as u64 * kdf.iterations as u64
+}
+
+/// A warning to show *before* unlocking with a password, if a header copy
+/// asks for a costlier key derivation than nullguard ever sets up
+/// ([`Argon2Params::DEFAULT`]): the header was then probably tampered with,
+/// and the derivation may take minutes or fail for lack of memory.
+pub fn unusual_kdf_warning(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut worst: Option<Argon2Params> = None;
+    for offset in [PRIMARY_OFFSET, BACKUP_OFFSET] {
+        let mut buf = vec![0u8; HEADER_AREA as usize];
+        if read_exact_at(&file, &mut buf, offset).is_err() {
+            continue;
+        }
+        if let Ok(h) = Header::parse(&buf) {
+            let d = Argon2Params::DEFAULT;
+            let unusual = h.kdf.memory_kib > d.memory_kib || h.kdf.iterations > d.iterations || h.kdf.parallelism > d.parallelism;
+            if unusual && worst.is_none_or(|w| kdf_cost(&h.kdf) > kdf_cost(&w)) {
+                worst = Some(h.kdf);
+            }
+        }
+    }
+    let k = worst?;
+    Some(format!(
+        "this vault's header asks for a much costlier key derivation ({} MiB, {} passes, {} lanes) than \
+         nullguard ever sets up. The header was probably tampered with. Unlocking may take minutes or \
+         run out of memory; the other header copy is tried first if it is cheaper.",
+        k.memory_kib / 1024,
+        k.iterations,
+        k.parallelism
+    ))
 }
 
 fn stale_copy_warning(name: &str) -> String {

@@ -150,7 +150,7 @@ permission bits are kept and enforced. Vaults don't store file owners, so
 |---|---|---|---|
 | Linux (x86_64, aarch64) | ✅ FUSE | ✅ | Pure-Rust FUSE: needs only `/dev/fuse` and the standard `fusermount3` helper (package `fuse3`, present on virtually all desktop distros). No libfuse. |
 | macOS | ✅ FUSE | ✅ | Requires [macFUSE](https://osxfuse.github.io/), a system extension that can't be bundled into an app. The binary links macFUSE's libfuse, so macFUSE must be installed for it to start (`--features macos-no-mount` builds an offline-only binary without it). |
-| Windows | ✅ WinFsp | ✅ | Requires [WinFsp](https://winfsp.dev) (free), installed once. nullguard doesn't bundle it: it loads WinFsp from its install folder at run time, so `nullguard.exe` stays portable and only `mount` needs it. Mounts on a drive letter (`nullguard mount v.ngv X:`). Symbolic links in a vault, and names Windows can't represent, aren't shown. |
+| Windows | ✅ WinFsp | ✅ | Requires [WinFsp](https://winfsp.dev) 2.x (free), installed once; other major versions are refused rather than guessed at. nullguard doesn't bundle it: it loads WinFsp from its install folder at run time, so `nullguard.exe` stays portable and only `mount` needs it. Mounts on a drive letter (`nullguard mount v.ngv X:`). Symbolic links in a vault, and names Windows can't represent, aren't shown. |
 
 ## Building a portable binary
 
@@ -241,10 +241,17 @@ cloud storage, an "evil maid" with access to the file, a compromised backup).
   and the whole header must match the hash the filesystem recorded. A
   header copy that doesn't is never used: nullguard uses the other copy if
   that one is current, warns, and (on a writable open) restores the bad copy.
+  A copy tampered to demand a costlier key derivation than nullguard ever
+  sets up is warned about before unlocking, and is tried last, so it can't
+  stall unlocking while the other copy is intact.
 - **An old header can't be put back.** Every commit records the hash of the
   header in use, and a header change commits to *both* superblock slots.
   Restoring an older, authentic header (to revive a removed keyfile or an
-  old password) is refused, even if one superblock is also destroyed.
+  old password) is refused, even if one superblock is also destroyed. (If a
+  crash interrupts a header change between its two commits, one superblock
+  still names the old header until the next writable open, which finishes
+  the change; until then, destroying the newest superblock could bring the
+  old header back.)
 - **Destroying the newest commit** (corrupting the newest superblock to force
   the previous one) is detected and reported as a warning. It rolls back at
   most one commit, and never to a previous header. Putting an *older copy*
@@ -274,7 +281,9 @@ synced to the cloud).
 
 - Sees *which* chunks changed between versions and roughly how much was
   written, but not what was written. Written chunks are indistinguishable
-  from the random fill of unused space.
+  from the random fill of unused space. Every commit rewrites the whole
+  metadata, so its size (which grows with the number of files and blocks)
+  can be estimated too.
 
 **4. A future quantum computer.**
 
@@ -331,7 +340,12 @@ synced to the cloud).
   encrypted swap.
   Core dumps are disabled. On Linux the process is marked non-dumpable, which
   also blocks `ptrace` and `/proc/<pid>/mem` access by other processes of the
-  same user. On macOS it refuses debugger attachment (`PT_DENY_ATTACH`).
+  same user. On macOS it refuses debugger attachment (`PT_DENY_ATTACH`). On
+  Windows, crash reports leave out heap memory (where keys and cached file
+  contents live), a crash ends the process before a dump can be taken, and
+  `mount` excludes `nullguard.exe` from Windows Error Reporting for your
+  user (a lasting setting under
+  `HKCU\Software\Microsoft\Windows\Windows Error Reporting\ExcludedApplications`).
 - The vault file is locked while open, so two nullguard processes can't
   corrupt it. On Windows, while nullguard writes to a vault no other program
   can open, rename or delete it. During read-only commands (`ls`, `get`,
@@ -351,7 +365,10 @@ synced to the cloud).
   user. On Windows `get` holds each destination folder open, so nobody can
   rename or replace it while the copy runs, refuses links and folders that
   belong to another user, and never replaces a file through its short 8.3
-  alias (such as `REPORT~1.PDF`).
+  alias (such as `REPORT~1.PDF`). The folder you name as the destination
+  may belong to anyone (such as `/tmp`): `get` only adds new private
+  entries to it, created so that no link can redirect them, and never
+  merges a vault folder into one it doesn't own.
 - `put` copies regular files and folders only. Symbolic links, named pipes,
   sockets and devices are skipped, and every entry is opened without
   following links and checked once open, so a file swapped for a link (for
@@ -375,7 +392,8 @@ nullguard can't protect you against:
   version).
 - **Secure deletion.** Deleting a file frees its chunks, but their old
   ciphertext stays on disk until the space is reused. Anyone who later gets
-  the vault's key (e.g. your password) can recover deleted files from an
+  the vault's key (e.g. your password) can recover deleted files, and the
+  names of deleted files and folders (from superseded metadata), from an
   old or current copy. `rekey` copies only the files you still have into a
   new vault file, so deleted files don't come along; the old file's bytes
   may still survive on the disk itself (SSDs, copy-on-write filesystems,

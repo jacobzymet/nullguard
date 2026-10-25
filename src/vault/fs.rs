@@ -492,6 +492,13 @@ impl Fs {
                             supers[0].generation, sb.generation
                         ));
                     }
+                    // A header change interrupted between its two commits
+                    // leaves the other slot naming the old header, and
+                    // destroying the newest superblock would bring that
+                    // header back. A writable open finishes the change now.
+                    if !fs.store.is_read_only() && supers.iter().any(|s| !ct_eq(&s.header_hash, &header_hash)) {
+                        fs.commit_now()?;
+                    }
                     return Ok(fs);
                 }
                 Err(e) => last_err = Some(e),
@@ -1328,7 +1335,9 @@ impl Fs {
     /// Decrypt and authenticate every block of every file.
     pub fn verify(&mut self) -> Result<VerifyReport, Error> {
         let mut report = VerifyReport::default();
-        let mut stack = vec![(ROOT_INO, String::from("/"))];
+        // Paths hold file names: built in wiped buffers sized up front (a
+        // growing string would leave unwiped copies behind when it moves).
+        let mut stack = vec![(ROOT_INO, Zeroizing::new(String::from("/")))];
         let mut buf = Zeroizing::new(vec![0u8; self.chunk_size as usize]);
         while let Some((ino, path)) = stack.pop() {
             let inode = self.inode(ino)?.clone();
@@ -1336,8 +1345,19 @@ impl Fs {
                 Node::Dir { entries, .. } => {
                     report.dirs += 1;
                     for (name, child) in entries {
-                        let base = if path == "/" { String::new() } else { path.clone() };
-                        stack.push((child, format!("{base}/{}", String::from_utf8_lossy(&name))));
+                        let base = if path.as_str() == "/" { "" } else { path.as_str() };
+                        // At most 3 bytes per name byte (an invalid byte
+                        // becomes the 3-byte replacement character).
+                        let mut p = Zeroizing::new(String::with_capacity(base.len() + 1 + 3 * name.len()));
+                        p.push_str(base);
+                        p.push('/');
+                        for chunk in name.utf8_chunks() {
+                            p.push_str(chunk.valid());
+                            if !chunk.invalid().is_empty() {
+                                p.push(char::REPLACEMENT_CHARACTER);
+                            }
+                        }
+                        stack.push((child, p));
                     }
                 }
                 Node::Symlink { .. } => report.symlinks += 1,
@@ -1347,7 +1367,7 @@ impl Fs {
                         report.blocks_checked += 1;
                         // Bypass the cache: check what is on disk.
                         if let Err(e) = self.store.read(b.chunk, Some(&b.nonce), &mut buf) {
-                            report.bad_blocks.push((path.clone(), idx, e.to_string()));
+                            report.bad_blocks.push((path.to_string(), idx, e.to_string()));
                         }
                     }
                 }
@@ -1514,8 +1534,29 @@ fn meta_magic(version: u16) -> &'static [u8; 8] {
     if version >= 4 { META_MAGIC_V4 } else { META_MAGIC_V3 }
 }
 
+/// The exact length [`encode_metadata`] produces, so its buffer can be
+/// allocated once: a growing buffer would move, leaving unwiped copies of
+/// the name table behind.
+fn metadata_len(version: u16, inodes: &HashMap<u64, Inode>, order: &[u64]) -> usize {
+    let mut len = 8 + 8 + 8;
+    for ino in order {
+        len += 8 + 1 + 2 + 4 * 12;
+        len += match &inodes[ino].node {
+            Node::File { blocks, .. } if version >= 4 => 8 + 8 + 40 * blocks.len(),
+            Node::File { blocks, .. } => {
+                let count = blocks.last_key_value().map_or(0, |(&idx, _)| idx as usize + 1);
+                8 + 8 + 32 * blocks.len() + 8 * (count - blocks.len())
+            }
+            Node::Dir { entries, .. } => 8 + 4 + entries.keys().map(|n| 2 + n.len() + 8).sum::<usize>(),
+            Node::Symlink { target } => 4 + target.len(),
+        };
+    }
+    len
+}
+
 fn encode_metadata(version: u16, next_ino: u64, inodes: &HashMap<u64, Inode>, order: Vec<u64>) -> Zeroizing<Vec<u8>> {
-    let mut out = Zeroizing::new(Vec::new());
+    let len = metadata_len(version, inodes, &order);
+    let mut out = Zeroizing::new(Vec::with_capacity(len));
     out.extend_from_slice(meta_magic(version));
     out.extend_from_slice(&next_ino.to_le_bytes());
     out.extend_from_slice(&(order.len() as u64).to_le_bytes());
@@ -1572,6 +1613,8 @@ fn encode_metadata(version: u16, next_ino: u64, inodes: &HashMap<u64, Inode>, or
             }
         }
     }
+    // Sized exactly, so the buffer was never moved (see `metadata_len`).
+    debug_assert!(out.len() == len && out.capacity() == len, "metadata_len is wrong");
     out
 }
 
@@ -1730,6 +1773,13 @@ fn decode_metadata(
 
 #[cfg(test)]
 impl Fs {
+    /// Commit once under `header_hash`: the first half of a header change,
+    /// as if interrupted right after it (for crash tests).
+    pub(crate) fn commit_once_under(&mut self, header_hash: [u8; 32]) -> Result<(), Error> {
+        self.header_hash = header_hash;
+        self.commit_now()
+    }
+
     /// Chunk indices holding a file's blocks (for tamper tests).
     pub(crate) fn chunks_of(&self, ino: u64) -> Vec<u64> {
         match &self.inodes[&ino].node {
@@ -1897,6 +1947,22 @@ mod tests {
             let mut b = v4.to_vec();
             b[at..at + 16].copy_from_slice(&patch);
             assert!(decode_metadata(&b, 4, 4096, 1 << 30).is_err(), "{why}");
+        }
+    }
+
+    /// The metadata buffer is allocated once at its final size (a growing
+    /// buffer would leave unwiped copies of file names where it was).
+    #[test]
+    fn metadata_buffer_never_grows() {
+        let (next, mut inodes) = sample_tree();
+        if let Node::File { size, blocks } = &mut inodes.get_mut(&2).unwrap().node {
+            *size = 50 * 4096;
+            blocks.insert(40, BlockRef { chunk: 11, nonce: [3; 24] }); // with holes before it
+        }
+        for version in [3, 4] {
+            let blob = encode_metadata(version, next, &inodes, vec![1, 2, 3, 4]);
+            assert_eq!(blob.len(), metadata_len(version, &inodes, &[1, 2, 3, 4]));
+            assert_eq!(blob.capacity(), blob.len(), "version {version}");
         }
     }
 
