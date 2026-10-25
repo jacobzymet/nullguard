@@ -35,7 +35,6 @@ and it's an opaque blob that detects any tampering.
 ## Contents
 
 - [Quick start](#quick-start)
-- [Upgrading from 0.1](#upgrading-from-01)
 - [Commands](#commands)
 - [Platform support](#platform-support)
 - [Building a portable binary](#building-a-portable-binary)
@@ -91,29 +90,6 @@ Removing a keyfile stops it from unlocking this vault file from now on. It
 doesn't change the master key, so someone who already unlocked the vault,
 or kept an older copy of the file, can still read what that copy holds. For
 full revocation, run `nullguard rekey` (see below).
-
-## Upgrading from 0.1
-
-nullguard 0.2 can't open vaults made by 0.1. To move a vault over, use the
-old binary to copy the files out and the new one to copy them in:
-
-```bash
-nullguard-0.1 get old.ngv / ./plain       # mind where plaintext lands
-nullguard create new.ngv --size 10G
-nullguard put new.ngv ./plain /
-```
-
-Old public-key keyfiles (`keygen` from 0.1) don't work with 0.2: create new
-keyfiles with `nullguard keygen`.
-
-### Vault format 4
-
-New vaults use format version 4, which keeps each key slot's commitment
-and encryption keys separate and stores sparse files compactly. Version 3
-vaults (made by earlier 0.2 builds) keep opening and working as before,
-and stay version 3, so older builds can still read them. `nullguard info`
-shows a vault's version, and `nullguard rekey` moves a vault to version 4.
-Older builds can't open version 4 vaults.
 
 ## Commands
 
