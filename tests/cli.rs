@@ -452,8 +452,7 @@ fn windows_files_are_private_and_shared_keyfiles_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let vault = dir.path().join("v.ngv");
     let v = s(&vault);
-    let me = nullguard::platform::win::current_user_sid().unwrap();
-    let private = format!("D:P(A;;FA;;;{me})(A;;FA;;;SY)");
+    let private = nullguard::platform::win::private_permissions_sddl().unwrap();
     ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}
 "));
     let key = dir.path().join("k");

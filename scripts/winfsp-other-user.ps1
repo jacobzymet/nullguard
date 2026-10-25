@@ -21,7 +21,9 @@ $work = Join-Path $env:PUBLIC ("ngprobe-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory $work | Out-Null
 $user = 'ngprobe'
 $password = 'Ng-' + [guid]::NewGuid().ToString('N').Substring(0, 16) + '!aA1'
-net user $user $password /add | Out-Null
+# (Not `net user /add`: it stops to ask about passwords over 14 characters.)
+$secure = ConvertTo-SecureString $password -AsPlainText -Force
+New-LocalUser -Name $user -Password $secure -AccountNeverExpires -PasswordNeverExpires | Out-Null
 try {
     icacls $work /grant "${user}:(OI)(CI)M" | Out-Null
     # Runs as the other user: try to open an existing file, a missing file,
@@ -45,7 +47,7 @@ foreach ($p in '\a\greeting.txt', '\nope.txt', '\nodir\nope.txt', '\a') {
 }
 '@ | Set-Content -Encoding UTF8 (Join-Path $work 'probe.ps1')
 
-    $cred = New-Object System.Management.Automation.PSCredential($user, (ConvertTo-SecureString $password -AsPlainText -Force))
+    $cred = New-Object System.Management.Automation.PSCredential($user, $secure)
     $out = Join-Path $work 'out.txt'
     $p = Start-Process powershell -Credential $cred -WorkingDirectory $work -Wait -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $out -RedirectStandardError (Join-Path $work 'err.txt') `
@@ -62,6 +64,6 @@ foreach ($p in '\a\greeting.txt', '\nope.txt', '\nodir\nope.txt', '\a') {
     Write-Host "another user is refused everything, the same way for every name"
 }
 finally {
-    net user $user /delete | Out-Null
+    Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }

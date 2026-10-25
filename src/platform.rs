@@ -399,13 +399,49 @@ pub mod win {
         user
     }
 
+    /// The permissions [`make_private`] applies, in SDDL form.
+    fn private_sddl() -> io::Result<String> {
+        Ok(format!("D:P(A;;FA;;;{})(A;;FA;;;SY)", current_user_sid()?))
+    }
+
+    /// [`private_sddl`] as Windows writes it back (it shortens some
+    /// well-known accounts, such as the built-in Administrator to "LA"):
+    /// what [`permissions_sddl`] reports for a private file.
+    pub fn private_permissions_sddl() -> io::Result<String> {
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+        let sddl = to_wide(&private_sddl()?);
+        let mut sd: *mut c_void = null_mut();
+        // SAFETY: a valid SDDL string; the descriptor and string are freed.
+        unsafe {
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, null_mut())
+                == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let mut text: *mut u16 = null_mut();
+            let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                null_mut(),
+            );
+            LocalFree(sd);
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let s = from_wide(text);
+            LocalFree(text.cast());
+            s.ok_or_else(|| io::Error::other("unreadable permissions"))
+        }
+    }
+
     /// Replace a file's or folder's permissions with: you and the system
     /// (SYSTEM) have full access, nobody else any, nothing inherited. The
     /// Windows counterpart of mode `0600`/`0700`. `file` must be open with
     /// `WRITE_DAC` access.
     pub fn make_private(file: &File) -> io::Result<()> {
-        let sid = current_user_sid()?;
-        let sddl = to_wide(&format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)"));
+        let sddl = to_wide(&private_sddl()?);
         let mut sd: *mut c_void = null_mut();
         // SAFETY: a valid SDDL string; the descriptor is freed below, after
         // its DACL (which points into it) has been applied.

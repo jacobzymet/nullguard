@@ -500,12 +500,11 @@ fn vault_file_is_private() {
 #[test]
 fn vault_file_is_private() {
     let t = new_vault();
-    let me = crate::platform::win::current_user_sid().unwrap();
     let f = File::open(&t.path).unwrap();
     // Protected ("P"; Windows may add "AI", auto-inherited bookkeeping),
-    // with exactly these two entries.
+    // with exactly the two entries nullguard sets.
     let sddl = crate::platform::win::permissions_sddl(&f).unwrap().replacen("D:PAI(", "D:P(", 1);
-    assert_eq!(sddl, format!("D:P(A;;FA;;;{me})(A;;FA;;;SY)"));
+    assert_eq!(sddl, crate::platform::win::private_permissions_sddl().unwrap());
 }
 
 #[test]
