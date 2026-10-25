@@ -160,6 +160,15 @@ fn password_handling() {
     let long = "x".repeat(10_000);
     let err = fails(&["ls", v, "--password-stdin"], &format!("{long}\n"));
     assert!(err.contains("limited to"), "{err}");
+
+    // The limit is on the normalized form: U+0958 is 3 bytes as typed but
+    // normalizes to two characters (6 bytes), so 3000 typed bytes become 6000.
+    let grows = "\u{958}".repeat(1000);
+    assert!(grows.len() <= 4096);
+    let other = dir.path().join("w.ngv");
+    let err = fails(&[&["create", s(&other), "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{grows}\n"));
+    assert!(err.contains("limited to"), "{err}");
+    assert!(!other.exists());
 }
 
 #[test]
@@ -338,6 +347,47 @@ fn exported_directories_are_private() {
     ok(&["get", v, "/secret-folder-name", s(&out), "--password-stdin"], &format!("{PW}\n"));
     let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700);
+}
+
+/// `get` never writes through a symbolic link, at any depth: a folder in
+/// the destination that is (or was swapped for) a link to somewhere else is
+/// refused, and nothing lands where it points.
+#[cfg(unix)]
+#[test]
+fn get_never_follows_links_inside_the_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("sub").join("secret.txt"), b"plaintext").unwrap();
+    ok(&["put", v, s(&src), "/", "--password-stdin"], &format!("{PW}\n"));
+
+    // out/src/sub is a link to another folder.
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(out.join("src")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, out.join("src").join("sub")).unwrap();
+    let err = fails(&["get", v, "/src", s(&out.join("src")), "--password-stdin"], &format!("{PW}\n"));
+    assert!(err.contains("symbolic link"), "{err}");
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "a file was written through the link");
+
+    // A file that is a link is refused too, even with --force.
+    std::fs::remove_file(out.join("src").join("sub")).unwrap();
+    std::fs::create_dir(out.join("src").join("sub")).unwrap();
+    let target = elsewhere.join("target.txt");
+    std::fs::write(&target, b"keep me").unwrap();
+    std::os::unix::fs::symlink(&target, out.join("src").join("sub").join("secret.txt")).unwrap();
+    let err = fails(&["get", v, "/src", s(&out.join("src")), "--force", "--password-stdin"], &format!("{PW}\n"));
+    assert!(err.contains("symbolic link"), "{err}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep me");
+
+    // Without links, merging into existing folders of your own works.
+    std::fs::remove_file(out.join("src").join("sub").join("secret.txt")).unwrap();
+    ok(&["get", v, "/src", s(&out.join("src")), "--password-stdin"], &format!("{PW}\n"));
+    assert_eq!(std::fs::read(out.join("src").join("sub").join("secret.txt")).unwrap(), b"plaintext");
 }
 
 #[cfg(windows)]

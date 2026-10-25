@@ -103,6 +103,15 @@ nullguard put new.ngv ./plain /
 Old public-key keyfiles (`keygen` from 0.1) don't work with 0.2: create new
 keyfiles with `nullguard keygen`.
 
+### Vault format 4
+
+New vaults use format version 4, which keeps each key slot's commitment
+and encryption keys separate and stores sparse files compactly. Version 3
+vaults (made by earlier 0.2 builds) keep opening and working as before,
+and stay version 3, so older builds can still read them. `nullguard info`
+shows a vault's version, and `nullguard rekey` moves a vault to version 4.
+Older builds can't open version 4 vaults.
+
 ## Commands
 
 | Command | What it does |
@@ -123,7 +132,8 @@ Every command that needs a secret reads it from the terminal without echo.
 `--password-stdin` reads it from standard input instead (one line per secret)
 for scripting. Avoid passwords in shell history or command lines.
 
-New passwords must be at least 12 characters (and at most 4096 bytes). A few
+New passwords must be at least 12 characters (and at most 4096 bytes, after
+the normalization described below). A few
 random words (a diceware passphrase) is ideal: the KDF makes each guess
 expensive, but nothing can save a guessable password. Passwords are Unicode
 NFC-normalized before use, so a password with accents unlocks the same vault
@@ -284,8 +294,12 @@ synced to the cloud).
   commit and unmount cleanly.
 - On Windows, the drive is likewise only for the user who mounted it: every
   file and folder carries a fixed permission set that gives that user full
-  access and nobody else any. (Administrators can override file
-  permissions, and can read process memory anyway: see *Out of scope*.) The
+  access and nobody else any. Sandboxed low-integrity processes (such as
+  some browser and document-viewer sandboxes) can't open them either, even
+  when they run as that user. (Administrators can override file
+  permissions, and can read process memory anyway: see *Out of scope*.
+  Unlike on Linux, other ordinary processes of the same user can read
+  nullguard's memory on Windows, which falls under malware running as you.) The
   drive letter only exists in the mounting user's session. Closed files'
   contents are kept out of Windows' standby cache. Ctrl-C, closing the
   console window, logging off and shutting down commit and unmount.
@@ -298,8 +312,10 @@ synced to the cloud).
 - Keys live in memory pages locked against swapping and are wiped
   (`zeroize`) when no longer needed. If the OS refuses to lock memory,
   nullguard says so. Argon2's working memory (from which the derived key
-  could otherwise be recomputed) and file names are wiped too, but they are
-  too large to lock, so they can reach unencrypted swap: use encrypted swap.
+  could otherwise be recomputed) and file names (whenever one is removed,
+  renamed or no longer needed, and all of them at unmount) are wiped too, but
+  they are too large to lock, so they can reach unencrypted swap: use
+  encrypted swap.
   Core dumps are disabled. On Linux the process is marked non-dumpable, which
   also blocks `ptrace` and `/proc/<pid>/mem` access by other processes of the
   same user. On macOS it refuses debugger attachment (`PT_DENY_ATTACH`).
@@ -314,7 +330,13 @@ synced to the cloud).
   block) deletes the incomplete output file, and a `put` that fails removes
   the incomplete file from the vault. `get` creates output folders readable
   only by you (`0700`), never writes through a symbolic link, and with
-  `--force` replaces existing files with new private ones.
+  `--force` replaces existing files with new private ones. On Linux and
+  macOS that holds at every level: `get` keeps each destination folder open
+  and creates everything inside it without following links, so nobody can
+  redirect the copy elsewhere by swapping a folder for a link while it runs,
+  and it refuses to copy into an existing folder that belongs to another
+  user. On Windows it checks each name for links right before using it;
+  copy out to a folder only you can write to, such as one in your profile.
 
 ### Out of scope
 
@@ -382,8 +404,9 @@ processes for the whole copy.
 Afterwards the old password, the old keyfiles and the old master key no
 longer open the vault file. Copies of the file made *before* the rekey are
 unaffected: they still open with the old credentials and still hold what
-they held then. Nothing about the file format changes; a rekeyed vault is
-simply a new vault with the same files.
+they held then. A rekeyed vault is simply a new vault with the same files,
+in the current format (so rekeying also moves a version 3 vault to
+version 4).
 
 ---
 
@@ -432,7 +455,9 @@ and learn whether yours is among them from how the unlock fails (a
 partitioning-oracle attack). Every wrapped key therefore carries an
 HMAC-SHA256 commitment to its KEK, checked in constant time *before*
 decrypting. HMAC-SHA256 is collision-resistant in its key, so a slot opens
-under exactly one KEK.
+under exactly one KEK. In format version 4 the commitment and the
+encryption each use their own key derived from the KEK (HKDF-SHA256), so
+no key is used by two different primitives.
 
 ---
 
@@ -456,7 +481,7 @@ chunk area is filled with random bytes.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | magic `NULLGARD` |
-| 8 | 2 | version = 3 |
+| 8 | 2 | version = 4 (3 is still supported) |
 | 10 | 16 | vault ID (random) |
 | 26 | 4 | chunk size: power of two, 4 KiB to 1 MiB |
 | 30 | 8 | chunk count N (≥ 16) |
@@ -476,17 +501,21 @@ lanes), so a crafted vault can't exhaust memory or CPU.
 **Wrapped key** (104 bytes): `nonce (24) ‖ commitment (32) ‖ ciphertext (32) ‖ tag (16)`, where
 
 ```text
+enc_key          = HKDF-SHA256(prk = KEK, info = "nullguard/v4/slot-encryption-key")
+commit_key       = HKDF-SHA256(prk = KEK, info = "nullguard/v4/slot-commitment-key")
 aad              = "nullguard/v2/keyslot" ‖ header[0..38]
-commitment       = HMAC-SHA256(KEK, "nullguard/v2/key-commitment" ‖ nonce ‖ aad)
-ciphertext ‖ tag = XChaCha20-Poly1305(KEK, nonce, master_key, aad)
+commitment       = HMAC-SHA256(commit_key, "nullguard/v2/key-commitment" ‖ nonce ‖ aad)
+ciphertext ‖ tag = XChaCha20-Poly1305(enc_key, nonce, master_key, aad)
 ```
+
+(Version 3 used the KEK itself as both `enc_key` and `commit_key`.)
 
 `header[0..38]` is the magic, version, vault ID and geometry, so a slot
 works only in the vault, and with the geometry, it was made for.
 
 **Password KEK.** `Argon2id(password, salt, m, t, p)` with a 32-byte output
 and no secret or associated data. The password is in Unicode Normalization
-Form C, encoded as UTF-8 (at most 4096 bytes).
+Form C, encoded as UTF-8 (new passwords: at most 4096 bytes).
 
 **Keyfile KEK.** `HKDF-SHA256(salt = vault ID, ikm = keyfile secret, info = "nullguard/v2/keyfile-kek")`.
 Keyfile slots carry no identifier: unlocking tries each one (one HMAC per
@@ -520,15 +549,20 @@ Chunks 0 and 1 are **superblock slots**. Every other chunk is either free
 length, zero padding enforced):
 
 ```text
-"NGMETA02" ‖ next_inode u64 ‖ inode_count u64 ‖ inode*
+"NGMETA03" ‖ next_inode u64 ‖ inode_count u64 ‖ inode*
 
 inode = ino u64 ‖ kind u8 (1 file, 2 dir, 3 symlink) ‖ perm u16
         ‖ (atime, mtime, ctime, crtime) each as secs i64 ‖ nanos u32
-        ‖ file:    size u64 ‖ block_count u64 ‖ block*      block = 0 u64 (hole)
-                                                                  | chunk u64 ‖ nonce (24)
+        ‖ file:    size u64 ‖ block_count u64 ‖ (index u64 ‖ chunk u64 ‖ nonce (24))*
         ‖ dir:     parent u64 ‖ entry_count u32 ‖ (name_len u16 ‖ name ‖ ino u64)*
         ‖ symlink: len u32 ‖ target
 ```
+
+A file lists only the blocks it stores, by strictly increasing index; the
+rest are holes (zeros). So a small write far past the end of a file costs
+one entry, not one per block in between. Version 3 vaults use `"NGMETA02"`,
+which lists every block up to the last one, holes as `0 u64`:
+`block_count u64 ‖ (0 u64 | chunk u64 ‖ nonce (24))*`.
 
 The metadata is validated as untrusted input even though it's
 authenticated: the root is inode 1, every inode is linked exactly once,
@@ -609,7 +643,8 @@ src/
     fuse.rs        FUSE (Linux, macOS)
     winfsp.rs      WinFsp (Windows): our own minimal bindings + adapter
   cli.rs         command line
-  platform.rs    process hardening (with mount/winfsp.rs, the only code with `unsafe`)
+  platform.rs    process hardening, no-follow file creation for `get`
+                 (with mount/winfsp.rs, the only code with `unsafe`)
 tests/cli.rs     end-to-end tests of the binary
 scripts/mount-test.sh  real FUSE mount test (Linux)
 ```

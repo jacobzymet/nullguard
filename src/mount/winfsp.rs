@@ -14,7 +14,8 @@
 //! data streams, extended attributes, reparse points or stored Windows
 //! permissions. Symbolic links in a vault (made on Linux or macOS) and names
 //! Windows can't represent are not shown. Every file has one fixed security
-//! descriptor that gives the mounting user full access and nobody else any.
+//! descriptor that gives the mounting user full access and nobody else any,
+//! and keeps low-integrity (sandboxed) processes out.
 
 #![allow(unsafe_code)]
 
@@ -283,8 +284,11 @@ fn user_only_security_descriptor() -> Result<Vec<u8>, Error> {
         LocalFree(sid_str.cast());
         let sid = sid.ok_or_else(|| fail("reading the current user"))?;
         // Owner and group: the user. DACL: protected (nothing inherited),
-        // one entry: the user, full access.
-        let sddl = to_wide(&format!("O:{sid}G:{sid}D:P(A;;FA;;;{sid})"));
+        // one entry: the user, full access. Integrity label: medium, with
+        // no-read-up, no-write-up and no-execute-up, so sandboxed
+        // low-integrity processes running as the same user (some browser
+        // and document-viewer sandboxes) can't open the vault's files.
+        let sddl = to_wide(&format!("O:{sid}G:{sid}D:P(A;;FA;;;{sid})S:(ML;;NRNWNX;;;ME)"));
         let mut sd: *mut c_void = null_mut();
         let mut size = 0u32;
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, &mut size) == 0 {
@@ -656,6 +660,11 @@ extern "C" fn cleanup(_: FspFs, ctx: *mut c_void, name: Wstr, flags: u32) {
     let _ = shim(|| {
         run(|fs| {
             let (parent, n) = parent_and_name(fs, name)?;
+            // Delete what this handle has open, never whatever the name
+            // happens to point to now.
+            if fs.lookup(parent, n.as_bytes()).st()? != ino_of(ctx) {
+                return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+            }
             if fs.attr(ino_of(ctx)).st()?.kind == Kind::Dir {
                 fs.rmdir(parent, n.as_bytes()).st()
             } else {
@@ -861,7 +870,7 @@ extern "C" fn read_directory(
                     let past = match m.as_str() {
                         "." => e.name != b".",
                         ".." => !dot,
-                        m => !dot && e.name.as_slice() > m.as_bytes(),
+                        m => !dot && &*e.name > m.as_bytes(),
                     };
                     if !past {
                         continue;
@@ -1177,8 +1186,33 @@ mod tests {
 
     #[test]
     fn security_descriptor_is_built_for_the_current_user() {
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        };
         let sd = user_only_security_descriptor().unwrap();
-        assert!(sd.len() > 20, "{} bytes", sd.len());
+        let mut text: *mut u16 = null_mut();
+        let what = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+        // SAFETY: a valid self-relative descriptor; the string is freed below.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd.as_ptr() as *mut c_void,
+                SDDL_REVISION_1,
+                what,
+                &mut text,
+                null_mut(),
+            )
+        };
+        assert_ne!(ok, 0);
+        let sddl = from_wide(text).unwrap();
+        // SAFETY: allocated by the call above.
+        unsafe { LocalFree(text.cast()) };
+        // Exactly one access entry, for one user, nothing inherited...
+        assert!(sddl.contains("D:P(A;;FA;;;S-1-"), "{sddl}");
+        assert_eq!(sddl.matches("(A;").count(), 1, "{sddl}");
+        // ...and low-integrity processes can't read, write or run anything.
+        let label = sddl.split("S:").nth(1).expect("an integrity label");
+        assert!(label.contains(";;;ME)") && ["NR", "NW", "NX"].iter().all(|f| label.contains(f)), "{sddl}");
     }
 
     #[test]

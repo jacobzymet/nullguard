@@ -136,11 +136,23 @@ impl Vault {
         opts: &CreateOptions,
         progress: &mut dyn FnMut(u64, u64),
     ) -> Result<(), Error> {
+        Self::create_versioned(path, password, opts, header::FORMAT_VERSION, progress)
+    }
+
+    /// [`Vault::create`] in a given format version (tests make version 3
+    /// vaults with it; nullguard itself only creates the current version).
+    pub(crate) fn create_versioned(
+        path: &Path,
+        password: &[u8],
+        opts: &CreateOptions,
+        version: u16,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(), Error> {
         opts.kdf.validate_for_new_slot()?;
         let chunk_size = opts.chunk_size.unwrap_or_else(|| auto_chunk_size(opts.size));
         let chunk_count = opts.size.saturating_sub(DATA_OFFSET) / chunk_stride(chunk_size);
         let master = SecretKey::generate()?;
-        let header = Header::create(chunk_size, chunk_count, &master, password, opts.kdf).map_err(|e| match e {
+        let header = Header::create_versioned(version, chunk_size, chunk_count, &master, password, opts.kdf).map_err(|e| match e {
             HeaderError::Malformed("too few chunks") => Error::Usage("vault size is too small".into()),
             other => other.into(),
         })?;

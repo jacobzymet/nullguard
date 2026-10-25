@@ -24,6 +24,7 @@
 //!   whole on each commit (every few seconds while dirty, on fsync, and on
 //!   unmount).
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,7 +43,10 @@ pub const MAX_SYMLINK_LEN: usize = 4095;
 
 const SUPERBLOCK_SLOTS: u64 = 2;
 const SUPER_MAGIC: &[u8; 8] = b"NGSUPER2";
-const META_MAGIC: &[u8; 8] = b"NGMETA02";
+/// Metadata of format version 3: every block listed, holes as zero.
+const META_MAGIC_V3: &[u8; 8] = b"NGMETA02";
+/// Metadata of format version 4: only a file's stored blocks are listed.
+const META_MAGIC_V4: &[u8; 8] = b"NGMETA03";
 const SUPER_FIXED_LEN: usize = 8 + 8 + 32 + 8 + 32 + 4;
 const EXTENT_LEN: usize = 12;
 
@@ -104,15 +108,68 @@ pub struct BlockRef {
     pub nonce: [u8; NONCE_LEN],
 }
 
+/// A file name from inside the vault. File names are secret too, so a name
+/// is wiped from memory whenever it is dropped: when an entry is removed or
+/// renamed, when a listing is done with, and when the vault is locked.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Name(Vec<u8>);
+
+impl Name {
+    pub fn new(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+}
+
+impl Drop for Name {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl std::ops::Deref for Name {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+// Lets maps keyed by `Name` be searched with a plain `&[u8]`. Sound because
+// `Name` compares and hashes exactly like its bytes.
+impl Borrow<[u8]> for Name {
+    fn borrow(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl PartialEq<[u8]> for Name {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.0 == other
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for Name {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        self.0 == other[..]
+    }
+}
+
+impl std::fmt::Debug for Name {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", String::from_utf8_lossy(&self.0))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Node {
-    /// `blocks[i]` holds bytes `i*chunk_size ..`; `None` is a hole (zeros).
-    /// Bytes past `size` in the last block are unspecified (they may hold
-    /// data from before a truncate). They are never returned by reads, and
-    /// are zeroed before the file grows over them (`zero_past_eof`).
-    File { size: u64, blocks: Vec<Option<BlockRef>> },
-    Dir { parent: u64, entries: BTreeMap<Vec<u8>, u64> },
-    Symlink { target: Vec<u8> },
+    /// `blocks[i]` holds bytes `i*chunk_size ..`; a missing index is a hole
+    /// (zeros), which costs nothing in memory (or, in format version 4, in
+    /// the metadata). No block lies wholly past `size`. Bytes past `size` in
+    /// the last block are unspecified (they may hold data from before a
+    /// truncate). They are never returned by reads, and are zeroed before
+    /// the file grows over them (`zero_past_eof`).
+    File { size: u64, blocks: BTreeMap<u64, BlockRef> },
+    Dir { parent: u64, entries: BTreeMap<Name, u64> },
+    Symlink { target: Zeroizing<Vec<u8>> },
 }
 
 #[derive(Clone, Debug)]
@@ -154,7 +211,7 @@ pub struct Attr {
 
 #[derive(Clone, Debug)]
 pub struct DirEntry {
-    pub name: Vec<u8>,
+    pub name: Name,
     pub ino: u64,
     pub kind: Kind,
 }
@@ -445,7 +502,7 @@ impl Fs {
         if !ct_eq(&Sha256::digest(blob.as_slice()), &sb.meta_hash) {
             return Err(Error::Corrupt("metadata hash mismatch: the vault was modified".into()));
         }
-        let (next_ino, inodes) = decode_metadata(&blob, self.chunk_size, self.max_file_size())?;
+        let (next_ino, inodes) = decode_metadata(&blob, self.store.version(), self.chunk_size, self.max_file_size())?;
 
         // Rebuild the allocation bitmap; any chunk used twice is corruption.
         let mut bitmap = Bitmap::try_new(self.store.chunk_count())?;
@@ -459,7 +516,7 @@ impl Fs {
         }
         for inode in inodes.values() {
             if let Node::File { blocks, .. } = &inode.node {
-                for b in blocks.iter().flatten() {
+                for b in blocks.values() {
                     if b.chunk >= self.store.chunk_count() || !bitmap.set(b.chunk) {
                         return Err(Error::Corrupt("data chunk out of range or referenced twice".into()));
                     }
@@ -525,7 +582,7 @@ impl Fs {
         }
         self.check_writable()?;
         let started = Instant::now();
-        let blob = encode_metadata(self.next_ino, &self.inodes, self.reachable());
+        let blob = encode_metadata(self.store.version(), self.next_ino, &self.inodes, self.reachable());
         let cs = self.chunk_size as usize;
         let nchunks = blob.len().div_ceil(cs).max(1);
 
@@ -721,7 +778,7 @@ impl Fs {
         self.inodes.get_mut(&ino).ok_or(Error::NotFound)
     }
 
-    fn dir_entries(&self, ino: u64) -> Result<&BTreeMap<Vec<u8>, u64>, Error> {
+    fn dir_entries(&self, ino: u64) -> Result<&BTreeMap<Name, u64>, Error> {
         match &self.inode(ino)?.node {
             Node::Dir { entries, .. } => Ok(entries),
             _ => Err(Error::NotADirectory),
@@ -743,7 +800,7 @@ impl Fs {
     pub fn attr(&self, ino: u64) -> Result<Attr, Error> {
         let i = self.inode(ino)?;
         let (size, used, nlink) = match &i.node {
-            Node::File { size, blocks } => (*size, blocks.iter().flatten().count() as u64 * self.chunk_size, 1),
+            Node::File { size, blocks } => (*size, blocks.len() as u64 * self.chunk_size, 1),
             Node::Dir { entries, .. } => {
                 let subdirs = entries
                     .values()
@@ -773,8 +830,8 @@ impl Fs {
     pub fn readdir(&self, ino: u64) -> Result<Vec<DirEntry>, Error> {
         let parent = self.lookup(ino, b"..")?;
         let mut out = vec![
-            DirEntry { name: b".".to_vec(), ino, kind: Kind::Dir },
-            DirEntry { name: b"..".to_vec(), ino: parent, kind: Kind::Dir },
+            DirEntry { name: Name::new(b"."), ino, kind: Kind::Dir },
+            DirEntry { name: Name::new(b".."), ino: parent, kind: Kind::Dir },
         ];
         for (name, &child) in self.dir_entries(ino)? {
             out.push(DirEntry { name: name.clone(), ino: child, kind: self.inode(child)?.kind() });
@@ -782,7 +839,7 @@ impl Fs {
         Ok(out)
     }
 
-    pub fn readlink(&self, ino: u64) -> Result<Vec<u8>, Error> {
+    pub fn readlink(&self, ino: u64) -> Result<Zeroizing<Vec<u8>>, Error> {
         match &self.inode(ino)?.node {
             Node::Symlink { target } => Ok(target.clone()),
             _ => Err(Error::InvalidArgument),
@@ -846,7 +903,7 @@ impl Fs {
             Inode { perm: perm & 0o7777, atime: now, mtime: now, ctime: now, crtime: now, node },
         );
         if let Node::Dir { entries, .. } = &mut self.inode_mut(parent)?.node {
-            entries.insert(name.to_vec(), ino);
+            entries.insert(Name::new(name), ino);
         }
         self.touch_dir(parent);
         self.dirty = true;
@@ -854,7 +911,7 @@ impl Fs {
     }
 
     pub fn create_file(&mut self, parent: u64, name: &[u8], perm: u16) -> Result<u64, Error> {
-        self.add_entry(parent, name, perm, Node::File { size: 0, blocks: Vec::new() })
+        self.add_entry(parent, name, perm, Node::File { size: 0, blocks: BTreeMap::new() })
     }
 
     pub fn mkdir(&mut self, parent: u64, name: &[u8], perm: u16) -> Result<u64, Error> {
@@ -865,7 +922,7 @@ impl Fs {
         if target.is_empty() || target.len() > MAX_SYMLINK_LEN || target.contains(&0) {
             return Err(Error::InvalidArgument);
         }
-        self.add_entry(parent, name, 0o777, Node::Symlink { target: target.to_vec() })
+        self.add_entry(parent, name, 0o777, Node::Symlink { target: Zeroizing::new(target.to_vec()) })
     }
 
     /// Remove the entry `name` from `parent` and dispose of the inode
@@ -887,7 +944,7 @@ impl Fs {
 
     fn destroy_inode(&mut self, ino: u64) {
         if let Some(Inode { node: Node::File { blocks, .. }, .. }) = self.inodes.remove(&ino) {
-            for b in blocks.into_iter().flatten() {
+            for b in blocks.into_values() {
                 self.free_chunk(b.chunk);
             }
         }
@@ -966,7 +1023,7 @@ impl Fs {
             entries.remove(name);
         }
         if let Node::Dir { entries, .. } = &mut self.inode_mut(new_parent)?.node {
-            entries.insert(new_name.to_vec(), ino);
+            entries.insert(Name::new(new_name), ino);
         }
         let now = Timestamp::now();
         let moved = self.inode_mut(ino)?;
@@ -1003,7 +1060,7 @@ impl Fs {
         }
     }
 
-    fn file_parts(&self, ino: u64) -> Result<(u64, &Vec<Option<BlockRef>>), Error> {
+    fn file_parts(&self, ino: u64) -> Result<(u64, &BTreeMap<u64, BlockRef>), Error> {
         match &self.inode(ino)?.node {
             Node::File { size, blocks } => Ok((*size, blocks)),
             Node::Dir { .. } => Err(Error::IsADirectory),
@@ -1012,7 +1069,7 @@ impl Fs {
     }
 
     fn block_ref(&self, ino: u64, idx: u64) -> Result<Option<BlockRef>, Error> {
-        Ok(self.file_parts(ino)?.1.get(idx as usize).copied().flatten())
+        Ok(self.file_parts(ino)?.1.get(&idx).copied())
     }
 
     /// Read up to `len` bytes at `offset`. Fails if any block in range fails
@@ -1048,13 +1105,9 @@ impl Fs {
 
     fn set_block(&mut self, ino: u64, idx: u64, new: BlockRef) -> Result<(), Error> {
         let old = match &mut self.inode_mut(ino)?.node {
-            Node::File { blocks, .. } => {
-                let idx = idx as usize;
-                if blocks.len() <= idx {
-                    blocks.resize(idx + 1, None);
-                }
-                blocks[idx].replace(new)
-            }
+            // Sparse: a write far past the end adds one entry, not one per
+            // block in between.
+            Node::File { blocks, .. } => blocks.insert(idx, new),
             _ => return Err(Error::InvalidArgument),
         };
         if let Some(o) = old {
@@ -1125,9 +1178,9 @@ impl Fs {
             // can't trigger a commit mid-operation, and works on a full vault
             // (which is when people delete things). Bytes past the new EOF in
             // the last block stay unreadable until zeroed on growth.
-            let keep = new_size.div_ceil(self.chunk_size) as usize;
+            let keep = new_size.div_ceil(self.chunk_size);
             let dropped: Vec<BlockRef> = match &mut self.inode_mut(ino)?.node {
-                Node::File { blocks, .. } if blocks.len() > keep => blocks.split_off(keep).into_iter().flatten().collect(),
+                Node::File { blocks, .. } => blocks.split_off(&keep).into_values().collect(),
                 _ => Vec::new(),
             };
             for b in dropped {
@@ -1208,13 +1261,11 @@ impl Fs {
                 Node::Symlink { .. } => report.symlinks += 1,
                 Node::File { blocks, .. } => {
                     report.files += 1;
-                    for (idx, b) in blocks.iter().enumerate() {
-                        if let Some(b) = b {
-                            report.blocks_checked += 1;
-                            // Bypass the cache: check what is on disk.
-                            if let Err(e) = self.store.read(b.chunk, Some(&b.nonce), &mut buf) {
-                                report.bad_blocks.push((path.clone(), idx as u64, e.to_string()));
-                            }
+                    for (&idx, b) in &blocks {
+                        report.blocks_checked += 1;
+                        // Bypass the cache: check what is on disk.
+                        if let Err(e) = self.store.read(b.chunk, Some(&b.nonce), &mut buf) {
+                            report.bad_blocks.push((path.clone(), idx, e.to_string()));
                         }
                     }
                 }
@@ -1238,28 +1289,11 @@ impl Fs {
     }
 }
 
-impl Drop for Fs {
-    fn drop(&mut self) {
-        // Dropping deliberately does NOT commit. Changes become durable only
-        // through an explicit `commit()` after an operation succeeded, so a
-        // command that fails halfway (or panics) can never persist a
-        // half-done change. The vault stays at its last commit.
-        //
-        // Wipe file names and symlink targets (cached file contents are
-        // already wiped by `Zeroizing`).
-        for inode in self.inodes.values_mut() {
-            match &mut inode.node {
-                Node::Dir { entries, .. } => {
-                    for (mut name, _) in std::mem::take(entries) {
-                        name.zeroize();
-                    }
-                }
-                Node::Symlink { target } => target.zeroize(),
-                Node::File { .. } => {}
-            }
-        }
-    }
-}
+// Dropping an `Fs` deliberately does NOT commit. Changes become durable only
+// through an explicit `commit()` after an operation succeeded, so a command
+// that fails halfway (or panics) can never persist a half-done change. The
+// vault stays at its last commit. File names, symlink targets and cached
+// file contents wipe themselves (`Name`, `Zeroizing`) when dropped.
 
 /// The hash of the vault header that the newest readable superblock was
 /// committed under: the vault's current header. `None` if no superblock
@@ -1339,24 +1373,28 @@ pub mod fuzzing {
         let _ = parse_superblock(&buf, chunk_count);
     }
 
-    /// Metadata parser. Whatever it accepts must encode and decode again
-    /// to the same bytes (the validator and the encoder agree).
+    /// Metadata parser, for both format versions. Whatever it accepts must
+    /// encode and decode again to the same bytes (the validator and the
+    /// encoder agree).
     pub fn metadata(data: &[u8]) {
-        let Ok((next_ino, inodes)) = decode_metadata(data, 4096, 1 << 40) else { return };
-        let encode = |inodes: &HashMap<u64, Inode>| {
-            let mut order = vec![ROOT_INO];
-            let mut i = 0;
-            while i < order.len() {
-                if let Node::Dir { entries, .. } = &inodes[&order[i]].node {
-                    order.extend(entries.values().copied());
+        for version in [3, 4] {
+            let Ok((next_ino, inodes)) = decode_metadata(data, version, 4096, 1 << 40) else { continue };
+            let encode = |inodes: &HashMap<u64, Inode>| {
+                let mut order = vec![ROOT_INO];
+                let mut i = 0;
+                while i < order.len() {
+                    if let Node::Dir { entries, .. } = &inodes[&order[i]].node {
+                        order.extend(entries.values().copied());
+                    }
+                    i += 1;
                 }
-                i += 1;
-            }
-            encode_metadata(next_ino, inodes, order)
-        };
-        let once = encode(&inodes);
-        let (_, again) = decode_metadata(&once, 4096, 1 << 40).expect("re-encoded metadata must decode");
-        assert_eq!(*once, *encode(&again), "metadata encoding is not stable");
+                encode_metadata(version, next_ino, inodes, order)
+            };
+            let once = encode(&inodes);
+            let (_, again) =
+                decode_metadata(&once, version, 4096, 1 << 40).expect("re-encoded metadata must decode");
+            assert_eq!(*once, *encode(&again), "metadata encoding is not stable");
+        }
     }
 }
 
@@ -1390,9 +1428,13 @@ fn put_ts(out: &mut Vec<u8>, t: Timestamp) {
     out.extend_from_slice(&t.nanos.to_le_bytes());
 }
 
-fn encode_metadata(next_ino: u64, inodes: &HashMap<u64, Inode>, order: Vec<u64>) -> Zeroizing<Vec<u8>> {
+fn meta_magic(version: u16) -> &'static [u8; 8] {
+    if version >= 4 { META_MAGIC_V4 } else { META_MAGIC_V3 }
+}
+
+fn encode_metadata(version: u16, next_ino: u64, inodes: &HashMap<u64, Inode>, order: Vec<u64>) -> Zeroizing<Vec<u8>> {
     let mut out = Zeroizing::new(Vec::new());
-    out.extend_from_slice(META_MAGIC);
+    out.extend_from_slice(meta_magic(version));
     out.extend_from_slice(&next_ino.to_le_bytes());
     out.extend_from_slice(&(order.len() as u64).to_le_bytes());
     for ino in order {
@@ -1410,14 +1452,26 @@ fn encode_metadata(next_ino: u64, inodes: &HashMap<u64, Inode>, order: Vec<u64>)
         match &i.node {
             Node::File { size, blocks } => {
                 out.extend_from_slice(&size.to_le_bytes());
-                out.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
-                for b in blocks {
-                    match b {
-                        Some(b) => {
-                            out.extend_from_slice(&b.chunk.to_le_bytes());
-                            out.extend_from_slice(&b.nonce);
+                if version >= 4 {
+                    // Sparse: (index, chunk, nonce) for each stored block.
+                    out.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
+                    for (idx, b) in blocks {
+                        out.extend_from_slice(&idx.to_le_bytes());
+                        out.extend_from_slice(&b.chunk.to_le_bytes());
+                        out.extend_from_slice(&b.nonce);
+                    }
+                } else {
+                    // Dense: every block up to the last stored one, holes as 0.
+                    let count = blocks.last_key_value().map_or(0, |(&idx, _)| idx + 1);
+                    out.extend_from_slice(&count.to_le_bytes());
+                    for idx in 0..count {
+                        match blocks.get(&idx) {
+                            Some(b) => {
+                                out.extend_from_slice(&b.chunk.to_le_bytes());
+                                out.extend_from_slice(&b.nonce);
+                            }
+                            None => out.extend_from_slice(&0u64.to_le_bytes()),
                         }
-                        None => out.extend_from_slice(&0u64.to_le_bytes()),
                     }
                 }
             }
@@ -1441,12 +1495,18 @@ fn encode_metadata(next_ino: u64, inodes: &HashMap<u64, Inode>, order: Vec<u64>)
 
 /// Strictly decode and validate metadata. Although metadata is
 /// authenticated, it is still treated as untrusted input: no panics, no
-/// unbounded allocations, and the tree must be well formed.
-fn decode_metadata(blob: &[u8], chunk_size: u64, max_file_size: u64) -> Result<(u64, HashMap<u64, Inode>), Error> {
+/// unbounded allocations, and the tree must be well formed. The encoding
+/// must be the one of the vault's format `version`.
+fn decode_metadata(
+    blob: &[u8],
+    version: u16,
+    chunk_size: u64,
+    max_file_size: u64,
+) -> Result<(u64, HashMap<u64, Inode>), Error> {
     let bad = |what: &str| Error::Corrupt(format!("malformed metadata: {what}"));
     let mut r = Reader::new(blob);
     let e = |_| bad("truncated");
-    if r.take(8).map_err(e)? != META_MAGIC {
+    if r.take(8).map_err(e)? != meta_magic(version) {
         return Err(bad("bad magic"));
     }
     let next_ino = r.u64().map_err(e)?;
@@ -1482,20 +1542,32 @@ fn decode_metadata(blob: &[u8], chunk_size: u64, max_file_size: u64) -> Result<(
                     return Err(bad("file larger than the vault"));
                 }
                 let n = r.u64().map_err(e)?;
+                // Each listed block takes at least 8 bytes (a hole in version
+                // 3), which bounds `n` by the blob.
                 if n > size.div_ceil(chunk_size) || n > r.rest().len() as u64 / 8 {
                     return Err(bad("block count"));
                 }
-                let mut blocks = Vec::with_capacity(n as usize);
-                for _ in 0..n {
-                    let chunk = r.u64().map_err(e)?;
-                    if chunk == 0 {
-                        blocks.push(None);
-                    } else {
-                        if chunk < SUPERBLOCK_SLOTS {
-                            return Err(bad("block points at a superblock"));
+                let mut blocks = BTreeMap::new();
+                for i in 0..n {
+                    let idx = if version >= 4 {
+                        let idx = r.u64().map_err(e)?;
+                        // Strictly increasing and inside the file: one encoding.
+                        let after_last = blocks.last_key_value().is_none_or(|(&last, _)| idx > last);
+                        if !after_last || idx >= size.div_ceil(chunk_size) {
+                            return Err(bad("block index"));
                         }
-                        blocks.push(Some(BlockRef { chunk, nonce: r.array().map_err(e)? }));
+                        idx
+                    } else {
+                        i
+                    };
+                    let chunk = r.u64().map_err(e)?;
+                    if chunk == 0 && version < 4 {
+                        continue; // a hole (only version 3 lists those)
                     }
+                    if chunk < SUPERBLOCK_SLOTS {
+                        return Err(bad("block points at a superblock"));
+                    }
+                    blocks.insert(idx, BlockRef { chunk, nonce: r.array().map_err(e)? });
                 }
                 Node::File { size, blocks }
             }
@@ -1505,7 +1577,7 @@ fn decode_metadata(blob: &[u8], chunk_size: u64, max_file_size: u64) -> Result<(
                 let mut entries = BTreeMap::new();
                 for _ in 0..n {
                     let len = r.u16().map_err(e)? as usize;
-                    let name = r.take(len).map_err(e)?.to_vec();
+                    let name = Name::new(r.take(len).map_err(e)?);
                     validate_name(&name).map_err(|_| bad("entry name"))?;
                     let child = r.u64().map_err(e)?;
                     if entries.insert(name, child).is_some() {
@@ -1524,7 +1596,7 @@ fn decode_metadata(blob: &[u8], chunk_size: u64, max_file_size: u64) -> Result<(
                 if target.contains(&0) {
                     return Err(bad("symlink target"));
                 }
-                Node::Symlink { target: target.to_vec() }
+                Node::Symlink { target: Zeroizing::new(target.to_vec()) }
             }
             _ => return Err(bad("inode kind")),
         };
@@ -1579,7 +1651,7 @@ impl Fs {
     /// Chunk indices holding a file's blocks (for tamper tests).
     pub(crate) fn chunks_of(&self, ino: u64) -> Vec<u64> {
         match &self.inodes[&ino].node {
-            Node::File { blocks, .. } => blocks.iter().flatten().map(|b| b.chunk).collect(),
+            Node::File { blocks, .. } => blocks.values().map(|b| b.chunk).collect(),
             _ => Vec::new(),
         }
     }
@@ -1588,6 +1660,9 @@ impl Fs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The format version most tests encode metadata for.
+    const V: u16 = 4;
 
     #[test]
     fn timestamps_roundtrip() {
@@ -1633,10 +1708,10 @@ mod tests {
         let ts = Timestamp { secs: 1, nanos: 2 };
         let mk = |node| Inode { perm: 0o644, atime: ts, mtime: ts, ctime: ts, crtime: ts, node };
         let mut inodes = HashMap::new();
-        inodes.insert(ROOT_INO, mk(Node::Dir { parent: ROOT_INO, entries: BTreeMap::from([(b"f".to_vec(), 2), (b"d".to_vec(), 3)]) }));
-        inodes.insert(2, mk(Node::File { size: 5000, blocks: vec![Some(BlockRef { chunk: 9, nonce: [7; 24] })] }));
-        inodes.insert(3, mk(Node::Dir { parent: ROOT_INO, entries: BTreeMap::from([(b"l".to_vec(), 4)]) }));
-        inodes.insert(4, mk(Node::Symlink { target: b"../f".to_vec() }));
+        inodes.insert(ROOT_INO, mk(Node::Dir { parent: ROOT_INO, entries: BTreeMap::from([(Name::new(b"f"), 2), (Name::new(b"d"), 3)]) }));
+        inodes.insert(2, mk(Node::File { size: 5000, blocks: BTreeMap::from([(0, BlockRef { chunk: 9, nonce: [7; 24] })]) }));
+        inodes.insert(3, mk(Node::Dir { parent: ROOT_INO, entries: BTreeMap::from([(Name::new(b"l"), 4)]) }));
+        inodes.insert(4, mk(Node::Symlink { target: Zeroizing::new(b"../f".to_vec()) }));
         (5, inodes)
     }
 
@@ -1644,11 +1719,11 @@ mod tests {
     fn metadata_roundtrip() {
         let (next, inodes) = sample_tree();
         let order = vec![1, 2, 3, 4];
-        let blob = encode_metadata(next, &inodes, order);
-        let (n2, back) = decode_metadata(&blob, 4096, 1 << 30).unwrap();
+        let blob = encode_metadata(V, next, &inodes, order);
+        let (n2, back) = decode_metadata(&blob, V, 4096, 1 << 30).unwrap();
         assert_eq!(n2, next);
         assert_eq!(back.len(), 4);
-        assert!(matches!(&back[&2].node, Node::File { size: 5000, blocks } if blocks[0] == Some(BlockRef { chunk: 9, nonce: [7; 24] })));
+        assert!(matches!(&back[&2].node, Node::File { size: 5000, blocks } if blocks.get(&0) == Some(&BlockRef { chunk: 9, nonce: [7; 24] })));
     }
 
     #[test]
@@ -1657,9 +1732,9 @@ mod tests {
         if let Node::File { size, .. } = &mut inodes.get_mut(&2).unwrap().node {
             *size = u64::MAX;
         }
-        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
-        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
-        assert!(decode_metadata(&blob, 4096, u64::MAX).is_ok());
+        let blob = encode_metadata(V, next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, V, 4096, 1 << 30).is_err());
+        assert!(decode_metadata(&blob, V, 4096, u64::MAX).is_ok());
     }
 
     #[test]
@@ -1667,19 +1742,19 @@ mod tests {
         let (next, mut inodes) = sample_tree();
         // Link the file twice.
         if let Node::Dir { entries, .. } = &mut inodes.get_mut(&3).unwrap().node {
-            entries.insert(b"again".to_vec(), 2);
+            entries.insert(Name::new(b"again"), 2);
         }
-        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
-        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
+        let blob = encode_metadata(V, next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, V, 4096, 1 << 30).is_err());
 
         // A detached cycle.
         let (next, mut inodes) = sample_tree();
         let ts = Timestamp { secs: 0, nanos: 0 };
         let mk = |node| Inode { perm: 0, atime: ts, mtime: ts, ctime: ts, crtime: ts, node };
-        inodes.insert(10, mk(Node::Dir { parent: 11, entries: BTreeMap::from([(b"x".to_vec(), 11)]) }));
-        inodes.insert(11, mk(Node::Dir { parent: 10, entries: BTreeMap::from([(b"y".to_vec(), 10)]) }));
-        let blob = encode_metadata(next.max(12), &inodes, vec![1, 2, 3, 4, 10, 11]);
-        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
+        inodes.insert(10, mk(Node::Dir { parent: 11, entries: BTreeMap::from([(Name::new(b"x"), 11)]) }));
+        inodes.insert(11, mk(Node::Dir { parent: 10, entries: BTreeMap::from([(Name::new(b"y"), 10)]) }));
+        let blob = encode_metadata(V, next.max(12), &inodes, vec![1, 2, 3, 4, 10, 11]);
+        assert!(decode_metadata(&blob, V, 4096, 1 << 30).is_err());
     }
 
     #[test]
@@ -1687,18 +1762,60 @@ mod tests {
         // perm with S_IFSOCK-style type bits.
         let (next, mut inodes) = sample_tree();
         inodes.get_mut(&2).unwrap().perm = 0o140644;
-        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
-        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
+        let blob = encode_metadata(V, next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, V, 4096, 1 << 30).is_err());
         // Setuid/setgid/sticky are ordinary permission bits and stay allowed.
         let (next, mut inodes) = sample_tree();
         inodes.get_mut(&2).unwrap().perm = 0o7777;
-        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
-        assert!(decode_metadata(&blob, 4096, 1 << 30).is_ok());
+        let blob = encode_metadata(V, next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, V, 4096, 1 << 30).is_ok());
 
         let (next, mut inodes) = sample_tree();
-        inodes.get_mut(&4).unwrap().node = Node::Symlink { target: b"a\0b".to_vec() };
-        let blob = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
-        assert!(decode_metadata(&blob, 4096, 1 << 30).is_err());
+        inodes.get_mut(&4).unwrap().node = Node::Symlink { target: Zeroizing::new(b"a\0b".to_vec()) };
+        let blob = encode_metadata(V, next, &inodes, vec![1, 2, 3, 4]);
+        assert!(decode_metadata(&blob, V, 4096, 1 << 30).is_err());
+    }
+
+    /// Version 3 lists every block (holes as zero), version 4 only the
+    /// stored ones. Both decode to the same sparse file, and each version
+    /// only accepts its own encoding.
+    #[test]
+    fn sparse_files_in_both_metadata_versions() {
+        let (next, mut inodes) = sample_tree();
+        // A 4 KiB-chunk file with blocks 0 and 1000: 999 holes in between.
+        if let Node::File { size, blocks } = &mut inodes.get_mut(&2).unwrap().node {
+            *size = 1001 * 4096;
+            blocks.insert(1000, BlockRef { chunk: 10, nonce: [8; 24] });
+        }
+        let order = vec![1, 2, 3, 4];
+        let v3 = encode_metadata(3, next, &inodes, order.clone());
+        let v4 = encode_metadata(4, next, &inodes, order);
+        // Version 3: 2 blocks of 32 bytes + 999 holes of 8. Version 4: 2 x 40.
+        assert_eq!(v3.len() - v4.len(), 2 * 32 + 999 * 8 - 2 * 40);
+        let blocks_of = |m: &HashMap<u64, Inode>| match &m[&2].node {
+            Node::File { blocks, .. } => blocks.clone(),
+            _ => panic!("not a file"),
+        };
+        let (_, back3) = decode_metadata(&v3, 3, 4096, 1 << 30).unwrap();
+        let (_, back4) = decode_metadata(&v4, 4, 4096, 1 << 30).unwrap();
+        assert_eq!(blocks_of(&back3), blocks_of(&inodes));
+        assert_eq!(blocks_of(&back4), blocks_of(&inodes));
+        assert!(decode_metadata(&v3, 4, 4096, 1 << 30).is_err());
+        assert!(decode_metadata(&v4, 3, 4096, 1 << 30).is_err());
+
+        // Version 4 block lists must be strictly increasing, inside the
+        // file, and never point at chunk 0.
+        let entry = [1000u64.to_le_bytes(), 10u64.to_le_bytes()].concat();
+        let at = v4.windows(16).position(|w| w == entry).unwrap();
+        for (patch, why) in [
+            ([0u64.to_le_bytes(), 10u64.to_le_bytes()].concat(), "repeated index"),
+            ([1001u64.to_le_bytes(), 10u64.to_le_bytes()].concat(), "index past the end of the file"),
+            ([1000u64.to_le_bytes(), 0u64.to_le_bytes()].concat(), "chunk 0"),
+        ] {
+            let mut b = v4.to_vec();
+            b[at..at + 16].copy_from_slice(&patch);
+            assert!(decode_metadata(&b, 4, 4096, 1 << 30).is_err(), "{why}");
+        }
     }
 
     fn superblock_bytes(meta_len: u64, extents: &[(u64, u32)]) -> Vec<u8> {
@@ -1747,7 +1864,6 @@ mod tests {
     #[test]
     fn metadata_corruption_never_panics() {
         let (next, inodes) = sample_tree();
-        let base = encode_metadata(next, &inodes, vec![1, 2, 3, 4]);
         let mut state = 0x2545F4914F6CDD1Du64;
         let mut rnd = || {
             state ^= state << 13;
@@ -1755,16 +1871,19 @@ mod tests {
             state ^= state << 17;
             state
         };
-        for _ in 0..20_000 {
-            let mut b = base.to_vec();
-            for _ in 0..(rnd() % 4 + 1) {
-                let pos = (rnd() as usize) % b.len();
-                b[pos] = rnd() as u8;
+        for version in [3, 4] {
+            let base = encode_metadata(version, next, &inodes, vec![1, 2, 3, 4]);
+            for _ in 0..20_000 {
+                let mut b = base.to_vec();
+                for _ in 0..(rnd() % 4 + 1) {
+                    let pos = (rnd() as usize) % b.len();
+                    b[pos] = rnd() as u8;
+                }
+                if rnd() % 10 == 0 {
+                    b.truncate((rnd() as usize) % b.len());
+                }
+                let _ = decode_metadata(&b, version, 4096, 1 << 30);
             }
-            if rnd() % 10 == 0 {
-                b.truncate((rnd() as usize) % b.len());
-            }
-            let _ = decode_metadata(&b, 4096, 1 << 30);
         }
     }
 }

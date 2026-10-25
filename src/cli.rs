@@ -1,5 +1,6 @@
 //! The `nullguard` command line.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -209,6 +210,12 @@ impl Prompter {
     /// Read a new password (twice when interactive) and enforce the policy.
     fn new_password(&self, what: &str) -> Result<Zeroizing<String>> {
         let pw = self.read(&format!("New {what}: "))?;
+        // The limit applies to the normalized form, which is what the key is
+        // derived from (normalizing can make some text longer). Unlocking
+        // only limits what is typed, so no existing password stops working.
+        if pw.len() > MAX_PASSWORD_BYTES {
+            bail!("passwords are limited to {MAX_PASSWORD_BYTES} bytes");
+        }
         if pw.chars().count() < MIN_PASSWORD_CHARS {
             bail!("the {what} must be at least {MIN_PASSWORD_CHARS} characters (a few random words is ideal)");
         }
@@ -582,7 +589,7 @@ pub fn run() -> Result<()> {
 
         Command::Info { vault } => {
             let h = Vault::peek_header(&vault)?;
-            println!("nullguard vault (version {})", vault::header::FORMAT_VERSION);
+            println!("nullguard vault (version {})", h.version);
             println!("  cipher:      {}", crate::crypto::aead::CIPHER_NAME);
             println!("  chunk size:  {}", human(h.chunk_size as u64));
             println!("  capacity:    {} ({} chunks)", human(h.chunk_count * h.chunk_size as u64), h.chunk_count);
@@ -594,6 +601,12 @@ pub fn run() -> Result<()> {
                 h.kdf.parallelism
             );
             println!("  keyfiles:    {}", h.keyfiles.len());
+            if h.version < vault::header::FORMAT_VERSION {
+                println!(
+                    "(An older vault format. It keeps working; `nullguard rekey` moves it to version {}.)",
+                    vault::header::FORMAT_VERSION
+                );
+            }
             println!("(Header values are not authenticated until the vault is unlocked.)");
         }
 
@@ -638,7 +651,7 @@ pub fn run() -> Result<()> {
             let entries = if fs.attr(ino)?.kind == Kind::Dir {
                 fs.readdir(ino)?.into_iter().filter(|e| e.name != b"." && e.name != b"..").collect()
             } else {
-                vec![vault::fs::DirEntry { name: path.clone().into_bytes(), ino, kind: Kind::File }]
+                vec![vault::fs::DirEntry { name: vault::fs::Name::new(path.as_bytes()), ino, kind: Kind::File }]
             };
             for e in entries {
                 let a = fs.attr(e.ino)?;
@@ -664,17 +677,19 @@ pub fn run() -> Result<()> {
         Command::Get { vault, path, dest, force, unlock: u } => {
             let mut fs = open_fs(&vault, &u, true)?;
             let ino = resolve(&fs, &path)?;
-            let dest = if dest.is_dir() && fs.attr(ino)?.kind != Kind::Dir {
+            // The local folder the copy goes into, and its name there.
+            let (folder, name) = if dest.is_dir() && fs.attr(ino)?.kind != Kind::Dir {
                 let name = base_name(&path)?;
                 if !safe_local_name(name) {
-                    bail!("refusing to create a local file with the unsafe name {name:?}");
+                    bail!("refusing to create a local file with the unsafe name {}", display_name(name.as_bytes()));
                 }
-                dest.join(name)
+                (LocalDir::open(&dest)?, OsString::from(name))
             } else {
-                dest
+                let (parent, name) = split_dest(&dest)?;
+                (LocalDir::open(&parent)?, name)
             };
-            let n = export(&mut fs, ino, &dest, force, 0)?;
-            println!("Copied {n} file(s) to {}.", display_path(&dest));
+            let n = export(&mut fs, ino, &folder, &name, force, 0)?;
+            println!("Copied {n} file(s) to {}.", display_path(&folder.path_of(&name)));
         }
 
         Command::Put { vault, src, path, force, unlock: u } => {
@@ -890,46 +905,163 @@ fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool, depth:
     Ok(1)
 }
 
-fn export(fs: &mut Fs, ino: u64, dest: &Path, force: bool, depth: usize) -> Result<u64> {
+/// Split a local destination into the folder it is in and its own name.
+fn split_dest(dest: &Path) -> Result<(PathBuf, OsString)> {
+    // "." or ".." have no name of their own: use the real path.
+    let full = if dest.file_name().is_none() {
+        std::fs::canonicalize(dest).with_context(|| format!("finding {}", display_path(dest)))?
+    } else {
+        dest.to_path_buf()
+    };
+    match (full.parent(), full.file_name()) {
+        (Some(p), Some(n)) => {
+            let p = if p.as_os_str().is_empty() { Path::new(".") } else { p };
+            Ok((p.to_path_buf(), n.to_owned()))
+        }
+        _ => bail!("can't copy to {}: name a folder or a file", display_path(dest)),
+    }
+}
+
+/// A local folder that `get` writes into.
+///
+/// On Linux and macOS the folder is held open, and every name in it is
+/// created relative to that handle without following symbolic links. So
+/// nobody can redirect the copy elsewhere (for example into another of
+/// your folders) by swapping a folder for a link while it runs. Existing
+/// folders the copy merges into must belong to you. On Windows, names are
+/// checked by path right before each use.
+struct LocalDir {
+    path: PathBuf,
+    #[cfg(unix)]
+    handle: std::fs::File,
+}
+
+impl LocalDir {
+    /// An existing folder named on the command line. (Links in a path the
+    /// user typed are the user's choice, and are followed.)
+    fn open(path: &Path) -> Result<Self> {
+        let what = || format!("opening {}", display_path(path));
+        if !std::fs::metadata(path).with_context(what)?.is_dir() {
+            bail!("{} is not a directory", display_path(path));
+        }
+        #[cfg(unix)]
+        let handle = std::fs::File::open(path).with_context(what)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            #[cfg(unix)]
+            handle,
+        })
+    }
+
+    fn path_of(&self, name: &OsStr) -> PathBuf {
+        self.path.join(name)
+    }
+
+    /// The folder `name` in this one: created (readable only by you) if
+    /// it is missing. An existing one must be a real folder, not a link,
+    /// and on Linux and macOS must belong to you: copying plaintext into a
+    /// folder someone else controls would let them meddle with it.
+    fn subdir(&self, name: &OsStr) -> Result<Self> {
+        let path = self.path_of(name);
+        let not_a_dir = || anyhow!("{} exists and is not a directory", display_path(&path));
+        let a_link = || anyhow!("refusing to export into {}: it is a symbolic link", display_path(&path));
+        let creating = || format!("creating {}", display_path(&path));
+        #[cfg(unix)]
+        {
+            use crate::platform::at::{self, Entry};
+            use std::os::unix::fs::MetadataExt;
+            match at::entry(&self.handle, name).with_context(creating)? {
+                // Plaintext file names inside: only the owner may list it.
+                Entry::Missing => at::make_dir(&self.handle, name, 0o700).with_context(creating)?,
+                Entry::Dir => {}
+                Entry::Symlink => return Err(a_link()),
+                Entry::File | Entry::Other => return Err(not_a_dir()),
+            }
+            // Fails if the folder was swapped for a link meanwhile.
+            let handle = at::open_dir(&self.handle, name).with_context(|| format!("opening {}", display_path(&path)))?;
+            if handle.metadata()?.uid() != crate::platform::uid() {
+                bail!(
+                    "{} already exists and belongs to another user; refusing to copy into it",
+                    display_path(&path)
+                );
+            }
+            Ok(Self { path, handle })
+        }
+        #[cfg(not(unix))]
+        {
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_symlink() => return Err(a_link()),
+                Ok(m) if !m.is_dir() => return Err(not_a_dir()),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir(&path).with_context(creating)?,
+                Err(e) => return Err(e).with_context(creating),
+            }
+            Ok(Self { path })
+        }
+    }
+
+    /// Create the file `name` here, readable only by you. Never writes
+    /// through a symbolic link; with `overwrite`, an existing file is
+    /// replaced by a new private one.
+    fn create_file(&self, name: &OsStr, overwrite: bool) -> io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            use crate::platform::at::{self, Entry};
+            match at::entry(&self.handle, name)? {
+                Entry::Symlink => {
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "refusing to write through a symbolic link"));
+                }
+                Entry::File if overwrite => at::remove_file(&self.handle, name)?,
+                _ => {}
+            }
+            at::create_file(&self.handle, name, 0o600)
+        }
+        #[cfg(not(unix))]
+        {
+            create_private(&self.path_of(name), overwrite)
+        }
+    }
+
+    fn remove_file(&self, name: &OsStr) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            crate::platform::at::remove_file(&self.handle, name)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::remove_file(self.path_of(name))
+        }
+    }
+}
+
+/// Copy the vault entry `ino` to `name` in the local folder `dir`.
+fn export(fs: &mut Fs, ino: u64, dir: &LocalDir, name: &OsStr, force: bool, depth: usize) -> Result<u64> {
     check_depth(depth)?;
     let a = fs.attr(ino)?;
+    let dest = dir.path_of(name);
     match a.kind {
         Kind::Dir => {
-            match std::fs::symlink_metadata(dest) {
-                Ok(m) if m.file_type().is_symlink() => {
-                    bail!("refusing to export into {}: it is a symbolic link", display_path(dest))
-                }
-                Ok(m) if !m.is_dir() => bail!("{} exists and is not a directory", display_path(dest)),
-                Ok(_) => {}
-                Err(_) => {
-                    // Plaintext file names inside: only the owner may list it.
-                    #[allow(unused_mut)] // only mutated on unix
-                    let mut b = std::fs::DirBuilder::new();
-                    #[cfg(unix)]
-                    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-                    b.create(dest).with_context(|| format!("creating {}", display_path(dest)))?;
-                }
-            }
+            let sub = dir.subdir(name)?;
             let mut n = 0;
             for e in fs.readdir(ino)? {
                 if e.name == b"." || e.name == b".." {
                     continue;
                 }
-                let name = String::from_utf8_lossy(&e.name).into_owned();
-                if !safe_local_name(&name) {
+                let child = String::from_utf8_lossy(&e.name).into_owned();
+                if !safe_local_name(&child) {
                     bail!("refusing to create a local file with the unsafe name {}", display_name(&e.name));
                 }
-                n += export(fs, e.ino, &dest.join(&name), force, depth + 1)?;
+                n += export(fs, e.ino, &sub, OsStr::new(&child), force, depth + 1)?;
             }
             Ok(n)
         }
         Kind::Symlink => {
-            eprintln!("skipping symlink {}", display_path(dest));
+            eprintln!("skipping symlink {}", display_path(&dest));
             Ok(0)
         }
         Kind::File => {
-            let mut out = create_private(dest, force).with_context(|| {
-                format!("creating {} (use --force to overwrite existing files)", display_path(dest))
+            let mut out = dir.create_file(name, force).with_context(|| {
+                format!("creating {} (use --force to overwrite existing files)", display_path(&dest))
             })?;
             let copy = (|| -> Result<()> {
                 let mut off = 0;
@@ -945,8 +1077,8 @@ fn export(fs: &mut Fs, ino: u64, dest: &Path, force: bool, depth: usize) -> Resu
                 // Never leave partial plaintext behind, e.g. when a block
                 // fails authentication halfway through.
                 drop(out);
-                let _ = std::fs::remove_file(dest);
-                return Err(e.context(format!("copying out to {}", display_path(dest))));
+                let _ = dir.remove_file(name);
+                return Err(e.context(format!("copying out to {}", display_path(&dest))));
             }
             Ok(1)
         }
