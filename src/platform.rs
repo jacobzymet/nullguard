@@ -303,33 +303,39 @@ pub mod win {
     use std::fs::{File, OpenOptions};
     use std::io;
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::Path;
     use std::ptr::null_mut;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-        SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorDacl,
-        GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetSidSubAuthority,
+        GetSidSubAuthorityCount, GetTokenInformation, IsTokenRestricted, OWNER_SECURITY_INFORMATION, PSID,
+        SECURITY_ATTRIBUTES, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel,
+        TokenIsAppContainer, TokenUser,
     };
+    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     // Access rights and flags (winnt.h / fileapi.h).
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const GENERIC_ALL: u32 = 0x1000_0000;
-    const READ_CONTROL: u32 = 0x0002_0000;
-    const WRITE_DAC: u32 = 0x0004_0000;
     const FILE_READ_DATA: u32 = 0x1;
-    const FILE_SHARE_READ: u32 = 0x1;
+    pub const FILE_SHARE_READ: u32 = 0x1;
     const FILE_SHARE_WRITE: u32 = 0x2;
+    const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_ALLOWED_COMPOUND_ACE_TYPE: u8 = 4;
+    const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 5;
+    const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+    const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 11;
     const INHERIT_ONLY_ACE: u8 = 0x8;
 
     fn from_wide(p: *const u16) -> Option<String> {
@@ -399,7 +405,9 @@ pub mod win {
         user
     }
 
-    /// The permissions [`make_private`] applies, in SDDL form.
+    /// The permissions nullguard gives the files and folders it creates, in
+    /// SDDL form: protected (nothing inherited), full access for you and
+    /// SYSTEM, nothing for anyone else.
     fn private_sddl() -> io::Result<String> {
         Ok(format!("D:P(A;;FA;;;{})(A;;FA;;;SY)", current_user_sid()?))
     }
@@ -436,68 +444,150 @@ pub mod win {
         }
     }
 
-    /// Replace a file's or folder's permissions with: you and the system
-    /// (SYSTEM) have full access, nobody else any, nothing inherited. The
-    /// Windows counterpart of mode `0600`/`0700`. `file` must be open with
-    /// `WRITE_DAC` access.
-    pub fn make_private(file: &File) -> io::Result<()> {
-        let sddl = to_wide(&private_sddl()?);
+    /// A path as a NUL-terminated UTF-16 string for the Windows API, in the
+    /// `\\?\` form for long paths (as the standard library does).
+    fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+        use std::os::windows::ffi::OsStrExt;
+        let mut p = path.to_path_buf();
+        if p.as_os_str().len() >= 248 {
+            p = std::path::absolute(&p)?;
+            let s = p.as_os_str().to_string_lossy().into_owned();
+            if !s.starts_with(r"\\") {
+                p = format!(r"\\?\{s}").into();
+            } else if !s.starts_with(r"\\?\") {
+                p = format!(r"\\?\UNC\{}", &s[2..]).into();
+            }
+        }
+        Ok(p.as_os_str().encode_wide().chain([0]).collect())
+    }
+
+    /// Run `f` with security attributes carrying the private permissions
+    /// ([`private_sddl`]), so a new object is private from the moment it
+    /// exists: there is no instant in which it has the permissions its
+    /// folder would pass on, when someone else could open it.
+    fn with_private_attributes<T>(f: impl FnOnce(*const SECURITY_ATTRIBUTES) -> T) -> io::Result<T> {
+        with_attributes(&private_sddl()?, f)
+    }
+
+    /// Run `f` with security attributes carrying the permissions `sddl`.
+    fn with_attributes<T>(sddl: &str, f: impl FnOnce(*const SECURITY_ATTRIBUTES) -> T) -> io::Result<T> {
+        let sddl = to_wide(sddl);
         let mut sd: *mut c_void = null_mut();
-        // SAFETY: a valid SDDL string; the descriptor is freed below, after
-        // its DACL (which points into it) has been applied.
+        // SAFETY: a valid SDDL string; the descriptor lives until after `f`.
         unsafe {
             if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, null_mut())
                 == 0
             {
                 return Err(io::Error::last_os_error());
             }
-            let mut present = 0;
-            let mut defaulted = 0;
-            let mut dacl: *mut ACL = null_mut();
-            let mut result = Ok(());
-            if GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) == 0 || present == 0 {
-                result = Err(io::Error::other("could not build the private permissions"));
-            } else {
-                let err = SetSecurityInfo(
-                    file.as_raw_handle(),
-                    SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    null_mut(),
-                    null_mut(),
-                    dacl,
-                    null_mut(),
-                );
-                if err != 0 {
-                    result = Err(io::Error::from_raw_os_error(err as i32));
-                }
-            }
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            };
+            let result = f(&sa);
             LocalFree(sd);
-            result
+            Ok(result)
         }
     }
 
-    /// `OpenOptions` for creating a new file whose permissions can then be
-    /// made private (they carry `WRITE_DAC`), and that nobody may rename or
-    /// delete while it is open.
-    pub fn private_create_options() -> OpenOptions {
-        let mut o = OpenOptions::new();
-        o.read(true)
-            .write(true)
-            .create_new(true)
-            .access_mode(GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
-            .share_mode(FILE_SHARE_READ);
-        o
+    /// Create a new file (never an existing one) for reading and writing,
+    /// private from the start: you and SYSTEM have access, nobody else
+    /// (the counterpart of mode `0600`). `share` says what others may do
+    /// while it is open (`FILE_SHARE_*`; 0 for nothing).
+    pub fn create_private_file(path: &Path, share: u32) -> io::Result<File> {
+        create_file_with(path, share, &private_sddl()?)
     }
 
-    /// Create a new file (never an existing one) that only you can read.
-    pub fn create_private_file(path: &Path) -> io::Result<File> {
-        let file = private_create_options().open(path)?;
-        if let Err(e) = make_private(&file) {
-            drop(file);
-            let _ = std::fs::remove_file(path);
-            return Err(e);
+    /// Create a new file for reading and writing with the permissions `sddl`.
+    fn create_file_with(path: &Path, share: u32, sddl: &str) -> io::Result<File> {
+        let name = wide_path(path)?;
+        let handle = with_attributes(sddl, |sa| {
+            // SAFETY: a NUL-terminated path and valid security attributes.
+            unsafe {
+                CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE, share, sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, null_mut())
+            }
+        })?;
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
         }
-        Ok(file)
+        // SAFETY: a handle just opened, owned by nothing else.
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+
+    /// Create a folder that only you can open (private from the start, like
+    /// mode `0700`), and hold it (see [`open_dir`]).
+    pub fn create_private_dir(path: &Path) -> io::Result<File> {
+        let name = wide_path(path)?;
+        // SAFETY: a NUL-terminated path and valid security attributes.
+        let ok = with_private_attributes(|sa| unsafe { CreateDirectoryW(name.as_ptr(), sa) })?;
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        open_dir(path, true)
+    }
+
+    /// Whether a folder (or file) belongs to you. Folders made by an
+    /// elevated administrator may belong to the Administrators group, which
+    /// counts too (administrators are trusted with everything anyway).
+    pub fn owned_by_me(file: &File) -> io::Result<bool> {
+        let me = current_user_sid()?;
+        let mut owner: PSID = null_mut();
+        let mut sd: *mut c_void = null_mut();
+        // SAFETY: `file` is open for reading (READ_CONTROL); the owner SID
+        // points into the descriptor, which is freed after it is read.
+        unsafe {
+            let err = GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut sd,
+            );
+            if err != 0 {
+                return Err(io::Error::from_raw_os_error(err as i32));
+            }
+            let sid = if owner.is_null() { None } else { sid_string(owner) };
+            LocalFree(sd);
+            Ok(matches!(sid.as_deref(), Some(s) if s == me || s == "S-1-5-32-544"))
+        }
+    }
+
+    /// Whether an access token belongs to a sandboxed process: an app
+    /// container, a restricted token, or an integrity level below medium
+    /// (browser and document-viewer sandboxes use these). Such processes
+    /// run as you but must not get at the vault's files.
+    ///
+    /// # Safety
+    /// As for [`token_user`].
+    pub unsafe fn token_is_sandboxed(token: HANDLE) -> io::Result<bool> {
+        // SAFETY: fixed-size queries into local buffers, then a sized query
+        // for the integrity label; the SID read points into that buffer.
+        unsafe {
+            let mut len = 0u32;
+            let mut app_container = 0u32;
+            if GetTokenInformation(token, TokenIsAppContainer, (&mut app_container as *mut u32).cast(), 4, &mut len) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if app_container != 0 || IsTokenRestricted(token) != 0 {
+                return Ok(true);
+            }
+            GetTokenInformation(token, TokenIntegrityLevel, null_mut(), 0, &mut len);
+            let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+            if GetTokenInformation(token, TokenIntegrityLevel, buf.as_mut_ptr().cast(), len, &mut len) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+            let count = *GetSidSubAuthorityCount(label.Label.Sid);
+            if count == 0 {
+                return Ok(true);
+            }
+            let level = *GetSidSubAuthority(label.Label.Sid, count as u32 - 1);
+            Ok(level < SECURITY_MANDATORY_MEDIUM_RID)
+        }
     }
 
     /// Open a folder and hold it: while the handle is open, nobody can
@@ -518,22 +608,6 @@ pub mod win {
         if !meta.is_dir() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a directory"));
         }
-        Ok(dir)
-    }
-
-    /// Create a folder only you can open, and hold it (see [`open_dir`]).
-    pub fn create_private_dir(path: &Path) -> io::Result<File> {
-        std::fs::create_dir(path)?;
-        let dir = OpenOptions::new()
-            .access_mode(GENERIC_READ | READ_CONTROL | WRITE_DAC)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-        let meta = dir.metadata()?;
-        if !meta.is_dir() || meta.file_type().is_symlink() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a directory"));
-        }
-        make_private(&dir)?;
         Ok(dir)
     }
 
@@ -576,8 +650,20 @@ pub mod win {
                         return Err(io::Error::last_os_error());
                     }
                     let header = &*(ace as *const ACE_HEADER);
-                    if header.AceType != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags & INHERIT_ONLY_ACE != 0 {
-                        continue;
+                    if header.AceFlags & INHERIT_ONLY_ACE != 0 {
+                        continue; // applies only to things created inside it
+                    }
+                    match header.AceType {
+                        // Plain and conditional ("callback") grants: same
+                        // layout up to the SID, checked below.
+                        ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE => {}
+                        // Other kinds of grant (compound, object): who they
+                        // grant to isn't read here, so assume someone else.
+                        ACCESS_ALLOWED_COMPOUND_ACE_TYPE
+                        | ACCESS_ALLOWED_OBJECT_ACE_TYPE
+                        | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => return Ok(true),
+                        // Denials, auditing and labels grant nothing.
+                        _ => continue,
                     }
                     let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
                     if allowed.Mask & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL) == 0 {
@@ -634,6 +720,35 @@ pub mod win {
         }
     }
 
+    /// A copy of this process's token lowered to low integrity, as browser
+    /// sandboxes run (for tests). The caller closes it.
+    #[cfg(test)]
+    pub(crate) fn low_integrity_token() -> HANDLE {
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows_sys::Win32::Security::{
+            DuplicateTokenEx, SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
+            TOKEN_DUPLICATE, TokenPrimary,
+        };
+        const SE_GROUP_INTEGRITY: u32 = 0x20;
+        // SAFETY: token handles of this process; the SID is freed once the
+        // token has copied it.
+        unsafe {
+            let mut mine: HANDLE = null_mut();
+            assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut mine), 0);
+            let mut low: HANDLE = null_mut();
+            let access = TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_DUPLICATE;
+            assert_ne!(DuplicateTokenEx(mine, access, null_mut(), SecurityImpersonation, TokenPrimary, &mut low), 0);
+            CloseHandle(mine);
+            let mut sid: PSID = null_mut();
+            assert_ne!(ConvertStringSidToSidW(to_wide("S-1-16-4096").as_ptr(), &mut sid), 0);
+            let label = TOKEN_MANDATORY_LABEL { Label: SID_AND_ATTRIBUTES { Sid: sid, Attributes: SE_GROUP_INTEGRITY } };
+            let size = (size_of::<TOKEN_MANDATORY_LABEL>() + 12) as u32;
+            assert_ne!(SetTokenInformation(low, TokenIntegrityLevel, (&label as *const TOKEN_MANDATORY_LABEL).cast(), size), 0);
+            LocalFree(sid);
+            low
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -641,27 +756,55 @@ pub mod win {
         #[test]
         fn private_files_are_private_and_shared_ones_are_detected() {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("secret");
-            let f = create_private_file(&path).unwrap();
-            drop(f);
-            let f = File::open(&path).unwrap();
+            let me = current_user_sid().unwrap();
+            let f = create_private_file(&dir.path().join("secret"), 0).unwrap();
+            assert!(!readable_by_others(&f).unwrap());
+            assert_eq!(permissions_sddl(&f).unwrap().replacen("D:PAI(", "D:P(", 1), private_permissions_sddl().unwrap());
+            // Private from the start, even in a folder that passes on
+            // access for Everyone.
+            let open = dir.path().join("open");
+            with_attributes("D:P(A;OICI;FA;;;WD)", |sa| {
+                let name = wide_path(&open).unwrap();
+                // SAFETY: a NUL-terminated path and valid attributes.
+                assert_ne!(unsafe { CreateDirectoryW(name.as_ptr(), sa) }, 0);
+            })
+            .unwrap();
+            let f = create_private_file(&open.join("secret"), 0).unwrap();
             assert!(!readable_by_others(&f).unwrap());
 
-            // A file that grants Everyone (WD) read access is caught.
-            let shared = dir.path().join("shared");
-            let f = private_create_options().open(&shared).unwrap();
-            let sddl = to_wide("D:P(A;;FA;;;SY)(A;;FR;;;WD)");
-            let mut sd: *mut c_void = null_mut();
-            // SAFETY: as in `make_private`.
-            unsafe {
-                assert_ne!(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, null_mut()), 0);
-                let (mut present, mut defaulted, mut dacl) = (0, 0, null_mut());
-                assert_ne!(GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted), 0);
-                let err = SetSecurityInfo(f.as_raw_handle(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, null_mut(), null_mut(), dacl, null_mut());
-                assert_eq!(err, 0);
-                LocalFree(sd);
+            // Files others may read are caught: a plain grant to Everyone,
+            // and a conditional ("callback") one.
+            for (name, grant) in [("shared", "(A;;FR;;;WD)"), ("conditional", "(XA;;FR;;;WD;(Exists Department))")] {
+                let f = create_file_with(&dir.path().join(name), FILE_SHARE_READ, &format!("D:P(A;;FA;;;{me}){grant}")).unwrap();
+                assert!(readable_by_others(&f).unwrap(), "{name}");
             }
-            assert!(readable_by_others(&f).unwrap());
+        }
+
+        #[test]
+        fn ownership_is_checked() {
+            let dir = tempfile::tempdir().unwrap();
+            let mine = create_private_dir(&dir.path().join("mine")).unwrap();
+            assert!(owned_by_me(&mine).unwrap());
+            // The Windows folder belongs to TrustedInstaller.
+            let windows = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+            assert!(!owned_by_me(&open_dir(Path::new(&windows), false).unwrap()).unwrap());
+        }
+
+        /// A token lowered to low integrity (as browser sandboxes run) counts
+        /// as sandboxed; this process's own token doesn't.
+        #[test]
+        fn sandboxed_tokens_are_recognized() {
+            // SAFETY: token handles of this process, closed below.
+            unsafe {
+                let mut mine: HANDLE = null_mut();
+                assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut mine), 0);
+                assert!(!token_is_sandboxed(mine).unwrap());
+                let low = low_integrity_token();
+                assert!(token_is_sandboxed(low).unwrap());
+                assert_eq!(token_user(low).unwrap(), current_user_sid().unwrap(), "same user, yet sandboxed");
+                CloseHandle(low);
+                CloseHandle(mine);
+            }
         }
 
         #[test]

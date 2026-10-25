@@ -26,8 +26,9 @@ thiserror = "2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
-# Ctrl-C (and on Windows, closing the console, logoff, shutdown) unmounts.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# Ctrl-C and SIGTERM unmount. (Windows has its own console handler, which
+# waits for the commit before the process may end.)
 ctrlc = { version = "3.5", features = ["termination"] }
 
 # Windows API declarations (Microsoft's official crate), for mounting
@@ -38,6 +39,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_Threading",

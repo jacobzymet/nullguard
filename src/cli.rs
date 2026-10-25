@@ -454,7 +454,8 @@ fn create_private(path: &Path, overwrite: bool) -> io::Result<std::fs::File> {
     }
     #[cfg(windows)]
     {
-        crate::platform::win::create_private_file(path)
+        // Nobody else may open it while it is being written.
+        crate::platform::win::create_private_file(path, 0)
     }
 }
 
@@ -1064,7 +1065,8 @@ fn split_dest(dest: &Path) -> Result<(PathBuf, OsString)> {
 /// your folders) by swapping a folder for a link while it runs. Existing
 /// folders the copy merges into must belong to you. On Windows the folder
 /// is held open so it can't be renamed or replaced meanwhile, links are
-/// refused when opened, and new files and folders are made private.
+/// refused when opened, existing folders must belong to you too, and new
+/// files and folders are private from the moment they exist.
 struct LocalDir {
     path: PathBuf,
     handle: std::fs::File,
@@ -1091,8 +1093,8 @@ impl LocalDir {
 
     /// The folder `name` in this one: created (readable only by you) if
     /// it is missing. An existing one must be a real folder, not a link,
-    /// and on Linux and macOS must belong to you: copying plaintext into a
-    /// folder someone else controls would let them meddle with it.
+    /// and must belong to you: copying plaintext into a folder someone else
+    /// controls would let them meddle with it.
     fn subdir(&self, name: &OsStr) -> Result<Self> {
         let path = self.path_of(name);
         let not_a_dir = || anyhow!("{} exists and is not a directory", display_path(&path));
@@ -1130,6 +1132,12 @@ impl LocalDir {
                 Ok(_) => {
                     let h = win::open_dir(&path, true).with_context(|| format!("opening {}", display_path(&path)))?;
                     check_real_name(&path, name)?;
+                    if !win::owned_by_me(&h).with_context(|| format!("checking {}", display_path(&path)))? {
+                        bail!(
+                            "{} already exists and belongs to another user; refusing to copy into it",
+                            display_path(&path)
+                        );
+                    }
                     h
                 }
                 // Plaintext file names inside: only you may list it.

@@ -158,8 +158,8 @@ impl Vault {
         })?;
 
         // Only the owner may read the vault: other local users shouldn't even
-        // get a copy to attack offline. (On Windows the permissions are set
-        // right after creating it, before anything is written.)
+        // get a copy to attack offline. (Private from the moment it exists,
+        // on every OS.)
         #[cfg(unix)]
         let file = {
             let mut oo = OpenOptions::new();
@@ -168,14 +168,8 @@ impl Vault {
             oo.open(path)?
         };
         #[cfg(windows)]
-        let file = {
-            let mut oo = crate::platform::win::private_create_options();
-            std::os::windows::fs::OpenOptionsExt::share_mode(&mut oo, 0);
-            oo.open(path)?
-        };
+        let file = crate::platform::win::create_private_file(path, 0)?;
         let result = (|| {
-            #[cfg(windows)]
-            crate::platform::win::make_private(&file)?;
             file.try_lock().map_err(|_| Error::InUse)?;
             let len = header.file_len();
             file.set_len(len)?;

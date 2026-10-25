@@ -390,6 +390,29 @@ fn get_never_follows_links_inside_the_destination() {
     assert_eq!(std::fs::read(out.join("src").join("sub").join("secret.txt")).unwrap(), b"plaintext");
 }
 
+/// `get` won't merge into an existing folder that belongs to someone else
+/// (here a system folder). The vault folder is empty, so nothing could be
+/// written even if the check failed.
+#[test]
+fn get_refuses_folders_of_other_users() {
+    #[cfg(windows)]
+    let (theirs, name) = (std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()), "Windows");
+    #[cfg(unix)]
+    let (theirs, name) = ("/usr".to_string(), "usr");
+    #[cfg(unix)]
+    if nullguard::platform::uid() == 0 {
+        eprintln!("skipped: running as root, who owns /usr");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    ok(&["mkdir", v, &format!("/{name}"), "--password-stdin"], &format!("{PW}\n"));
+    let err = fails(&["get", v, &format!("/{name}"), &theirs, "--password-stdin"], &format!("{PW}\n"));
+    assert!(err.contains("belongs to another user"), "{err}");
+}
+
 /// `put` copies regular files and folders only: links (to files or to
 /// folders) are skipped rather than followed, and a named pipe is skipped
 /// rather than read (which would hang until something writes to it).

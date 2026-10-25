@@ -302,15 +302,20 @@ synced to the cloud).
   nullguard's memory on Windows, which falls under malware running as you.)
   Other users can still reach the drive's device by its path, so nullguard
   refuses every file or folder they try to open, the same way whether or
-  not that name exists: they can't probe which names the vault holds. They
-  can see the drive's size and how much of it is free. The
+  not that name exists: they can't probe which names the vault holds. The
+  same goes for your own sandboxed processes (low integrity, app containers,
+  restricted tokens). Other users can see the drive's size and how much of
+  it is free. The
   drive letter only exists in the mounting user's session. Closed files'
   contents are kept out of Windows' standby cache. Ctrl-C, closing the
-  console window, logging off and shutting down commit and unmount.
+  console window, logging off and shutting down commit and unmount. (For
+  the last three, Windows allows a few seconds before it ends the process;
+  nullguard uses them to commit, and a commit takes well under that.)
 - Vault files, keyfiles and everything `get` copies out are created readable
   only by their owner (`0600`, folders `0700`; on Windows, an explicit
-  permission set for you and the system only, replacing whatever the folder
-  would pass on), so other local users can't even copy them to attack
+  permission set for you and the system only, in place from the moment the
+  file exists instead of what the folder would pass on), so other local
+  users can't even copy them to attack
   offline. Keyfiles that other users can read are refused, as ssh does with
   private keys, on every OS. (A drive without file permissions, such as a
   FAT-formatted USB stick, counts as readable by everyone on Windows; on
@@ -318,8 +323,10 @@ synced to the cloud).
 - Keys live in memory pages locked against swapping and are wiped
   (`zeroize`) when no longer needed. If the OS refuses to lock memory,
   nullguard says so. Argon2's working memory (from which the derived key
-  could otherwise be recomputed) and file names (whenever one is removed,
-  renamed or no longer needed, and all of them at unmount) are wiped too, but
+  could otherwise be recomputed) and the file names nullguard holds (in the
+  filesystem, its listings and the Windows drive's lookups; whenever one is
+  removed, renamed or no longer needed, and all of them at unmount) are
+  wiped too, but
   they are too large to lock, so they can reach unencrypted swap: use
   encrypted swap.
   Core dumps are disabled. On Linux the process is marked non-dumpable, which
@@ -342,8 +349,9 @@ synced to the cloud).
   redirect the copy elsewhere by swapping a folder for a link while it runs,
   and it refuses to copy into an existing folder that belongs to another
   user. On Windows `get` holds each destination folder open, so nobody can
-  rename or replace it while the copy runs, refuses links, and never
-  replaces a file through its short 8.3 alias (such as `REPORT~1.PDF`).
+  rename or replace it while the copy runs, refuses links and folders that
+  belong to another user, and never replaces a file through its short 8.3
+  alias (such as `REPORT~1.PDF`).
 - `put` copies regular files and folders only. Symbolic links, named pipes,
   sockets and devices are skipped, and every entry is opened without
   following links and checked once open, so a file swapped for a link (for

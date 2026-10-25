@@ -23,7 +23,7 @@ use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -40,7 +40,11 @@ use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6432KEY, RegGetValueW};
+use windows_sys::Win32::System::Console::{
+    CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler,
+};
 use windows_sys::Win32::System::Threading::{CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::MountOptions;
 use crate::vault::Error;
@@ -475,7 +479,7 @@ fn file_info(fs: &Fs, ino: u64) -> Res<FileInfo> {
 /// A vault entry's name as Windows sees it, or `None` if it is hidden on
 /// Windows: symbolic links, names that aren't valid UTF-8, and names
 /// Windows can't represent.
-fn windows_name(name: &[u8], kind: Kind) -> Option<Vec<u16>> {
+fn windows_name(name: &[u8], kind: Kind) -> Option<Zeroizing<Vec<u16>>> {
     if kind == Kind::Symlink {
         return None;
     }
@@ -484,7 +488,7 @@ fn windows_name(name: &[u8], kind: Kind) -> Option<Vec<u16>> {
     if s.chars().any(bad) || s.ends_with([' ', '.']) {
         return None;
     }
-    Some(s.encode_utf16().collect())
+    Some(Zeroizing::new(s.encode_utf16().collect()))
 }
 
 /// Split a WinFsp path (`\dir\file`) into its components.
@@ -515,17 +519,17 @@ fn lookup(fs: &Fs, parts: &[&str]) -> Res<u64> {
 }
 
 fn resolve(fs: &Fs, path: Wstr) -> Res<u64> {
-    let path = from_wide(path).ok_or(STATUS_OBJECT_NAME_INVALID)?;
+    let path = Zeroizing::new(from_wide(path).ok_or(STATUS_OBJECT_NAME_INVALID)?);
     lookup(fs, &components(&path)?)
 }
 
 /// The parent directory of `path` and the last component's name.
-fn parent_and_name(fs: &Fs, path: Wstr) -> Res<(u64, String)> {
-    let path = from_wide(path).ok_or(STATUS_OBJECT_NAME_INVALID)?;
+fn parent_and_name(fs: &Fs, path: Wstr) -> Res<(u64, Zeroizing<String>)> {
+    let path = Zeroizing::new(from_wide(path).ok_or(STATUS_OBJECT_NAME_INVALID)?);
     let parts = components(&path)?;
     let (name, dirs) = parts.split_last().ok_or(STATUS_ACCESS_DENIED)?; // the root itself
     let parent = lookup(fs, dirs).map_err(|_| STATUS_OBJECT_PATH_NOT_FOUND)?;
-    Ok((parent, (*name).to_owned()))
+    Ok((parent, Zeroizing::new((*name).to_owned())))
 }
 
 /// The request the current thread is serving, if it is an open ("Create").
@@ -566,7 +570,15 @@ unsafe fn open_request_from(req: *const u8, owner: &str) -> bool {
     // this process by WinFsp for the duration of the request.
     let handle = (token & 0xffff_ffff) as usize as HANDLE;
     // SAFETY: a token handle WinFsp opened for us (a bad one fails the call).
-    matches!(unsafe { crate::platform::win::token_user(handle) }, Ok(sid) if sid == owner)
+    if !matches!(unsafe { crate::platform::win::token_user(handle) }, Ok(sid) if sid == owner) {
+        return false;
+    }
+    // The owner's own sandboxed processes (low integrity, app containers,
+    // restricted tokens) are refused too. The drive's permissions keep them
+    // out of normal opens, but opens that ask for no access skip that check
+    // and would still tell them which names exist and how big files are.
+    // SAFETY: as above.
+    matches!(unsafe { crate::platform::win::token_is_sandboxed(handle) }, Ok(false))
 }
 
 /// Serve opens only for the user who mounted the vault.
@@ -919,7 +931,7 @@ extern "C" fn read_directory(
 ) -> NTSTATUS {
     shim(|| {
         let state = STATE.get().ok_or(STATUS_IO_DEVICE_ERROR)?;
-        let marker = from_wide(marker);
+        let marker = from_wide(marker).map(Zeroizing::new);
         let entries = run(|fs| {
             let ino = ino_of(ctx);
             let mut out = Vec::new();
@@ -951,7 +963,9 @@ extern "C" fn read_directory(
             d.name[..name.len()].copy_from_slice(&name);
             // SAFETY: `d` is a valid entry; `buf`, `len` and `pdone` are
             // WinFsp's own buffer bookkeeping, passed through unchanged.
-            if unsafe { (state.add_dir_info)(&mut d, buf, len, pdone) } == 0 {
+            let added = unsafe { (state.add_dir_info)(&mut d, buf, len, pdone) };
+            d.name.zeroize(); // file names are secret: no copies left behind
+            if added == 0 {
                 return Ok(()); // buffer full: WinFsp asks again from the last name
             }
         }
@@ -1039,19 +1053,67 @@ pub fn mount(fs: Fs, mountpoint: &Path, opts: &MountOptions) -> Result<(), Error
         return Err(Error::Usage("a vault is already mounted by this process".into()));
     }
     let state = STATE.get().expect("just set");
+    // SAFETY: an unnamed manual-reset event, never closed (see `console_event`).
+    let locked = unsafe { CreateEventW(null(), 1, 0, null()) };
+    LOCKED_EVENT.store(locked as usize, Ordering::SeqCst);
     let result = serve(&api, letter, opts);
     // Unmounted (or failed to mount): commit, then drop the filesystem,
     // which wipes its keys.
-    let fs = state.fs.lock().ok().and_then(|mut g| g.take());
-    if state.broken.load(Ordering::SeqCst) {
-        return Err(Error::Corrupt("an internal error occurred; the last changes were not committed".into()));
+    let outcome = (|| {
+        let fs = state.fs.lock().ok().and_then(|mut g| g.take());
+        if state.broken.load(Ordering::SeqCst) {
+            return Err(Error::Corrupt("an internal error occurred; the last changes were not committed".into()));
+        }
+        let commit = match fs {
+            Some(mut fs) => fs.commit(),
+            None => Err(Error::Corrupt("internal error; the last changes were not committed".into())),
+        };
+        result?;
+        commit
+    })();
+    // A console-close handler may be waiting for this before Windows ends
+    // the process.
+    if !locked.is_null() {
+        // SAFETY: the event created above.
+        unsafe { SetEvent(locked) };
     }
-    let commit = match fs {
-        Some(mut fs) => fs.commit(),
-        None => Err(Error::Corrupt("internal error; the last changes were not committed".into())),
-    };
-    result?;
-    commit
+    outcome
+}
+
+/// The event that makes the mount loop unmount (`serve`), and the event set
+/// once the vault is committed and locked (`mount`), for `console_event`.
+static UNMOUNT_EVENT: AtomicUsize = AtomicUsize::new(0);
+static LOCKED_EVENT: AtomicUsize = AtomicUsize::new(0);
+
+/// How long a console-close handler waits for the vault to be committed and
+/// locked. Windows ends the process about 5 seconds after closing the
+/// console (or at logoff and shutdown) at the latest.
+const CLOSE_WAIT_MS: u32 = 4500;
+
+/// Console control handler: Ctrl-C, Ctrl-Break, closing the console window,
+/// logoff and shutdown all unmount.
+///
+/// For the last three, Windows ends the process as soon as the handler
+/// returns, so it waits (within the time Windows allows) until the vault has
+/// been committed and locked. Returning right away, as a plain Ctrl-C
+/// handler does, would lose the changes made since the last commit.
+unsafe extern "system" fn console_event(kind: u32) -> windows_sys::core::BOOL {
+    let unmount = UNMOUNT_EVENT.load(Ordering::SeqCst);
+    if unmount == 0 {
+        return 0; // not serving: let Windows handle it as usual
+    }
+    eprintln!("\nnullguard: unmounting...");
+    // SAFETY: the events stay open until the process exits.
+    unsafe {
+        SetEvent(unmount as HANDLE);
+        if matches!(kind, CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
+            let locked = LOCKED_EVENT.load(Ordering::SeqCst);
+            if locked != 0 {
+                WaitForSingleObject(locked as HANDLE, CLOSE_WAIT_MS);
+            }
+        }
+    }
+    1
 }
 
 fn serve(api: &Api, letter: char, opts: &MountOptions) -> Result<(), Error> {
@@ -1134,15 +1196,10 @@ fn serve(api: &Api, letter: char, opts: &MountOptions) -> Result<(), Error> {
     }
 
     // Ctrl-C, closing the console window, logoff and shutdown all unmount.
-    let event_addr = event as usize;
-    if ctrlc::set_handler(move || {
-        eprintln!("\nnullguard: unmounting...");
-        // SAFETY: the event outlives this handler (closed only after the
-        // wait loop below has ended).
-        unsafe { SetEvent(event_addr as HANDLE) };
-    })
-    .is_err()
-    {
+    UNMOUNT_EVENT.store(event as usize, Ordering::SeqCst);
+    // SAFETY: registers a handler that only uses the two events above,
+    // which stay open until the process exits.
+    if unsafe { SetConsoleCtrlHandler(Some(console_event), 1) } == 0 {
         eprintln!("nullguard: WARNING: could not install the Ctrl-C handler; use `nullguard unmount` to lock the vault");
     }
 
@@ -1235,7 +1292,7 @@ mod tests {
 
     #[test]
     fn names_windows_cannot_show_are_hidden() {
-        assert_eq!(windows_name(b"report.pdf", Kind::File), Some("report.pdf".encode_utf16().collect()));
+        assert_eq!(windows_name(b"report.pdf", Kind::File).map(|n| n.to_vec()), Some("report.pdf".encode_utf16().collect()));
         assert!(windows_name("ünïcødé".as_bytes(), Kind::Dir).is_some());
         for bad in [&b"a:b"[..], b"a\\b", b"what?", b"x*", b"tab\t", b"trailing.", b"trailing ", b"\xff\xfe"] {
             assert_eq!(windows_name(bad, Kind::File), None, "{bad:?}");
@@ -1317,10 +1374,57 @@ mod tests {
             assert!(!open_request_from(open_request(anonymous, true).as_ptr(), &me), "another user was served");
 
             assert!(!open_request_from(open_request(0x1234 as HANDLE, true).as_ptr(), &me), "a bad token was accepted");
+            // The same user in a low-integrity sandbox is refused too.
+            let low = crate::platform::win::low_integrity_token();
+            assert!(!open_request_from(open_request(low, true).as_ptr(), &me), "a sandboxed process was served");
+            CloseHandle(low);
             // Kernel-mode requests (from drivers) carry no user to check.
             assert!(open_request_from(open_request(anonymous, false).as_ptr(), &me));
             CloseHandle(mine);
             CloseHandle(anonymous);
+        }
+    }
+
+    /// Closing the console (or logoff, shutdown) makes the handler wait
+    /// until the vault is committed and locked, because Windows ends the
+    /// process as soon as it returns. Ctrl-C returns at once.
+    #[test]
+    fn console_close_waits_for_the_vault_to_be_locked() {
+        use windows_sys::Win32::System::Console::CTRL_C_EVENT;
+        use windows_sys::Win32::System::Threading::ResetEvent;
+        // SAFETY: two unnamed events, closed at the end; the handler is
+        // called directly, as Windows would on its own thread.
+        unsafe {
+            let unmount = CreateEventW(null(), 1, 0, null());
+            let locked = CreateEventW(null(), 1, 0, null());
+            UNMOUNT_EVENT.store(unmount as usize, Ordering::SeqCst);
+            LOCKED_EVENT.store(locked as usize, Ordering::SeqCst);
+            // The "mount loop": once asked to unmount, it takes a moment to
+            // commit, then reports the vault locked.
+            let (u, l) = (unmount as usize, locked as usize);
+            let worker = std::thread::spawn(move || {
+                WaitForSingleObject(u as HANDLE, 10_000);
+                std::thread::sleep(Duration::from_millis(300));
+                SetEvent(l as HANDLE);
+            });
+            let started = std::time::Instant::now();
+            assert_eq!(console_event(CTRL_CLOSE_EVENT), 1);
+            assert!(started.elapsed() >= Duration::from_millis(250), "returned before the vault was locked");
+            assert_eq!(WaitForSingleObject(unmount, 0), WAIT_OBJECT_0, "unmount was not requested");
+            worker.join().unwrap();
+
+            ResetEvent(unmount);
+            ResetEvent(locked);
+            let started = std::time::Instant::now();
+            assert_eq!(console_event(CTRL_C_EVENT), 1);
+            assert!(started.elapsed() < Duration::from_millis(250), "Ctrl-C waited");
+            assert_eq!(WaitForSingleObject(unmount, 0), WAIT_OBJECT_0);
+
+            UNMOUNT_EVENT.store(0, Ordering::SeqCst);
+            LOCKED_EVENT.store(0, Ordering::SeqCst);
+            assert_eq!(console_event(CTRL_C_EVENT), 0, "handled while not mounted");
+            CloseHandle(unmount);
+            CloseHandle(locked);
         }
     }
 
