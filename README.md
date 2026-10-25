@@ -27,6 +27,9 @@ and it's an opaque blob that detects any tampering.
 > deliberately small and heavily tested, but please keep backups and treat
 > it as new software until it has had outside review.
 
+> **Built with AI.** nullguard was implemented primarily by artificial
+> intelligence, with human direction and review.
+
 ---
 
 ## Contents
