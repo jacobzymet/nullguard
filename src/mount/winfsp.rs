@@ -35,17 +35,12 @@ use windows_sys::Win32::Foundation::{
     STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS,
     WAIT_OBJECT_0,
 };
-use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6432KEY, RegGetValueW};
-use windows_sys::Win32::System::Threading::{
-    CreateEventW, EVENT_MODIFY_STATE, GetCurrentProcess, OpenEventW, OpenProcessToken, SetEvent, WaitForSingleObject,
-};
+use windows_sys::Win32::System::Threading::{CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject};
 
 use super::MountOptions;
 use crate::vault::Error;
@@ -182,6 +177,24 @@ type SetMountPointFn = unsafe extern "C" fn(FspFs, *const u16) -> NTSTATUS;
 type StartDispatcherFn = unsafe extern "C" fn(FspFs, u32) -> NTSTATUS;
 type StopDispatcherFn = unsafe extern "C" fn(FspFs);
 type AddDirInfoFn = unsafe extern "C" fn(*mut DirInfo, *mut c_void, u32, *mut u32) -> u8;
+type GetOperationContextFn = unsafe extern "C" fn() -> *const OperationContext;
+
+/// `FSP_FILE_SYSTEM_OPERATION_CONTEXT`: the request the current thread is
+/// serving.
+#[repr(C)]
+struct OperationContext {
+    request: *const u8,
+    response: *const u8,
+}
+
+// Offsets in `FSP_FSCTL_TRANSACT_REQ` (fsctl.h): the request's size and
+// kind, and for an open ("Create") request the requester's access token
+// and the flags word whose lowest bit says the request came from user mode.
+const REQ_SIZE: usize = 2;
+const REQ_KIND: usize = 4;
+const REQ_CREATE_TOKEN: usize = 40;
+const REQ_CREATE_FLAGS: usize = 64;
+const CREATE_KIND: u32 = 1;
 
 struct Api {
     create: CreateFn,
@@ -190,6 +203,7 @@ struct Api {
     start_dispatcher: StartDispatcherFn,
     stop_dispatcher: StopDispatcherFn,
     add_dir_info: AddDirInfoFn,
+    get_operation_context: GetOperationContextFn,
 }
 
 impl Api {
@@ -226,6 +240,9 @@ impl Api {
                 )?),
                 stop_dispatcher: std::mem::transmute::<RawFn, StopDispatcherFn>(sym(b"FspFileSystemStopDispatcher\0")?),
                 add_dir_info: std::mem::transmute::<RawFn, AddDirInfoFn>(sym(b"FspFileSystemAddDirInfo\0")?),
+                get_operation_context: std::mem::transmute::<RawFn, GetOperationContextFn>(sym(
+                    b"FspFileSystemGetOperationContext\0",
+                )?),
             })
         }
     }
@@ -258,31 +275,10 @@ fn winfsp_install_dir() -> Option<PathBuf> {
 
 /// A security descriptor that gives the current user full access and
 /// nobody else (not other users, not administrators' normal access) any.
-fn user_only_security_descriptor() -> Result<Vec<u8>, Error> {
+fn user_only_security_descriptor(sid: &str) -> Result<Vec<u8>, Error> {
     let fail = |what: &str| Error::Io(std::io::Error::other(format!("{what}: {}", std::io::Error::last_os_error())));
-    // SAFETY: standard token query of our own process; every out-pointer
-    // is valid, and the buffers are sized as Windows reports.
+    // SAFETY: a valid SDDL string; the descriptor is copied out and freed.
     unsafe {
-        let mut token: HANDLE = null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return Err(fail("reading the current user"));
-        }
-        let mut len = 0u32;
-        GetTokenInformation(token, TokenUser, null_mut(), 0, &mut len);
-        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
-        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
-        CloseHandle(token);
-        if ok == 0 {
-            return Err(fail("reading the current user"));
-        }
-        let user = &*(buf.as_ptr() as *const TOKEN_USER);
-        let mut sid_str: *mut u16 = null_mut();
-        if ConvertSidToStringSidW(user.User.Sid, &mut sid_str) == 0 {
-            return Err(fail("reading the current user"));
-        }
-        let sid = from_wide(sid_str);
-        LocalFree(sid_str.cast());
-        let sid = sid.ok_or_else(|| fail("reading the current user"))?;
         // Owner and group: the user. DACL: protected (nothing inherited),
         // one entry: the user, full access. Integrity label: medium, with
         // no-read-up, no-write-up and no-execute-up, so sandboxed
@@ -305,6 +301,9 @@ fn user_only_security_descriptor() -> Result<Vec<u8>, Error> {
 // ----------------------------------------------------------------------
 
 struct State {
+    /// The mounting user (SID string): the only user whose opens are served.
+    owner_sid: String,
+    get_operation_context: GetOperationContextFn,
     /// `None` once unmounted (the `Fs` is taken out, committed and dropped,
     /// which wipes its keys).
     fs: Mutex<Option<Fs>>,
@@ -529,6 +528,63 @@ fn parent_and_name(fs: &Fs, path: Wstr) -> Res<(u64, String)> {
     Ok((parent, (*name).to_owned()))
 }
 
+/// The request the current thread is serving, if it is an open ("Create").
+fn current_open_request(state: &State) -> Option<*const u8> {
+    // SAFETY: WinFsp's thread-local context of the operation being served
+    // (null outside one); its request holds at least the fixed header.
+    unsafe {
+        let ctx = (state.get_operation_context)();
+        if ctx.is_null() || (*ctx).request.is_null() {
+            return None;
+        }
+        let req = (*ctx).request;
+        let kind = std::ptr::read_unaligned(req.add(REQ_KIND).cast::<u32>());
+        let size = std::ptr::read_unaligned(req.add(REQ_SIZE).cast::<u16>()) as usize;
+        (kind == CREATE_KIND && size >= REQ_CREATE_FLAGS + 4).then_some(req)
+    }
+}
+
+/// Whether an open request comes from the user `owner` (a SID string).
+///
+/// Requests from kernel mode come from drivers, not from users, and WinFsp
+/// itself skips its access checks for them; they are allowed.
+///
+/// # Safety
+/// `req` must point to a WinFsp Create request (`current_open_request`).
+unsafe fn open_request_from(req: *const u8, owner: &str) -> bool {
+    // SAFETY: both fields lie within a Create request (caller).
+    let (flags, token) = unsafe {
+        (
+            std::ptr::read_unaligned(req.add(REQ_CREATE_FLAGS).cast::<u32>()),
+            std::ptr::read_unaligned(req.add(REQ_CREATE_TOKEN).cast::<u64>()),
+        )
+    };
+    if flags & 1 == 0 {
+        return true;
+    }
+    // The low 32 bits are a handle to the requester's token, duplicated into
+    // this process by WinFsp for the duration of the request.
+    let handle = (token & 0xffff_ffff) as usize as HANDLE;
+    // SAFETY: a token handle WinFsp opened for us (a bad one fails the call).
+    matches!(unsafe { crate::platform::win::token_user(handle) }, Ok(sid) if sid == owner)
+}
+
+/// Serve opens only for the user who mounted the vault.
+///
+/// WinFsp lets any local user open paths on the drive's device, and it
+/// skips the permission check for opens that ask for no access. Without
+/// this, another user could learn which names exist in the vault (a
+/// missing name fails differently) and see files' sizes. Every open from
+/// another user is refused the same way, whether or not the name exists.
+fn check_caller() -> Res<()> {
+    let state = STATE.get().ok_or(STATUS_IO_DEVICE_ERROR)?;
+    match current_open_request(state) {
+        // SAFETY: a Create request, as `current_open_request` checked.
+        Some(req) if unsafe { open_request_from(req, &state.owner_sid) } => Ok(()),
+        _ => Err(STATUS_ACCESS_DENIED),
+    }
+}
+
 fn copy_security(sd: *mut c_void, psize: *mut usize) -> Res<()> {
     let state = STATE.get().ok_or(STATUS_IO_DEVICE_ERROR)?;
     let len = state.security.len();
@@ -582,6 +638,12 @@ extern "C" fn get_security_by_name(
     psize: *mut usize,
 ) -> NTSTATUS {
     shim(|| {
+        // Also asked outside opens (to check a rename's target, on a handle
+        // the caller already has): only opens need the caller check.
+        let state = STATE.get().ok_or(STATUS_IO_DEVICE_ERROR)?;
+        if current_open_request(state).is_some() {
+            check_caller()?;
+        }
         let attrs = run(|fs| {
             let ino = resolve(fs, name)?;
             Ok(attributes(&fs.attr(ino).st()?))
@@ -604,6 +666,7 @@ extern "C" fn create(
     pinfo: *mut FileInfo,
 ) -> NTSTATUS {
     shim(|| {
+        check_caller()?;
         let (ino, info) = run(|fs| {
             let (parent, n) = parent_and_name(fs, name)?;
             let ino = if options & FILE_DIRECTORY_FILE != 0 {
@@ -630,6 +693,7 @@ extern "C" fn open(
     pinfo: *mut FileInfo,
 ) -> NTSTATUS {
     shim(|| {
+        check_caller()?;
         let (ino, info) = run(|fs| {
             let ino = resolve(fs, name)?;
             fs.open_file(ino).st()?;
@@ -962,10 +1026,13 @@ pub fn mount(fs: Fs, mountpoint: &Path, opts: &MountOptions) -> Result<(), Error
     check_mountpoint(mountpoint)?;
     let letter = drive_letter(mountpoint).expect("checked above");
     let api = Api::load()?;
+    let owner_sid = crate::platform::win::current_user_sid()?;
     let state = State {
         fs: Mutex::new(Some(fs)),
         broken: AtomicBool::new(false),
-        security: user_only_security_descriptor()?,
+        security: user_only_security_descriptor(&owner_sid)?,
+        owner_sid,
+        get_operation_context: api.get_operation_context,
         add_dir_info: api.add_dir_info,
     };
     if STATE.set(state).is_err() {
@@ -1190,7 +1257,7 @@ mod tests {
         use windows_sys::Win32::Security::{
             DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
         };
-        let sd = user_only_security_descriptor().unwrap();
+        let sd = user_only_security_descriptor(&crate::platform::win::current_user_sid().unwrap()).unwrap();
         let mut text: *mut u16 = null_mut();
         let what = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
         // SAFETY: a valid self-relative descriptor; the string is freed below.
@@ -1215,6 +1282,46 @@ mod tests {
         // ...and low-integrity processes can't read, write or run anything.
         let label = sddl.split("S:").nth(1).expect("an integrity label");
         assert!(label.contains(";;;ME)") && ["NR", "NW", "NX"].iter().all(|f| label.contains(f)), "{sddl}");
+    }
+
+    /// A fake WinFsp open request carrying `token`.
+    fn open_request(token: HANDLE, user_mode: bool) -> Vec<u8> {
+        let mut req = vec![0u8; 128];
+        req[REQ_SIZE..REQ_SIZE + 2].copy_from_slice(&128u16.to_le_bytes());
+        req[REQ_KIND..REQ_KIND + 4].copy_from_slice(&CREATE_KIND.to_le_bytes());
+        req[REQ_CREATE_TOKEN..REQ_CREATE_TOKEN + 8].copy_from_slice(&(token as usize as u64).to_le_bytes());
+        req[REQ_CREATE_FLAGS..REQ_CREATE_FLAGS + 4].copy_from_slice(&(user_mode as u32).to_le_bytes());
+        req
+    }
+
+    /// Opens are served for the mounting user only: another user's token
+    /// (here the anonymous logon's) is refused, and so is a bad handle.
+    #[test]
+    fn only_the_mounting_user_is_served() {
+        use windows_sys::Win32::Security::{ImpersonateAnonymousToken, RevertToSelf, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken};
+        let me = crate::platform::win::current_user_sid().unwrap();
+        // SAFETY: token handles of this process and thread, closed below;
+        // the impersonation is undone before anything else runs here.
+        unsafe {
+            let mut mine: HANDLE = null_mut();
+            assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut mine), 0);
+            assert!(open_request_from(open_request(mine, true).as_ptr(), &me));
+
+            assert_ne!(ImpersonateAnonymousToken(GetCurrentThread()), 0);
+            let mut anonymous: HANDLE = null_mut();
+            let opened = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut anonymous);
+            assert_ne!(RevertToSelf(), 0);
+            assert_ne!(opened, 0);
+            assert_eq!(crate::platform::win::token_user(anonymous).unwrap(), "S-1-5-7");
+            assert!(!open_request_from(open_request(anonymous, true).as_ptr(), &me), "another user was served");
+
+            assert!(!open_request_from(open_request(0x1234 as HANDLE, true).as_ptr(), &me), "a bad token was accepted");
+            // Kernel-mode requests (from drivers) carry no user to check.
+            assert!(open_request_from(open_request(anonymous, false).as_ptr(), &me));
+            CloseHandle(mine);
+            CloseHandle(anonymous);
+        }
     }
 
     #[test]

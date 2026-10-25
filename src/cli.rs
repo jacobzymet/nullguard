@@ -1,6 +1,7 @@
 //! The `nullguard` command line.
 
 use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -351,8 +352,17 @@ fn check_keyfile_permissions(path: &Path, file: &std::fs::File) -> Result<()> {
             );
         }
     }
-    #[cfg(not(unix))]
-    let _ = (path, file);
+    #[cfg(windows)]
+    if crate::platform::win::readable_by_others(file).with_context(|| format!("checking {}", path.display()))? {
+        bail!(
+            "keyfile {} is readable by other users of this computer; refusing to use it. Keep it in a \
+             folder only you can read (a drive without file permissions, such as a FAT-formatted USB \
+             stick, counts as readable by everyone), or fix it with: \
+             icacls \"{}\" /inheritance:r /grant:r \"%USERNAME%:F\"",
+            path.display(),
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -418,7 +428,8 @@ fn human(n: u64) -> String {
     if u == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[u]) }
 }
 
-/// Create a file that only the current user can read (unix: mode 0600).
+/// Create a file that only the current user can read (unix: mode 0600;
+/// Windows: an explicit owner-only permission set).
 ///
 /// Never writes *through* a symlink at `path`. With `overwrite`, an existing
 /// regular file is replaced by a new private one (rather than truncated in
@@ -429,17 +440,43 @@ fn create_private(path: &Path, overwrite: bool) -> io::Result<std::fs::File> {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "refusing to write through a symbolic link"));
         }
         if overwrite && meta.is_file() {
+            #[cfg(windows)]
+            if let Some(name) = path.file_name() {
+                check_real_name(path, name)?;
+            }
             std::fs::remove_file(path)?;
         }
     }
-    let mut o = OpenOptions::new();
-    o.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
+        OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
     }
-    o.open(path)
+    #[cfg(windows)]
+    {
+        crate::platform::win::create_private_file(path)
+    }
+}
+
+/// Windows also knows most files by a short 8.3 alias (`REPORT~1.PDF` for
+/// `report final.pdf`). Before replacing or merging into an existing entry,
+/// make sure `name` is its real name, not another file's alias: a vault
+/// entry named like an alias must never clobber an unrelated local file.
+#[cfg(windows)]
+fn check_real_name(path: &Path, name: &OsStr) -> io::Result<()> {
+    let real = std::fs::canonicalize(path)?;
+    let fold = |s: &OsStr| s.to_string_lossy().to_lowercase();
+    if real.file_name().map(fold) == Some(fold(name)) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "refusing to replace {}: on this drive that name is a short alias of another file ({})",
+            display_path(path),
+            display_path(&real)
+        ),
+    ))
 }
 
 pub fn run() -> Result<()> {
@@ -849,27 +886,125 @@ fn windows_reserved(name: &str) -> bool {
         && matches!(rest[0], '1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}')
 }
 
-fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool, depth: usize) -> Result<u64> {
-    check_depth(depth)?;
-    let meta = std::fs::symlink_metadata(src).with_context(|| format!("reading {}", src.display()))?;
-    if meta.is_dir() {
-        let dir = match fs.lookup(parent, name) {
-            Ok(ino) if fs.attr(ino)?.kind == Kind::Dir => ino,
-            Ok(_) => bail!("{} exists in the vault and is not a directory", display_name(name)),
-            Err(_) => fs.mkdir(parent, name, 0o700)?,
-        };
-        let mut n = 0;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let child = entry.file_name();
-            n += import(fs, &entry.path(), dir, child.to_string_lossy().as_bytes(), force, depth + 1)?;
-        }
-        return Ok(n);
+/// Why a local entry of this type isn't copied by `put`, if it isn't.
+fn skipped_kind(t: &std::fs::FileType) -> Option<&'static str> {
+    if t.is_symlink() {
+        Some("a symbolic link")
+    } else if t.is_dir() || t.is_file() {
+        None
+    } else {
+        Some("not a regular file") // named pipes, sockets, devices
     }
-    if meta.file_type().is_symlink() {
-        eprintln!("skipping symlink {}", src.display());
+}
+
+/// Open a local file or folder for `put` without following a link: on
+/// Linux and macOS a link fails to open (and a named pipe opens without
+/// waiting for a writer); on Windows a link opens as itself. What was
+/// opened is checked afterwards (`import_open`).
+fn open_source(path: &Path, is_dir: bool) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = is_dir;
+        OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
+    }
+    #[cfg(windows)]
+    {
+        // A folder is held open so nobody can swap it while it is copied.
+        if is_dir { crate::platform::win::open_dir(path, true) } else { crate::platform::win::open_no_follow(path) }
+    }
+}
+
+/// Copy the local file or folder `src` into the vault as `parent/name`.
+///
+/// Only regular files and folders are copied; symbolic links, named pipes,
+/// sockets and devices are skipped. Every entry is opened without following
+/// links and checked once open, so an entry swapped for a link (or a pipe)
+/// while the copy runs is never read through. On Linux and macOS, folders
+/// are listed and entered through their open handles; on Windows, each
+/// folder on the way is held open, so it can't be swapped.
+fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool, depth: usize) -> Result<u64> {
+    let meta = std::fs::symlink_metadata(src).with_context(|| format!("reading {}", src.display()))?;
+    if let Some(why) = skipped_kind(&meta.file_type()) {
+        eprintln!("skipping {} ({why})", src.display());
         return Ok(0);
     }
+    let handle = open_source(src, meta.is_dir()).with_context(|| format!("opening {}", src.display()))?;
+    import_open(fs, handle, src, parent, name, force, depth)
+}
+
+/// [`import`] for an entry that is already open: copy what was opened.
+fn import_open(
+    fs: &mut Fs,
+    handle: std::fs::File,
+    shown: &Path,
+    parent: u64,
+    name: &[u8],
+    force: bool,
+    depth: usize,
+) -> Result<u64> {
+    check_depth(depth)?;
+    let meta = handle.metadata().with_context(|| format!("reading {}", shown.display()))?;
+    if let Some(why) = skipped_kind(&meta.file_type()) {
+        eprintln!("skipping {} ({why})", shown.display());
+        return Ok(0);
+    }
+    if meta.is_file() {
+        return import_file(fs, handle, &meta, shown, parent, name, force);
+    }
+    let dir = match fs.lookup(parent, name) {
+        Ok(ino) if fs.attr(ino)?.kind == Kind::Dir => ino,
+        Ok(_) => bail!("{} exists in the vault and is not a directory", display_name(name)),
+        Err(_) => fs.mkdir(parent, name, 0o700)?,
+    };
+    let mut n = 0;
+    #[cfg(unix)]
+    {
+        use crate::platform::at::{self, Entry};
+        let listing = || format!("listing {}", shown.display());
+        for child in at::list(&handle).with_context(listing)? {
+            let path = shown.join(&child);
+            match at::entry(&handle, &child).with_context(listing)? {
+                Entry::Missing => continue, // removed meanwhile
+                Entry::Symlink => eprintln!("skipping {} (a symbolic link)", path.display()),
+                Entry::Other => eprintln!("skipping {} (not a regular file)", path.display()),
+                Entry::File | Entry::Dir => {
+                    let h = at::open_read(&handle, &child).with_context(|| format!("opening {}", path.display()))?;
+                    n += import_open(fs, h, &path, dir, child.to_string_lossy().as_bytes(), force, depth + 1)?;
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // `handle` holds this folder (and the callers hold its parents), so
+        // the path still names the folder that was checked.
+        for entry in std::fs::read_dir(shown).with_context(|| format!("listing {}", shown.display()))? {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if let Some(why) = skipped_kind(&kind) {
+                eprintln!("skipping {} ({why})", path.display());
+                continue;
+            }
+            let h = open_source(&path, kind.is_dir()).with_context(|| format!("opening {}", path.display()))?;
+            let child = entry.file_name();
+            n += import_open(fs, h, &path, dir, child.to_string_lossy().as_bytes(), force, depth + 1)?;
+        }
+    }
+    Ok(n)
+}
+
+/// Copy an open regular file into the vault as `parent/name`.
+fn import_file(
+    fs: &mut Fs,
+    mut f: std::fs::File,
+    meta: &std::fs::Metadata,
+    shown: &Path,
+    parent: u64,
+    name: &[u8],
+    force: bool,
+) -> Result<u64> {
     if let Ok(existing) = fs.lookup(parent, name) {
         if !force {
             bail!("{} already exists in the vault (use --force to overwrite)", display_name(name));
@@ -879,7 +1014,6 @@ fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool, depth:
         }
         fs.unlink(parent, name)?;
     }
-    let mut f = std::fs::File::open(src).with_context(|| format!("opening {}", src.display()))?;
     let ino = fs.create_file(parent, name, 0o600)?;
     let copy = (|| -> Result<()> {
         let mut buf = Zeroizing::new(vec![0u8; COPY_BUF]);
@@ -900,7 +1034,7 @@ fn import(fs: &mut Fs, src: &Path, parent: u64, name: &[u8], force: bool, depth:
     if let Err(e) = copy {
         // Don't leave a truncated file behind in the vault.
         let _ = fs.unlink(parent, name);
-        return Err(e.context(format!("copying {}", src.display())));
+        return Err(e.context(format!("copying {}", shown.display())));
     }
     Ok(1)
 }
@@ -928,11 +1062,11 @@ fn split_dest(dest: &Path) -> Result<(PathBuf, OsString)> {
 /// created relative to that handle without following symbolic links. So
 /// nobody can redirect the copy elsewhere (for example into another of
 /// your folders) by swapping a folder for a link while it runs. Existing
-/// folders the copy merges into must belong to you. On Windows, names are
-/// checked by path right before each use.
+/// folders the copy merges into must belong to you. On Windows the folder
+/// is held open so it can't be renamed or replaced meanwhile, links are
+/// refused when opened, and new files and folders are made private.
 struct LocalDir {
     path: PathBuf,
-    #[cfg(unix)]
     handle: std::fs::File,
 }
 
@@ -946,11 +1080,9 @@ impl LocalDir {
         }
         #[cfg(unix)]
         let handle = std::fs::File::open(path).with_context(what)?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            #[cfg(unix)]
-            handle,
-        })
+        #[cfg(windows)]
+        let handle = crate::platform::win::open_dir(path, false).with_context(what)?;
+        Ok(Self { path: path.to_path_buf(), handle })
     }
 
     fn path_of(&self, name: &OsStr) -> PathBuf {
@@ -987,16 +1119,24 @@ impl LocalDir {
             }
             Ok(Self { path, handle })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            match std::fs::symlink_metadata(&path) {
+            use crate::platform::win;
+            let _ = &self.handle; // holds this folder while its children are used
+            let handle = match std::fs::symlink_metadata(&path) {
                 Ok(m) if m.file_type().is_symlink() => return Err(a_link()),
                 Ok(m) if !m.is_dir() => return Err(not_a_dir()),
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => std::fs::create_dir(&path).with_context(creating)?,
+                // Opening refuses a link that replaced the folder meanwhile.
+                Ok(_) => {
+                    let h = win::open_dir(&path, true).with_context(|| format!("opening {}", display_path(&path)))?;
+                    check_real_name(&path, name)?;
+                    h
+                }
+                // Plaintext file names inside: only you may list it.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => win::create_private_dir(&path).with_context(creating)?,
                 Err(e) => return Err(e).with_context(creating),
-            }
-            Ok(Self { path })
+            };
+            Ok(Self { path, handle })
         }
     }
 
@@ -1016,7 +1156,7 @@ impl LocalDir {
             }
             at::create_file(&self.handle, name, 0o600)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
             create_private(&self.path_of(name), overwrite)
         }
@@ -1027,7 +1167,7 @@ impl LocalDir {
         {
             crate::platform::at::remove_file(&self.handle, name)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
             std::fs::remove_file(self.path_of(name))
         }

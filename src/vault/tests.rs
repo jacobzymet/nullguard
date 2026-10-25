@@ -494,6 +494,20 @@ fn vault_file_is_private() {
     assert_eq!(mode & 0o077, 0, "vault must not be readable by other users: {mode:o}");
 }
 
+/// Windows has no mode bits: the vault gets an explicit permission set for
+/// the owner (and SYSTEM) only, replacing what the folder would pass on.
+#[cfg(windows)]
+#[test]
+fn vault_file_is_private() {
+    let t = new_vault();
+    let me = crate::platform::win::current_user_sid().unwrap();
+    let f = File::open(&t.path).unwrap();
+    // Protected ("P"; Windows may add "AI", auto-inherited bookkeeping),
+    // with exactly these two entries.
+    let sddl = crate::platform::win::permissions_sddl(&f).unwrap().replacen("D:PAI(", "D:P(", 1);
+    assert_eq!(sddl, format!("D:P(A;;FA;;;{me})(A;;FA;;;SY)"));
+}
+
 #[test]
 fn torn_superblock_falls_back_with_warning() {
     let t = new_vault();

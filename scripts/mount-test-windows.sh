@@ -6,6 +6,7 @@
 set -euo pipefail
 
 NG=$(realpath "${1:?usage: $0 path/to/nullguard.exe [drive letter]}")
+HERE=$(cd "$(dirname "$0")" && pwd -W)
 D="${2:-N}:"
 WORK=$(mktemp -d)
 PW="correct horse battery staple"
@@ -60,6 +61,13 @@ powershell -NoProfile -Command "
   if (\$who -ne \$me) { throw \"access rule is for \$who, not \$me\" }
   if (\$acl.GetOwner([System.Security.Principal.SecurityIdentifier]) -ne \$me) { throw 'wrong owner' }
 "
+
+echo "== isolation: other local users can't open anything or probe names"
+if net session >/dev/null 2>&1; then
+  powershell -NoProfile -ExecutionPolicy Bypass -File "$HERE/winfsp-other-user.ps1" -Drive "$D"
+else
+  echo "(skipped: needs an administrator to create a second user)"
+fi
 
 echo "== refuses a drive letter that is in use"
 if printf '%s\n' "$PW" | "$NG" mount v.ngv "$D" --password-stdin 2> err.log; then echo "mounted twice"; exit 1; fi

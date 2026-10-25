@@ -390,6 +390,132 @@ fn get_never_follows_links_inside_the_destination() {
     assert_eq!(std::fs::read(out.join("src").join("sub").join("secret.txt")).unwrap(), b"plaintext");
 }
 
+/// `put` copies regular files and folders only: links (to files or to
+/// folders) are skipped rather than followed, and a named pipe is skipped
+/// rather than read (which would hang until something writes to it).
+#[test]
+fn put_skips_links_and_special_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    // Private files outside the folder being copied.
+    let private = dir.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::write(private.join("id_key"), b"SECRET").unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("normal.txt"), b"normal").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(private.join("id_key"), src.join("file-link")).unwrap();
+        std::os::unix::fs::symlink(&private, src.join("dir-link")).unwrap();
+        let made = Command::new("mkfifo").arg(src.join("pipe")).status().unwrap();
+        assert!(made.success());
+    }
+    #[cfg(windows)]
+    {
+        // A directory junction needs no special rights to create.
+        let made = Command::new("cmd")
+            .args(["/C", "mklink", "/J", s(&src.join("dir-link")), s(&private)])
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+    }
+    let out = ng(&["put", v, s(&src), "/", "--password-stdin"], &format!("{PW}\n"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("skipping") && err.contains("dir-link"), "{err}");
+    let listing = ok(&["ls", v, "/src", "--password-stdin"], &format!("{PW}\n"));
+    assert!(listing.contains("normal.txt"), "{listing}");
+    for absent in ["file-link", "dir-link", "pipe", "id_key"] {
+        assert!(!listing.contains(absent), "{absent} was copied: {listing}");
+    }
+}
+
+/// The exact permissions of a local file or folder (Windows).
+#[cfg(windows)]
+fn permissions(path: &Path) -> String {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_BACKUP_SEMANTICS, to open folders too.
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(0x0200_0000).open(path).unwrap();
+    // "AI" (auto-inherited) is bookkeeping Windows may add; it grants nothing.
+    nullguard::platform::win::permissions_sddl(&f).unwrap().replacen("D:PAI(", "D:P(", 1)
+}
+
+/// On Windows, everything nullguard creates (vaults, keyfiles, files and
+/// folders copied out) is private like mode 0600/0700 on unix, and keyfiles
+/// other users can read are refused.
+#[cfg(windows)]
+#[test]
+fn windows_files_are_private_and_shared_keyfiles_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    let me = nullguard::platform::win::current_user_sid().unwrap();
+    let private = format!("D:P(A;;FA;;;{me})(A;;FA;;;SY)");
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}
+"));
+    let key = dir.path().join("k");
+    ok(&["keygen", s(&key)], "");
+    ok(&["mkdir", v, "/folder", "--password-stdin"], &format!("{PW}
+"));
+    let src = dir.path().join("note.txt");
+    std::fs::write(&src, b"note").unwrap();
+    ok(&["put", v, s(&src), "/folder", "--password-stdin"], &format!("{PW}
+"));
+    let out = dir.path().join("out");
+    ok(&["get", v, "/folder", s(&out), "--password-stdin"], &format!("{PW}
+"));
+    for made in [vault.clone(), key.clone(), out.clone(), out.join("note.txt")] {
+        assert_eq!(permissions(&made), private, "{}", made.display());
+    }
+
+    ok(&["add-keyfile", v, s(&key), "--password-stdin"], &format!("{PW}
+"));
+    ok(&["ls", v, "--keyfile", s(&key)], "");
+    // Let Everyone (S-1-1-0) read the keyfile: it is refused from then on.
+    let granted = Command::new("icacls").args([s(&key), "/grant", "*S-1-1-0:R"]).output().unwrap();
+    assert!(granted.status.success(), "{}", String::from_utf8_lossy(&granted.stderr));
+    let err = fails(&["ls", v, "--keyfile", s(&key)], "");
+    assert!(err.contains("readable by other users"), "{err}");
+}
+
+/// Windows knows most files by a short 8.3 alias too. A vault file named
+/// like the alias of an unrelated local file must not replace that file,
+/// even with --force.
+#[cfg(windows)]
+#[test]
+fn get_force_never_replaces_a_file_through_its_short_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let local = out.join("long file name.txt");
+    std::fs::write(&local, b"keep me").unwrap();
+    // The alias Windows gave it, if this drive makes aliases at all.
+    let script = format!("(New-Object -ComObject Scripting.FileSystemObject).GetFile('{}').ShortName", s(&local));
+    let q = Command::new("powershell").args(["-NoProfile", "-Command", &script]).output().unwrap();
+    let alias = String::from_utf8_lossy(&q.stdout).trim().to_string();
+    if alias.is_empty() || alias.eq_ignore_ascii_case("long file name.txt") {
+        eprintln!("skipped: this drive doesn't create 8.3 short names");
+        return;
+    }
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}
+"));
+    // A file in the vault named exactly like the alias.
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join(&alias), b"from the vault").unwrap();
+    ok(&["put", v, s(&src.join(&alias)), "/", "--password-stdin"], &format!("{PW}
+"));
+    let err = fails(&["get", v, &format!("/{alias}"), s(&out), "--force", "--password-stdin"], &format!("{PW}
+"));
+    assert!(err.contains("short alias"), "{err}");
+    assert_eq!(std::fs::read(&local).unwrap(), b"keep me");
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_mounts_need_a_free_drive_letter() {

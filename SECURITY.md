@@ -31,8 +31,8 @@ running as you while the vault is unlocked).
 - Cryptography comes only from audited crates: XChaCha20-Poly1305,
   Argon2id and SHA-256 (see the README's
   [cryptographic design](README.md#cryptographic-design)).
-- `unsafe` is denied crate-wide except for a few libc calls in
-  `src/platform.rs` and our own minimal WinFsp bindings in
+- `unsafe` is denied crate-wide except for a few libc and Windows API calls
+  in `src/platform.rs` and our own minimal WinFsp bindings in
   `src/mount/winfsp.rs` (Windows only).
 - CI runs `cargo audit` against the RustSec advisory database on every push.
 - nullguard has **not yet had an independent security audit**.

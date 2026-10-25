@@ -299,16 +299,22 @@ synced to the cloud).
   when they run as that user. (Administrators can override file
   permissions, and can read process memory anyway: see *Out of scope*.
   Unlike on Linux, other ordinary processes of the same user can read
-  nullguard's memory on Windows, which falls under malware running as you.) The
+  nullguard's memory on Windows, which falls under malware running as you.)
+  Other users can still reach the drive's device by its path, so nullguard
+  refuses every file or folder they try to open, the same way whether or
+  not that name exists: they can't probe which names the vault holds. They
+  can see the drive's size and how much of it is free. The
   drive letter only exists in the mounting user's session. Closed files'
   contents are kept out of Windows' standby cache. Ctrl-C, closing the
   console window, logging off and shutting down commit and unmount.
-- On Linux and macOS, vault files and keyfiles are created readable only by
-  their owner (`0600`), so other local users can't even copy them to attack
+- Vault files, keyfiles and everything `get` copies out are created readable
+  only by their owner (`0600`, folders `0700`; on Windows, an explicit
+  permission set for you and the system only, replacing whatever the folder
+  would pass on), so other local users can't even copy them to attack
   offline. Keyfiles that other users can read are refused, as ssh does with
-  private keys. On Windows, files get the permissions of the folder they're
-  created in (your user profile is private by default); keep vaults and
-  keyfiles there or in another folder only you can read.
+  private keys, on every OS. (A drive without file permissions, such as a
+  FAT-formatted USB stick, counts as readable by everyone on Windows; on
+  Linux it depends on how it is mounted.)
 - Keys live in memory pages locked against swapping and are wiped
   (`zeroize`) when no longer needed. If the OS refuses to lock memory,
   nullguard says so. Argon2's working memory (from which the derived key
@@ -335,8 +341,15 @@ synced to the cloud).
   and creates everything inside it without following links, so nobody can
   redirect the copy elsewhere by swapping a folder for a link while it runs,
   and it refuses to copy into an existing folder that belongs to another
-  user. On Windows it checks each name for links right before using it;
-  copy out to a folder only you can write to, such as one in your profile.
+  user. On Windows `get` holds each destination folder open, so nobody can
+  rename or replace it while the copy runs, refuses links, and never
+  replaces a file through its short 8.3 alias (such as `REPORT~1.PDF`).
+- `put` copies regular files and folders only. Symbolic links, named pipes,
+  sockets and devices are skipped, and every entry is opened without
+  following links and checked once open, so a file swapped for a link (for
+  example to your SSH key) while the copy runs is never read through. On
+  Linux and macOS folders are read through their open handles; on Windows
+  each folder on the way is held open.
 
 ### Out of scope
 
@@ -365,6 +378,8 @@ nullguard can't protect you against:
 Even to an attacker with the vault file, these are visible by design:
 
 - That the file is a nullguard vault, its version number, and its total size.
+  (While a vault is mounted on Windows, other local users can also see how
+  much of it is free.)
 - The chunk size, the password's Argon2id parameters, and how many keyfiles
   can unlock it (but nothing that identifies them).
 
@@ -643,7 +658,8 @@ src/
     fuse.rs        FUSE (Linux, macOS)
     winfsp.rs      WinFsp (Windows): our own minimal bindings + adapter
   cli.rs         command line
-  platform.rs    process hardening, no-follow file creation for `get`
+  platform.rs    process hardening, no-follow file access for `get` and `put`,
+                 Windows file permissions
                  (with mount/winfsp.rs, the only code with `unsafe`)
 tests/cli.rs     end-to-end tests of the binary
 scripts/mount-test.sh  real FUSE mount test (Linux)
