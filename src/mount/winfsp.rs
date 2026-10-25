@@ -1207,8 +1207,10 @@ mod tests {
         let sddl = from_wide(text).unwrap();
         // SAFETY: allocated by the call above.
         unsafe { LocalFree(text.cast()) };
-        // Exactly one access entry, for one user, nothing inherited...
-        assert!(sddl.contains("D:P(A;;FA;;;S-1-"), "{sddl}");
+        // Exactly one access entry, for one user, nothing inherited. (The
+        // user may be shown as a SID or, for well-known accounts such as
+        // the built-in Administrator, as an alias like "LA".)
+        assert!(sddl.contains("D:P(A;;FA;;;"), "{sddl}");
         assert_eq!(sddl.matches("(A;").count(), 1, "{sddl}");
         // ...and low-integrity processes can't read, write or run anything.
         let label = sddl.split("S:").nth(1).expect("an integrity label");
