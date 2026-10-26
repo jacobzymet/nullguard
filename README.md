@@ -48,38 +48,157 @@ and it's an opaque blob that detects any tampering.
 
 ## Quick start
 
+Choose your OS: [Linux](#linux), [macOS](#macos), or [Windows](#windows).
+Run the commands from the folder containing the binary. The Windows examples
+use **PowerShell**.
+
+Mounting runs in the foreground. Use the mounted folder or drive from
+another window. To lock it, press Ctrl-C in the mount terminal or run the
+unmount command in a second terminal. Wait for the mount terminal to report
+`Vault unmounted and locked.` before disconnecting storage.
+
+### Linux
+
+**Mounting requirement:** `/dev/fuse` and `fusermount3`, provided by your
+distribution's `fuse3` package. Offline commands do not need FUSE.
+
 ```bash
 # Create a 10 GiB vault (you'll be asked for a password, twice).
-nullguard create secrets.ngv --size 10G
+./nullguard create secrets.ngv --size 10G
 
-# Mount it. The vault stays unlocked until you unmount.
+# Mount on an empty folder.
 mkdir ~/vault
-nullguard mount secrets.ngv ~/vault      # Windows: nullguard mount secrets.ngv X:
-
-# ... use ~/vault like any folder ...
-
-# Lock it again (or press Ctrl-C in the mount terminal).
-nullguard unmount ~/vault                # Windows: nullguard unmount X:
+./nullguard mount secrets.ngv ~/vault
 ```
 
-Without mounting (works everywhere, with nothing else installed):
+To lock it from a second terminal in the binary's folder:
 
 ```bash
-nullguard put secrets.ngv ./taxes /            # copy a folder in
-nullguard ls  secrets.ngv /taxes
-nullguard get secrets.ngv /taxes/2025.pdf .    # copy a file out
-nullguard verify secrets.ngv                   # check every block's integrity
+./nullguard unmount ~/vault
 ```
 
-Keyfiles (for scripts, a recovery key, or a second person):
+**Work without mounting:**
 
 ```bash
-nullguard keygen usb/recovery.key            # a random 256-bit key, mode 0600
-nullguard add-keyfile secrets.ngv usb/recovery.key
-nullguard mount secrets.ngv ~/vault --keyfile usb/recovery.key
-nullguard remove-keyfile secrets.ngv usb/recovery.key
-nullguard remove-keyfile secrets.ngv --all   # lost a keyfile? remove them all
+./nullguard put secrets.ngv ./taxes /          # copy a folder in
+./nullguard ls secrets.ngv /taxes
+./nullguard get secrets.ngv /taxes/2025.pdf .   # copy a file out
+./nullguard verify secrets.ngv                # check integrity
 ```
+
+**Use a keyfile:** replace `usb` with an existing folder on your separate
+keyfile storage. The generated file has mode `0600`.
+
+```bash
+./nullguard keygen usb/recovery.key
+./nullguard add-keyfile secrets.ngv usb/recovery.key
+./nullguard mount secrets.ngv ~/vault --keyfile usb/recovery.key
+```
+
+After unmounting, remove a keyfile's access with:
+
+```bash
+./nullguard remove-keyfile secrets.ngv usb/recovery.key
+# If a keyfile is lost, remove all keyfiles instead:
+./nullguard remove-keyfile secrets.ngv --all
+```
+
+### macOS
+
+**Requirement:** install [macFUSE](https://osxfuse.github.io/) before running
+the standard binary, including offline commands. To work without macFUSE,
+build the [offline-only binary](#build-on-macos).
+
+```bash
+# Create a 10 GiB vault (you'll be asked for a password, twice).
+./nullguard create secrets.ngv --size 10G
+
+# Mount on an empty folder.
+mkdir ~/vault
+./nullguard mount secrets.ngv ~/vault
+```
+
+To lock it from a second terminal in the binary's folder:
+
+```bash
+./nullguard unmount ~/vault
+```
+
+**Work without mounting:** use either the standard binary with macFUSE
+installed or the offline-only build.
+
+```bash
+./nullguard put secrets.ngv ./taxes /          # copy a folder in
+./nullguard ls secrets.ngv /taxes
+./nullguard get secrets.ngv /taxes/2025.pdf .   # copy a file out
+./nullguard verify secrets.ngv                # check integrity
+```
+
+**Use a keyfile:** replace `usb` with an existing folder on your separate
+keyfile storage. The generated file has mode `0600`.
+
+```bash
+./nullguard keygen usb/recovery.key
+./nullguard add-keyfile secrets.ngv usb/recovery.key
+./nullguard mount secrets.ngv ~/vault --keyfile usb/recovery.key
+```
+
+After unmounting, remove a keyfile's access with:
+
+```bash
+./nullguard remove-keyfile secrets.ngv usb/recovery.key
+# If a keyfile is lost, remove all keyfiles instead:
+./nullguard remove-keyfile secrets.ngv --all
+```
+
+### Windows
+
+**Mounting requirement:** install [WinFsp](https://winfsp.dev) **2.x** and
+choose a free drive letter. These examples use `X:`. Offline commands run
+without WinFsp.
+
+```powershell
+# Create a 10 GiB vault (you'll be asked for a password, twice).
+.\nullguard.exe create .\secrets.ngv --size 10G
+
+# Mount as the X: drive.
+.\nullguard.exe mount .\secrets.ngv X:
+```
+
+To lock it from a second PowerShell window in the binary's folder:
+
+```powershell
+.\nullguard.exe unmount X:
+```
+
+**Work without mounting:**
+
+```powershell
+.\nullguard.exe put .\secrets.ngv .\taxes /          # copy a folder in
+.\nullguard.exe ls .\secrets.ngv /taxes
+.\nullguard.exe get .\secrets.ngv /taxes/2025.pdf .   # copy a file out
+.\nullguard.exe verify .\secrets.ngv                # check integrity
+```
+
+**Use a keyfile:** replace `.\usb` with an existing folder on your separate
+keyfile storage. The storage must support file permissions; keyfiles readable
+by other users are refused, including those on FAT-formatted drives.
+
+```powershell
+.\nullguard.exe keygen .\usb\recovery.key
+.\nullguard.exe add-keyfile .\secrets.ngv .\usb\recovery.key
+.\nullguard.exe mount .\secrets.ngv X: --keyfile .\usb\recovery.key
+```
+
+After unmounting, remove a keyfile's access with:
+
+```powershell
+.\nullguard.exe remove-keyfile .\secrets.ngv .\usb\recovery.key
+# If a keyfile is lost, remove all keyfiles instead:
+.\nullguard.exe remove-keyfile .\secrets.ngv --all
+```
+
+### About keyfiles
 
 A keyfile **is** a key: anyone holding it can unlock every vault it was
 added to, with no password. Keep it somewhere separate from the vault (a USB
@@ -96,8 +215,8 @@ full revocation, run `nullguard rekey` (see below).
 | Command | What it does |
 |---|---|
 | `create <vault> --size <N>` | Create a vault. `--low-memory` uses 64 MiB for the password's key derivation instead of 1 GiB. |
-| `mount <vault> <dir or X:>` | Unlock and mount on an empty folder (Linux, macOS) or a free drive letter (Windows). `--keyfile`, `--read-only`, `--no-exec` and `--allow-outside-links` (not on Windows). Runs in the foreground; Ctrl-C unmounts. |
-| `unmount <dir>` | Unmount and lock (commits all changes first). |
+| `mount <vault> <mountpoint>` | Unlock and mount. See the [OS-specific quick start](#quick-start) for the mountpoint and [mount options](#mount-options) below. Runs in the foreground; Ctrl-C unmounts. |
+| `unmount <mountpoint>` | Request unmounting. The mount process commits changes and reports when the vault is locked. |
 | `change-password <vault>` | Re-wrap the master key under a new password (see the caveat below). `--low-memory` as for `create`. |
 | `rekey <vault>` | Move the vault to a new master key and new password: old passwords, keyfiles and leaked keys stop working. Copies every file, so it needs free space for a second copy while it runs. Keyfiles must be added again afterwards. `--low-memory` as for `create`. |
 | `keygen <file>` | Create a keyfile (never overwrites). |
@@ -106,6 +225,17 @@ full revocation, run `nullguard rekey` (see below).
 | `info <vault>` | Show header parameters (no password; not authenticated). |
 | `verify <vault>` | Unlock and authenticate both header copies, both superblocks, the metadata and every block. Fails (non-zero exit) on *any* problem or warning. |
 | `ls`, `get`, `put`, `rm`, `mkdir` | Work with files without mounting. |
+
+### Mount options
+
+| Option | Linux | macOS | Windows |
+|---|---|---|---|
+| `--keyfile <file>` | Supported | Supported | Supported |
+| `--read-only` | Supported | Supported | Supported |
+| `--no-exec` | Supported | Supported | Unavailable |
+| `--allow-outside-links` | Supported | Supported | Unavailable; symbolic links are not shown |
+
+### Passwords
 
 Every command that needs a secret reads it from the terminal without echo.
 `--password-stdin` reads it from standard input instead (one line per secret)
@@ -118,11 +248,6 @@ expensive, but nothing can save a guessable password. Passwords are Unicode
 NFC-normalized before use, so a password with accents unlocks the same vault
 on every OS and keyboard.
 
-Inside a mounted vault, every file appears owned by you, the user who
-mounted it, whatever machine or OS created it (like a USB stick). File
-permission bits are kept and enforced. Vaults don't store file owners, so
-`chown` has no effect.
-
 ## Platform support
 
 | Platform | Mount | Offline commands | Notes |
@@ -133,29 +258,101 @@ permission bits are kept and enforced. Vaults don't store file owners, so
 
 ## Building a portable binary
 
+Run these commands from the repository root. Install Rust 1.89 or newer
+before building.
+
+### Build on Linux
+
+Build a fully static binary:
+
 ```bash
-# Linux: fully static binary (runs on any distro)
 rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
-
-# Windows: static C runtime (configured in .cargo/config.toml), no VC++ redistributable
-cargo build --release
-
-# macOS
-cargo build --release
+cargo build --release --locked --target x86_64-unknown-linux-musl
 ```
 
-Release builds use LTO and keep integer-overflow checks on (an overflow is a
-security bug, so it aborts instead of wrapping). Run the tests with `cargo test`
-and the real-mount test with `scripts/mount-test.sh target/release/nullguard`
-(Linux, needs FUSE) or `scripts/mount-test-windows.sh target/release/nullguard.exe`
-(Windows, Git Bash, needs WinFsp).
+The binary is `target/x86_64-unknown-linux-musl/release/nullguard`.
+
+### Build on macOS
+
+With macFUSE installed, build a binary with mounting support:
+
+```bash
+cargo build --release --locked
+```
+
+To build an offline-only binary that runs without macFUSE:
+
+```bash
+cargo build --release --locked --features macos-no-mount
+```
+
+Both builds write `target/release/nullguard`. The offline-only build cannot
+mount vaults.
+
+### Build on Windows
+
+Run in PowerShell:
+
+```powershell
+cargo build --release --locked
+```
+
+The binary is `target\release\nullguard.exe`. The MSVC targets use the static
+C runtime configured in `.cargo/config.toml`, so they do not need the Visual
+C++ redistributable. WinFsp is loaded at run time and is needed only for
+mounting.
+
+Release builds on every OS use LTO and keep integer-overflow checks on (an
+overflow aborts instead of wrapping).
+
+### Test on Linux
+
+Run the unit and CLI tests:
+
+```bash
+cargo test --locked
+```
+
+With FUSE available, build and run the real-mount test:
+
+```bash
+cargo build --release --locked
+./scripts/mount-test.sh target/release/nullguard
+```
+
+### Test on macOS
+
+Run the unit and CLI tests without requiring macFUSE:
+
+```bash
+cargo test --locked --features macos-no-mount
+```
+
+The automated real-mount scripts target Linux and Windows.
+
+### Test on Windows
+
+Run the unit and CLI tests and build the binary in PowerShell:
+
+```powershell
+cargo test --locked
+cargo build --release --locked
+```
+
+For the real-mount test, install WinFsp 2.x and run the script in **Git Bash**
+from the repository root:
+
+```bash
+./scripts/mount-test-windows.sh target/release/nullguard.exe
+```
+
+### Parser fuzzing
 
 The parsers for untrusted input (header, superblock, metadata, keyfile)
 have fuzz tests in `fuzz/`, which throw millions of random and malformed
 inputs at each one. They need nightly Rust and
 [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz), and are not part of
-the nullguard binary:
+the nullguard binary. This example uses a Linux shell:
 
 ```bash
 cd fuzz
@@ -273,89 +470,98 @@ synced to the cloud).
 
 **5. Other users and processes on the same machine while the vault is mounted.**
 
-- The mount is only accessible to the user who mounted it (no `allow_other`).
-  That includes root: on Linux, even root gets "permission denied" (it could
-  still read the process's memory, see *Out of scope*). The kernel enforces
-  file permissions (`default_permissions`), and the mount is `nodev,nosuid`
-  (`--no-exec` adds `noexec`). nullguard refuses to mount over a non-empty
-  folder, which would hide its contents. Ctrl-C and SIGTERM (e.g. at shutdown)
-  commit and unmount cleanly.
-- On Windows, the drive is likewise only for the user who mounted it: every
-  file and folder carries a fixed permission set that gives that user full
-  access and nobody else any. Sandboxed low-integrity processes (such as
-  some browser and document-viewer sandboxes) can't open them either, even
-  when they run as that user. (Administrators can override file
-  permissions, and can read process memory anyway: see *Out of scope*.
-  Unlike on Linux, other ordinary processes of the same user can read
-  nullguard's memory on Windows, which falls under malware running as you.)
-  Other users can still reach the drive's device by its path, so nullguard
-  refuses every file or folder they try to open, the same way whether or
-  not that name exists: they can't probe which names the vault holds. The
-  same goes for your own sandboxed processes (low integrity, app containers,
-  restricted tokens). Other users can see the drive's size and how much of
-  it is free. The
-  drive letter only exists in the mounting user's session. Closed files'
-  contents are kept out of Windows' standby cache. Ctrl-C, closing the
-  console window, logging off and shutting down commit and unmount. (For
-  the last three, Windows allows a few seconds before it ends the process;
-  nullguard uses them to commit, and a commit takes well under that.)
-- Vault files, keyfiles and everything `get` copies out are created readable
-  only by their owner (`0600`, folders `0700`; on Windows, an explicit
-  permission set for you and the system only, in place from the moment the
-  file exists instead of what the folder would pass on), so other local
-  users can't even copy them to attack
-  offline. Keyfiles that other users can read are refused, as ssh does with
-  private keys, on every OS. (A drive without file permissions, such as a
-  FAT-formatted USB stick, counts as readable by everyone on Windows; on
-  Linux it depends on how it is mounted.)
+#### Safeguards on all platforms
+
+- Vault files, keyfiles and exported files are private from the moment they
+  are created. Keyfiles that other users can read are refused. The exact
+  permission rules are described for each OS below.
+- The vault file is locked while open, so two nullguard processes cannot
+  corrupt it. Every mounted file is presented as owned by the mounting user;
+  vaults do not store file owners.
 - Keys live in memory pages locked against swapping and are wiped
-  (`zeroize`) when no longer needed. If the OS refuses to lock memory,
-  nullguard says so. Argon2's working memory (from which the derived key
-  could otherwise be recomputed) and the file names nullguard holds (in the
-  filesystem, its listings and the Windows drive's lookups; whenever one is
-  removed, renamed or no longer needed, and all of them at unmount) are
-  wiped too, but
-  they are too large to lock, so they can reach unencrypted swap: use
-  encrypted swap.
-  Core dumps are disabled. On Linux the process is marked non-dumpable, which
-  also blocks `ptrace` and `/proc/<pid>/mem` access by other processes of the
-  same user. On macOS it refuses debugger attachment (`PT_DENY_ATTACH`). On
-  Windows, crash reports leave out heap memory (where keys and cached file
-  contents live), a crash ends the process before a dump can be taken, and
-  `mount` excludes `nullguard.exe` from Windows Error Reporting for your
-  user (a lasting setting under
-  `HKCU\Software\Microsoft\Windows\Windows Error Reporting\ExcludedApplications`).
-- The vault file is locked while open, so two nullguard processes can't
-  corrupt it. On Windows, while nullguard writes to a vault no other program
-  can open, rename or delete it. During read-only commands (`ls`, `get`,
-  `verify`) other programs may still read the (encrypted) file.
-- `--password-stdin` reads straight from the raw input handle into a wiped
-  buffer, so no copy of the password stays in the process's standard input
-  buffer while a vault is mounted.
-- Partial results never linger: a `get` that fails (e.g. on a tampered
-  block) deletes the incomplete output file. With `get --force`, the existing
-  destination stays intact until every block authenticates and the new file
-  is synced, then it is replaced atomically. A `put` that fails removes
-  the incomplete file from the vault. `get` creates output folders readable
-  only by you (`0700`), never writes through a symbolic link, and with
-  `--force` replaces existing files with new private ones. On Linux and
-  macOS that holds at every level: `get` keeps each destination folder open
-  and creates everything inside it without following links, so nobody can
-  redirect the copy elsewhere by swapping a folder for a link while it runs,
-  and it refuses to copy into an existing folder that belongs to another
-  user. On Windows `get` holds each destination folder open, so nobody can
-  rename or replace it while the copy runs, refuses links and folders that
-  belong to another user, and never replaces a file through its short 8.3
-  alias (such as `REPORT~1.PDF`). The folder you name as the destination
-  may belong to anyone (such as `/tmp`): `get` only adds new private
-  entries to it, created so that no link can redirect them, and never
-  merges a vault folder into one it doesn't own.
-- `put` copies regular files and folders only. Symbolic links, named pipes,
-  sockets and devices are skipped, and every entry is opened without
-  following links and checked once open, so a file swapped for a link (for
-  example to your SSH key) while the copy runs is never read through. On
-  Linux and macOS folders are read through their open handles; on Windows
-  each folder on the way is held open.
+  (`zeroize`) when no longer needed. If memory locking fails, nullguard
+  reports it. Argon2's working memory and the file names held by the
+  filesystem, listings and lookups are wiped when no longer needed, but
+  are too large to lock: use encrypted swap.
+- `--password-stdin` reads from the raw input handle into a wiped buffer,
+  so the password does not remain in the standard input buffer while a
+  vault is mounted.
+- Failed copies remove their incomplete output. With `get --force`, the
+  existing destination stays intact until every block authenticates and
+  the new file is synced, then it is replaced atomically. A failed `put`
+  removes its incomplete file from the vault. `get` never writes through
+  symbolic links or merges a vault folder into a local folder owned by
+  another user. The destination parent named on the command line may
+  belong to anyone, such as `/tmp`; new entries inside it remain private.
+  `put` copies regular files and folders only, skips links, named pipes,
+  sockets and devices, and checks each entry after opening it without
+  following links.
+
+#### Linux protections
+
+- The FUSE mount is accessible only to the mounting user (`allow_other`
+  is not enabled). Even root gets permission denied through the mount,
+  although root can read process memory; see *Out of scope*.
+- The kernel enforces file permission bits (`default_permissions`). The
+  mount uses `nodev,nosuid`; `--no-exec` adds `noexec`. `chown` has no effect
+  because owners are not stored. Mounting over a non-empty folder is refused.
+- New vaults, keyfiles and exported files use mode `0600`; exported folders
+  use `0700`. Permissions on FAT-formatted storage depend on its mount
+  options.
+- Core dumps are disabled. The process is marked non-dumpable, blocking
+  `ptrace` and `/proc/<pid>/mem` access by other processes of the same user.
+- `get` holds destination folders open and uses directory-relative,
+  no-follow operations, preventing a folder-to-link swap from redirecting
+  output. `put` lists and enters source folders through their open handles.
+  Ctrl-C and SIGTERM commit changes and unmount.
+
+#### macOS protections
+
+- The FUSE mount is accessible only to the mounting user (`allow_other`
+  is not enabled). The kernel enforces file permission bits
+  (`default_permissions`). The mount uses `nodev,nosuid`; `--no-exec` adds
+  `noexec`. `chown` has no effect because owners are not stored. Mounting
+  over a non-empty folder is refused.
+- New vaults, keyfiles and exported files use mode `0600`; exported folders
+  use `0700`.
+- Core dumps are disabled. Debugger attachment is refused with
+  `PT_DENY_ATTACH`.
+- `get` holds destination folders open and uses directory-relative,
+  no-follow operations, preventing a folder-to-link swap from redirecting
+  output. `put` lists and enters source folders through their open handles.
+  Ctrl-C and SIGTERM commit changes and unmount.
+
+#### Windows protections
+
+- Each mounted file and folder has a fixed security descriptor granting
+  the mounting user full access and nobody else any. Opens from other
+  users, low-integrity processes, app containers and restricted tokens are
+  refused uniformly, whether or not the requested name exists, so those
+  callers cannot probe file names. Administrators can override permissions;
+  see *Out of scope*.
+- The drive letter exists only in the mounting user's session. Other users
+  can see the drive's size and free space. Closed files' contents are kept
+  out of the standby cache. While nullguard writes to the vault file,
+  other programs cannot open, rename or delete it. During read-only
+  commands (`ls`, `get`, `verify`), other programs may read the encrypted file.
+- New vaults, keyfiles and exported files and folders receive explicit
+  permissions for the current user and SYSTEM, without inheriting the
+  destination folder's permissions. FAT-formatted storage has no file
+  permissions and counts as readable by everyone, so keyfiles there are
+  refused.
+- `get` holds destination folders open so they cannot be renamed or
+  replaced while copying. It refuses links, folders owned by another
+  user, and file replacements through short 8.3 aliases such as
+  `REPORT~1.PDF`. `put` holds each source folder on the way open.
+- Other ordinary processes of the same user can read nullguard's memory;
+  this falls under malware running as you. Crash reports exclude heap
+  memory, and a crash ends the process before a dump is taken. Mounting
+  excludes `nullguard.exe` from Windows Error Reporting for the current
+  user, a lasting setting under
+  `HKCU\Software\Microsoft\Windows\Windows Error Reporting\ExcludedApplications`.
+  Ctrl-C, closing the console, logging off and shutting down trigger
+  commit and unmount. Windows allows only a few seconds for the final
+  commit on console close, logoff and shutdown.
 
 ### Out of scope
 
@@ -646,7 +852,9 @@ less often if commits are slow), on `fsync`, and on unmount.
 nullguard-keyfile-v2:<base64( secret (32) )>
 ```
 
-Keyfiles are created with mode 0600 and are never overwritten.
+Keyfiles are never overwritten. See the [Linux](#linux-protections),
+[macOS](#macos-protections) and [Windows](#windows-protections) permission
+rules above.
 
 ---
 
