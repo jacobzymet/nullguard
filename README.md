@@ -333,7 +333,9 @@ synced to the cloud).
   buffer, so no copy of the password stays in the process's standard input
   buffer while a vault is mounted.
 - Partial results never linger: a `get` that fails (e.g. on a tampered
-  block) deletes the incomplete output file, and a `put` that fails removes
+  block) deletes the incomplete output file. With `get --force`, the existing
+  destination stays intact until every block authenticates and the new file
+  is synced, then it is replaced atomically. A `put` that fails removes
   the incomplete file from the vault. `get` creates output folders readable
   only by you (`0700`), never writes through a symbolic link, and with
   `--force` replaces existing files with new private ones. On Linux and
@@ -398,7 +400,9 @@ vault only with people you'd trust with the data itself. nullguard does
 treat a vault's *contents* as untrusted input, though. File names are
 shown with control and bidi-override characters escaped, so a planted name
 can't inject terminal escape sequences or impersonate another name. Names
-that would be unsafe on the local OS are refused by `get`. Recursive
+that would be unsafe on the local OS are refused by `get`. Unix filename
+bytes are preserved during `put` and `get`; names that cannot be represented
+on Windows are refused instead of silently changed. Recursive
 commands stop at 1024 levels of nesting. A mounted vault doesn't follow
 symbolic links that lead out of it (to an absolute path, or up past the
 vault's root, also by way of other links): otherwise someone who can write

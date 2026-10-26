@@ -387,8 +387,15 @@ fn unlock(path: &Path, args: &UnlockArgs, read_only: bool) -> Result<(Vault, Pro
 
 fn open_fs(path: &Path, args: &UnlockArgs, read_only: bool) -> Result<Fs> {
     let (v, _, _) = unlock(path, args, read_only)?;
-    let mut fs = v.into_fs()?;
+    let fs = v.into_fs()?;
     warn_all(&fs.warnings);
+    Ok(fs)
+}
+
+/// Offline mutations commit only after the entire command succeeds.
+/// Mounts use `open_fs` instead, keeping timed commits and reclamation on.
+fn open_transaction(path: &Path, args: &UnlockArgs) -> Result<Fs> {
+    let mut fs = open_fs(path, args, false)?;
     // Commands are all-or-nothing: nothing is committed until the whole
     // command has succeeded (see `Fs::set_auto_commit`).
     fs.set_auto_commit(false);
@@ -441,21 +448,12 @@ fn human(n: u64) -> String {
 /// Create a file that only the current user can read (unix: mode 0600;
 /// Windows: an explicit owner-only permission set).
 ///
-/// Never writes *through* a symlink at `path`. With `overwrite`, an existing
-/// regular file is replaced by a new private one (rather than truncated in
-/// place, which would keep its old, possibly world-readable, permissions).
-fn create_private(path: &Path, overwrite: bool) -> io::Result<std::fs::File> {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "refusing to write through a symbolic link"));
-        }
-        if overwrite && meta.is_file() {
-            #[cfg(windows)]
-            if let Some(name) = path.file_name() {
-                check_real_name(path, name)?;
-            }
-            std::fs::remove_file(path)?;
-        }
+/// Never overwrites an existing entry or writes through a symbolic link.
+fn create_private(path: &Path) -> io::Result<std::fs::File> {
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "refusing to write through a symbolic link"));
     }
     #[cfg(unix)]
     {
@@ -597,7 +595,7 @@ pub fn run() -> Result<()> {
 
         Command::Keygen { out } => {
             let key = Keyfile::generate()?;
-            create_private(&out, false)
+            create_private(&out)
                 .and_then(|mut f| f.write_all(key.encode().as_bytes()).and_then(|_| f.sync_all()))
                 .with_context(|| format!("writing {} (it must not exist yet)", out.display()))?;
             println!("Keyfile: {}", out.display());
@@ -736,28 +734,26 @@ pub fn run() -> Result<()> {
         }
 
         Command::Put { vault, src, path, force, unlock: u } => {
-            let mut fs = open_fs(&vault, &u, false)?;
+            let mut fs = open_transaction(&vault, &u)?;
             let (parent, name) = match fs.resolve(&path) {
                 Ok(ino) if fs.attr(ino)?.kind == Kind::Dir => {
-                    let name = src
-                        .file_name()
-                        .ok_or_else(|| anyhow!("cannot determine a name for {}", src.display()))?
-                        .to_string_lossy()
-                        .into_owned();
+                    let name = src.file_name()
+                        .ok_or_else(|| anyhow!("cannot determine a name for {}", src.display()))?;
+                    let name = vault::fs::Name::new(local_name_bytes(name)?);
                     (ino, name)
                 }
                 _ => {
                     let (dir, name) = split_path(&path)?;
-                    (resolve(&fs, dir)?, name.to_owned())
+                    (resolve(&fs, dir)?, vault::fs::Name::new(name.as_bytes()))
                 }
             };
-            let n = import(&mut fs, &src, parent, name.as_bytes(), force, 0)?;
+            let n = import(&mut fs, &src, parent, &name, force, 0)?;
             fs.commit()?;
             println!("Copied {n} file(s) into the vault.");
         }
 
         Command::Rm { vault, path, recursive, unlock: u } => {
-            let mut fs = open_fs(&vault, &u, false)?;
+            let mut fs = open_transaction(&vault, &u)?;
             let (dir, name) = split_path(&path)?;
             let parent = resolve(&fs, dir)?;
             remove(&mut fs, parent, name.as_bytes(), recursive, 0)?;
@@ -766,7 +762,7 @@ pub fn run() -> Result<()> {
         }
 
         Command::Mkdir { vault, path, unlock: u } => {
-            let mut fs = open_fs(&vault, &u, false)?;
+            let mut fs = open_transaction(&vault, &u)?;
             let (dir, name) = split_path(&path)?;
             let parent = resolve(&fs, dir)?;
             fs.mkdir(parent, name.as_bytes(), 0o700)?;
@@ -860,7 +856,7 @@ fn display_path(path: &Path) -> String {
 /// escaping the destination directory (or, on Windows, writing into an
 /// NTFS alternate data stream or a device such as `CON`).
 fn safe_local_name(name: &str) -> bool {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+    if !safe_name_bytes(name.as_bytes()) {
         return false;
     }
     if cfg!(windows) && windows_reserved(name) {
@@ -874,6 +870,42 @@ fn safe_local_name(name: &str) -> bool {
         return false;
     }
     true
+}
+
+fn safe_name_bytes(name: &[u8]) -> bool {
+    !name.is_empty() && name != b"." && name != b".." && !name.iter().any(|b| matches!(b, b'/' | b'\\' | 0))
+}
+
+/// Preserve native Unix name bytes; reject Windows names whose UTF-16
+/// cannot be represented by the vault instead of substituting characters.
+fn local_name_bytes(name: &OsStr) -> Result<&[u8]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(name.as_bytes())
+    }
+    #[cfg(windows)]
+    {
+        name.to_str().map(str::as_bytes)
+            .ok_or_else(|| anyhow!("cannot copy a file name containing invalid Unicode"))
+    }
+}
+
+/// Convert without changing a name: distinct vault entries must never
+/// collapse into one output name through replacement characters.
+fn export_name(name: &[u8]) -> Result<OsString> {
+    #[cfg(unix)]
+    if safe_name_bytes(name) {
+        use std::os::unix::ffi::OsStringExt;
+        return Ok(OsString::from_vec(name.to_vec()));
+    }
+    #[cfg(windows)]
+    if let Ok(text) = std::str::from_utf8(name)
+        && safe_local_name(text)
+    {
+        return Ok(OsString::from(text));
+    }
+    bail!("refusing to create a local file with the unsafe or unrepresentable name {}", display_name(name))
 }
 
 /// Windows device names (`CON`, `NUL`, `COM1`, `LPT¹`, `CONIN$`, ...). Windows
@@ -976,7 +1008,7 @@ fn import_open(
                 Entry::Other => eprintln!("skipping {} (not a regular file)", path.display()),
                 Entry::File | Entry::Dir => {
                     let h = at::open_read(&handle, &child).with_context(|| format!("opening {}", path.display()))?;
-                    n += import_open(fs, h, &path, dir, child.to_string_lossy().as_bytes(), force, depth + 1)?;
+                    n += import_open(fs, h, &path, dir, local_name_bytes(&child)?, force, depth + 1)?;
                 }
             }
         }
@@ -995,7 +1027,7 @@ fn import_open(
             }
             let h = open_source(&path, kind.is_dir()).with_context(|| format!("opening {}", path.display()))?;
             let child = entry.file_name();
-            n += import_open(fs, h, &path, dir, child.to_string_lossy().as_bytes(), force, depth + 1)?;
+            n += import_open(fs, h, &path, dir, local_name_bytes(&child)?, force, depth + 1)?;
         }
     }
     Ok(n)
@@ -1153,25 +1185,90 @@ impl LocalDir {
         }
     }
 
-    /// Create the file `name` here, readable only by you. Never writes
-    /// through a symbolic link; with `overwrite`, an existing file is
-    /// replaced by a new private one.
-    fn create_file(&self, name: &OsStr, overwrite: bool) -> io::Result<std::fs::File> {
+    /// Create a new private file, never replacing an existing entry.
+    fn create_file(&self, name: &OsStr) -> io::Result<std::fs::File> {
         #[cfg(unix)]
         {
             use crate::platform::at::{self, Entry};
-            match at::entry(&self.handle, name)? {
-                Entry::Symlink => {
-                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "refusing to write through a symbolic link"));
-                }
-                Entry::File if overwrite => at::remove_file(&self.handle, name)?,
-                _ => {}
+            if at::entry(&self.handle, name)? == Entry::Symlink {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "refusing to write through a symbolic link"));
             }
             at::create_file(&self.handle, name, 0o600)
         }
         #[cfg(windows)]
         {
-            create_private(&self.path_of(name), overwrite)
+            create_private(&self.path_of(name))
+        }
+    }
+
+    /// Check a forced replacement without removing anything. Check again
+    /// immediately before publishing, including Windows short-name aliases.
+    fn check_replaceable(&self, name: &OsStr) -> io::Result<()> {
+        let link = || io::Error::new(io::ErrorKind::AlreadyExists, "refusing to write through a symbolic link");
+        let other = || io::Error::new(io::ErrorKind::AlreadyExists, "the destination is not a regular file");
+        #[cfg(unix)]
+        {
+            use crate::platform::at::{self, Entry};
+            match at::entry(&self.handle, name)? {
+                Entry::Missing | Entry::File => Ok(()),
+                Entry::Symlink => Err(link()),
+                _ => Err(other()),
+            }
+        }
+        #[cfg(windows)]
+        {
+            let path = self.path_of(name);
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_symlink() => Err(link()),
+                Ok(m) if m.is_file() => check_real_name(&path, name),
+                Ok(_) => Err(other()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    /// Stage forced exports next to their destination. The old file stays
+    /// intact until every block authenticates and the new file is synced.
+    fn begin_export(&self, name: &OsStr, force: bool) -> Result<ExportFile<'_>> {
+        if !force {
+            let file = self.create_file(name)?;
+            return Ok(ExportFile { dir: self, name: name.to_owned(), file: Some(file), finished: false });
+        }
+        self.check_replaceable(name)?;
+        for _ in 0..16 {
+            let random = crate::crypto::random::array::<16>()?;
+            let mut temp = String::from(".nullguard-");
+            for b in random {
+                use std::fmt::Write as _;
+                write!(&mut temp, "{b:02x}")?;
+            }
+            temp.push_str(".tmp");
+            let temp = OsString::from(temp);
+            // A vault entry can itself have a temporary-looking name.
+            if temp == name {
+                continue;
+            }
+            match self.create_file(&temp) {
+                Ok(file) => return Ok(ExportFile { dir: self, name: temp, file: Some(file), finished: false }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        bail!("could not create a unique private export file")
+    }
+
+    fn replace_file(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        self.check_replaceable(to)?;
+        #[cfg(unix)]
+        {
+            crate::platform::at::rename_file(&self.handle, from, to)
+        }
+        #[cfg(windows)]
+        {
+            // The directory and all its parents stay open throughout the
+            // export, so these paths cannot be redirected through a link.
+            std::fs::rename(self.path_of(from), self.path_of(to))
         }
     }
 
@@ -1183,6 +1280,41 @@ impl LocalDir {
         #[cfg(windows)]
         {
             std::fs::remove_file(self.path_of(name))
+        }
+    }
+}
+
+/// Deletes only the newly created output if copying, authentication,
+/// syncing, or publishing fails. Also cleans up during unwinding.
+struct ExportFile<'a> {
+    dir: &'a LocalDir,
+    name: OsString,
+    file: Option<std::fs::File>,
+    finished: bool,
+}
+
+impl ExportFile<'_> {
+    fn file(&mut self) -> &mut std::fs::File {
+        self.file.as_mut().expect("export file is open until finished")
+    }
+
+    fn finish(mut self, name: &OsStr, force: bool) -> io::Result<()> {
+        self.file().sync_all()?;
+        // Windows refuses to rename an open file without delete sharing.
+        drop(self.file.take());
+        if force {
+            self.dir.replace_file(&self.name, name)?;
+        }
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for ExportFile<'_> {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if !self.finished {
+            let _ = self.dir.remove_file(&self.name);
         }
     }
 }
@@ -1200,11 +1332,8 @@ fn export(fs: &mut Fs, ino: u64, dir: &LocalDir, name: &OsStr, force: bool, dept
                 if e.name == b"." || e.name == b".." {
                     continue;
                 }
-                let child = String::from_utf8_lossy(&e.name).into_owned();
-                if !safe_local_name(&child) {
-                    bail!("refusing to create a local file with the unsafe name {}", display_name(&e.name));
-                }
-                n += export(fs, e.ino, &sub, OsStr::new(&child), force, depth + 1)?;
+                let child = export_name(&e.name)?;
+                n += export(fs, e.ino, &sub, &child, force, depth + 1)?;
             }
             Ok(n)
         }
@@ -1213,24 +1342,20 @@ fn export(fs: &mut Fs, ino: u64, dir: &LocalDir, name: &OsStr, force: bool, dept
             Ok(0)
         }
         Kind::File => {
-            let mut out = dir.create_file(name, force).with_context(|| {
+            let mut out = dir.begin_export(name, force).with_context(|| {
                 format!("creating {} (use --force to overwrite existing files)", display_path(&dest))
             })?;
             let copy = (|| -> Result<()> {
                 let mut off = 0;
                 while off < a.size {
                     let chunk = fs.read(ino, off, COPY_BUF)?;
-                    out.write_all(&chunk)?;
+                    out.file().write_all(&chunk)?;
                     off += chunk.len() as u64;
                 }
-                out.sync_all()?;
+                out.finish(name, force)?;
                 Ok(())
             })();
             if let Err(e) = copy {
-                // Never leave partial plaintext behind, e.g. when a block
-                // fails authentication halfway through.
-                drop(out);
-                let _ = dir.remove_file(name);
                 return Err(e.context(format!("copying out to {}", display_path(&dest))));
             }
             Ok(1)
@@ -1263,6 +1388,96 @@ fn remove(fs: &mut Fs, parent: u64, name: &[u8], recursive: bool, depth: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mount_open_keeps_timed_commits_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.ngv");
+        let key_path = dir.path().join("key");
+        let key = Keyfile::generate().unwrap();
+        create_private(&key_path).unwrap().write_all(key.encode().as_bytes()).unwrap();
+        let password = b"correct horse battery staple";
+        let opts = CreateOptions { size: 1 << 20, kdf: Argon2Params::LOW_MEMORY, chunk_size: Some(4096), fill_random: false };
+        Vault::create(&path, password, &opts, &mut |_, _| {}).unwrap();
+        let mut vault = Vault::open(&path, Credential::Password(password), false).unwrap();
+        vault.add_keyfile(&key).unwrap();
+        drop(vault);
+        let args = UnlockArgs { keyfile: Some(key_path), password_stdin: false };
+        // Exercise the actual opening helper used by the mount command.
+        let mut fs = open_fs(&path, &args, false).unwrap();
+        let ino = fs.create_file(vault::fs::ROOT_INO, b"timed", 0o600).unwrap();
+        fs.write(ino, 0, b"persist without an explicit flush").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2200));
+        fs.maybe_commit().unwrap();
+        assert!(!fs.is_dirty(), "mount opening disabled periodic commits");
+        drop(fs); // no explicit commit or clean unmount
+        let mut fs = open_fs(&path, &args, true).unwrap();
+        let ino = fs.resolve("/timed").unwrap();
+        assert_eq!(&*fs.read(ino, 0, 100).unwrap(), b"persist without an explicit flush");
+    }
+
+    #[test]
+    fn aborted_export_keeps_the_original_and_removes_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("original");
+        std::fs::write(&path, b"keep me").unwrap();
+        let dir = LocalDir::open(temp.path()).unwrap();
+        {
+            let mut staged = dir.begin_export(OsStr::new("original"), true).unwrap();
+            staged.file().write_all(b"partial").unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
+            // Dropping models an error before publication.
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_export_publication_keeps_the_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = LocalDir::open(temp.path()).unwrap();
+        let name = OsStr::new("destination");
+        let mut staged = dir.begin_export(name, true).unwrap();
+        staged.file().write_all(b"complete").unwrap();
+        // An incompatible entry appearing before publication must survive.
+        std::fs::create_dir(temp.path().join(name)).unwrap();
+        assert!(staged.finish(name, true).is_err());
+        assert!(temp.path().join(name).is_dir());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_export_uses_the_open_directory_after_a_path_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let out = temp.path().join("out");
+        let moved = temp.path().join("moved");
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("file"), b"leave this alone").unwrap();
+        let dir = LocalDir::open(&out).unwrap();
+        let name = OsStr::new("file");
+        let mut staged = dir.begin_export(name, true).unwrap();
+        staged.file().write_all(b"vault plaintext").unwrap();
+        std::fs::rename(&out, &moved).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &out).unwrap();
+        staged.finish(name, true).unwrap();
+        assert_eq!(std::fs::read(moved.join("file")).unwrap(), b"vault plaintext");
+        assert_eq!(std::fs::read(elsewhere.join("file")).unwrap(), b"leave this alone");
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unrepresentable_names_are_rejected_without_substitution() {
+        use std::os::windows::ffi::OsStringExt;
+        let invalid = OsString::from_wide(&[0xd800]);
+        assert!(local_name_bytes(&invalid).is_err());
+        assert!(export_name(b"f\xff").is_err());
+        assert!(export_name(b"NUL").is_err());
+        assert!(export_name(b"file:stream").is_err());
+    }
 
     #[test]
     fn sizes() {

@@ -86,6 +86,34 @@ if strings v.ngv | grep -q "greeting"; then echo "FILE NAME LEAKED"; exit 1; fi
 echo "== verify"
 printf '%s\n' "$PW" | "$NG" verify v.ngv --password-stdin
 
+echo "== timed commits survive an abrupt mount-process exit"
+mount_vault
+python3 - <<'PY'
+import time
+
+def superblocks():
+    with open("v.ngv", "rb") as f:
+        f.seek(8192)
+        return f.read(2 * (16 * 1024 + 40))
+
+before = superblocks()
+with open("mnt/timed-commit.txt", "w") as f:
+    f.write("persisted by the background commit\n")
+# Do not call sync/fsync or cleanly unmount: those would hide a disabled
+# background committer. Wait until a superblock actually changes instead.
+deadline = time.monotonic() + 15
+while superblocks() == before:
+    if time.monotonic() >= deadline:
+        raise RuntimeError("no background commit after writing to the mount")
+    time.sleep(0.1)
+PY
+kill -KILL "$MOUNT_PID"
+wait "$MOUNT_PID" 2>/dev/null || true
+if is_mounted; then fusermount3 -u "$WORK/mnt"; fi
+! is_mounted
+printf '%s\n' "$PW" | "$NG" get v.ngv /timed-commit.txt timed-commit.out --password-stdin
+grep -qx 'persisted by the background commit' timed-commit.out
+
 echo "== remount read-only (following outside links), check persistence"
 mount_vault --read-only --allow-outside-links
 cmp big.bin mnt/a/b/c/big.bin

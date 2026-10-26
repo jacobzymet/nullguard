@@ -1,6 +1,7 @@
 //! Drives the real `nullguard` binary end to end (non-interactively, via
 //! `--password-stdin`). Mounting is covered separately on Linux.
 
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -9,7 +10,7 @@ const PW: &str = "correct horse battery staple";
 const PW2: &str = "an even better passphrase here";
 const FAST_KDF: [&str; 1] = ["--low-memory"];
 
-fn ng(args: &[&str], stdin: &str) -> Output {
+fn ng(args: &[impl AsRef<OsStr>], stdin: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_nullguard"))
         .args(args)
         .stdin(Stdio::piped())
@@ -193,6 +194,86 @@ fn failed_get_leaves_no_partial_plaintext() {
     let out = dir.path().join("out.bin");
     fails(&["get", v, "/f.bin", s(&out), "--password-stdin"], &format!("{PW}\n"));
     assert!(!out.exists(), "partial plaintext was left behind");
+
+    // Forced extraction must preserve the old destination until all source
+    // blocks have authenticated. A late failure only removes the staging file.
+    std::fs::write(&out, b"keep the existing local file").unwrap();
+    fails(&["get", v, "/f.bin", s(&out), "--force", "--password-stdin"], &format!("{PW}\n"));
+    assert_eq!(std::fs::read(&out).unwrap(), b"keep the existing local file");
+    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".nullguard-")),
+        "partial staging file was left behind");
+}
+
+// Linux filesystems permit the invalid-UTF-8 names used by this regression.
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_names_roundtrip_without_collisions() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    let names = [b"f\xfe".to_vec(), b"f\xff".to_vec(), "f\u{fffd}".as_bytes().to_vec()];
+    for (i, bytes) in names.iter().enumerate() {
+        std::fs::write(src.join(std::ffi::OsString::from_vec(bytes.clone())), [i as u8]).unwrap();
+    }
+    let dirs = [b"d\xfe".to_vec(), b"d\xff".to_vec()];
+    for (i, bytes) in dirs.iter().enumerate() {
+        let d = src.join(std::ffi::OsString::from_vec(bytes.clone()));
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("child"), [i as u8]).unwrap();
+    }
+    // --force used to silently merge names containing different invalid bytes.
+    ok(&["put", v, s(&src), "/", "--force", "--password-stdin"], &format!("{PW}\n"));
+
+    // The top-level source name must retain its bytes too.
+    let single = dir.path().join(std::ffi::OsString::from_vec(b"single-\xff".to_vec()));
+    std::fs::write(&single, b"single").unwrap();
+    let imported = ng(&[OsStr::new("put"), vault.as_os_str(), single.as_os_str(), OsStr::new("/"),
+        OsStr::new("--password-stdin")], &format!("{PW}\n"));
+    assert!(imported.status.success(), "{}", String::from_utf8_lossy(&imported.stderr));
+
+    let out = dir.path().join("out");
+    // Exporting the root avoids passing non-UTF-8 through clap's string paths.
+    ok(&["get", v, "/", s(&out), "--force", "--password-stdin"], &format!("{PW}\n"));
+    assert_eq!(std::fs::read_dir(out.join("src")).unwrap().count(), names.len() + dirs.len());
+    for (i, bytes) in names.iter().enumerate() {
+        assert_eq!(std::fs::read(out.join("src").join(std::ffi::OsString::from_vec(bytes.clone()))).unwrap(), [i as u8]);
+    }
+    for (i, bytes) in dirs.iter().enumerate() {
+        assert_eq!(std::fs::read(out.join("src").join(std::ffi::OsString::from_vec(bytes.clone())).join("child")).unwrap(), [i as u8]);
+    }
+    assert_eq!(std::fs::read(out.join(single.file_name().unwrap())).unwrap(), b"single");
+}
+
+#[test]
+fn successful_forced_export_replaces_with_a_private_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v.ngv");
+    let v = s(&vault);
+    ok(&[&["create", v, "--size", "4M", "--password-stdin"][..], &FAST_KDF].concat(), &format!("{PW}\n"));
+    let src = dir.path().join("src");
+    std::fs::write(&src, b"complete authenticated replacement").unwrap();
+    ok(&["put", v, s(&src), "/", "--password-stdin"], &format!("{PW}\n"));
+    let out = dir.path().join("out");
+    std::fs::write(&out, b"old").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    ok(&["get", v, "/src", s(&out), "--force", "--password-stdin"], &format!("{PW}\n"));
+    assert_eq!(std::fs::read(&out).unwrap(), b"complete authenticated replacement");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    #[cfg(windows)]
+    assert!(!nullguard::platform::win::readable_by_others(&std::fs::File::open(&out).unwrap()).unwrap());
+    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".nullguard-")));
 }
 
 /// A `put --force` that fails partway (here: the replacement doesn't fit)

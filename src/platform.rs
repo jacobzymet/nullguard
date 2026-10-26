@@ -178,6 +178,16 @@ pub mod at {
         Ok(())
     }
 
+    /// Atomically publish a completed file within an open directory. The
+    /// destination entry is replaced, never followed if it became a link.
+    pub fn rename_file(dir: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        let from = c_name(from)?;
+        let to = c_name(to)?;
+        // SAFETY: a valid directory fd and NUL-terminated entry names.
+        check(unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) })?;
+        Ok(())
+    }
+
     /// Open `name` in `dir` for reading, never through a symbolic link, and
     /// without blocking: a named pipe opens at once instead of waiting for a
     /// writer, so the caller can look at what it got (`File::metadata`) and
