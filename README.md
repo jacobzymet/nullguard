@@ -8,7 +8,7 @@ keyfile and it appears as a normal folder. Everything inside (file contents,
 names, sizes, directory structure) is encrypted and authenticated. Lock it,
 and it's an opaque blob that detects any tampering.
 
-- **One portable binary.** No installer, no runtime, no DLLs, no driver of its
+- **A portable CLI, plus an optional desktop app.** The CLI has no installer, no runtime, no DLLs, no driver of its
   own. Copy `nullguard` (or `nullguard.exe`) onto a USB stick next to
   your vault and go.
 - **Audited cryptography.** XChaCha20-Poly1305 for data, Argon2id for
@@ -35,6 +35,7 @@ and it's an opaque blob that detects any tampering.
 ## Contents
 
 - [Quick start](#quick-start)
+- [Desktop app](#desktop-app)
 - [Commands](#commands)
 - [Platform support](#platform-support)
 - [Building a portable binary](#building-a-portable-binary)
@@ -47,6 +48,9 @@ and it's an opaque blob that detects any tampering.
 - [License](#license)
 
 ## Quick start
+
+For a graphical interface, use the [desktop app](#desktop-app). The following
+instructions are for the CLI.
 
 Choose your OS: [Linux](#linux), [macOS](#macos), or [Windows](#windows).
 Run the commands from the folder containing the binary. The Windows examples
@@ -209,6 +213,111 @@ Removing a keyfile stops it from unlocking this vault file from now on. It
 doesn't change the master key, so someone who already unlocked the vault,
 or kept an older copy of the file, can still read what that copy holds. For
 full revocation, run `nullguard rekey` (see below).
+
+## Desktop app
+
+`nullguard-desktop` is a separate Rust application built with egui. It uses
+the same vault format and engine as the CLI. Its controls look consistent
+across operating systems; file selection uses your OS's native dialog.
+
+1. Choose **Create a vault…**, select a location, size, and password, then
+   choose **Create and unlock**. Creating a vault reserves its full size on
+   disk and fills it with random data; progress and cancellation are available.
+2. For an existing vault, choose **Open a vault…**, then enter its password
+   or select its keyfile and choose **Unlock vault**.
+3. The app chooses an available mount location and opens your file manager.
+   Work with the files normally, then choose **Lock vault**. Wait for
+   **Locked** before removing storage.
+
+Closing the window locks open vaults and waits for their writes to finish.
+If a vault is busy, close the files using it and retry **Lock vault**. When
+your desktop supports a tray or menu-bar icon, its menu offers **Show
+Nullguard**, **Lock all vaults**, and **Lock and quit**. **Hide to tray / menu
+bar** keeps vaults open; it does not lock them.
+
+The app remembers vault locations, but never saves passwords or keyfile
+locations. It sends credentials to a worker process through a private pipe,
+with no credentials in process arguments or environment variables. Slow
+operations run in these workers. **Locked** appears only after the worker
+exits. OS and input-method buffers are outside the app's memory-wiping
+guarantees, as with other desktop password fields.
+
+**Advanced** offers read-only unlocking and an integrity check. Password
+changes, keyfile generation and management, rekeying, and offline file
+operations currently use the [CLI](#commands).
+
+Download builds from the successful [CI workflow's artifacts](https://github.com/jacobzymet/nullguard/actions/workflows/ci.yml):
+choose the `nullguard-desktop-…` artifact for your OS. These builds are
+currently unsigned; macOS builds are not notarized.
+
+### Desktop on Linux
+
+Install your distribution's `fuse3` package, with `/dev/fuse` enabled. Extract
+the downloaded archive and run it from your desktop session:
+
+```bash
+tar -xzf nullguard-desktop-linux.tar.gz
+./nullguard-desktop
+```
+
+The GUI needs the system's usual X11 or Wayland and OpenGL libraries; it is
+not the fully static musl CLI build. File dialogs on Linux use an XDG desktop
+portal; install your desktop's portal backend if dialogs do not open.
+Tray availability depends on the desktop environment.
+
+The dependency audit currently reports maintenance warnings for
+`zbus_names`, `zvariant`, and `zvariant_derive` in Linux accessibility and
+tray dependencies. Their functionality moved into zbus 6; upstream
+integration crates still use the older versions. These are maintenance
+warnings, with no known vulnerability advisory reported by the scan. CI
+continues to check the full lockfile and fails on known vulnerabilities.
+
+To build and launch from source, install Rust **1.95 or newer** and run from
+the repository root:
+
+```bash
+cargo run -p nullguard-desktop --release --locked
+```
+
+### Desktop on macOS
+
+Install [macFUSE](https://macfuse.github.io/) and complete its installation
+steps first. Unzip `Nullguard-macos.zip` and open `Nullguard.app`. An unsigned
+build may require approval in **System Settings → Privacy & Security**.
+
+To build and launch from source with Rust **1.95 or newer** and macFUSE
+installed, run from the repository root:
+
+```bash
+cargo run -p nullguard-desktop --release --locked
+```
+
+### Desktop on Windows
+
+Install [WinFsp 2.x](https://winfsp.dev/), then open
+`nullguard-desktop.exe`. Each unlocked vault receives a free drive letter.
+The GUI does not open a console window.
+
+To build and launch from source with Rust **1.95 or newer**, run in
+PowerShell from the repository root:
+
+```powershell
+cargo run -p nullguard-desktop --release --locked
+```
+
+### Testing the desktop app
+
+On Linux and Windows, run `cargo test --workspace --locked` to include the
+CLI and desktop tests. On macOS, use:
+
+```bash
+cargo test --workspace --locked --features nullguard/macos-no-mount,nullguard-desktop/macos-no-mount
+```
+
+Native Linux and Windows CI also test actual desktop worker creation,
+mounting, saving, locking, reopening, and a disconnected parent process.
+macOS CI builds the GUI and tests its offline worker operations; actual
+macFUSE mounting still requires testing on a configured Mac.
 
 ## Commands
 
@@ -882,6 +991,14 @@ src/
                  (with mount/winfsp.rs, the only code with `unsafe`)
 tests/cli.rs     end-to-end tests of the binary
 scripts/mount-test.sh  real FUSE mount test (Linux)
+desktop/
+  src/app.rs          egui desktop interface and session states
+  src/worker.rs       vault operations and mounts in isolated worker processes
+  src/protocol.rs     bounded private-pipe messages, OS-native paths
+  src/secret_input.rs masked password input without plaintext undo history
+  src/paths.rs        private settings, mount locations, file-manager opening
+  src/tray.rs         platform tray / menu-bar integration
+  tests/worker.rs     real executable and native-mount integration tests
 ```
 
 ## Limitations and roadmap

@@ -12,6 +12,26 @@ const KDF: Argon2Params = Argon2Params { memory_kib: Argon2Params::MIN_CREATE_ME
 /// Where the primary copy's wrapped password key starts.
 const PASSWORD_SLOT: u64 = 82;
 
+#[test]
+fn cancelled_creation_removes_only_its_partial_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cancelled.ngv");
+    let cancelled = std::cell::Cell::new(false);
+    let mut options = opts(4 << 20);
+    options.fill_random = true;
+    let result = Vault::create_cancellable(&path, PW, &options,
+        &mut |done, _| { if done > 0 { cancelled.set(true); } }, &|| cancelled.get());
+    assert!(result.is_err());
+    assert!(cancelled.get(), "cancellation must happen during filling");
+    assert!(!path.exists());
+
+    std::fs::write(&path, b"an existing file").unwrap();
+    assert!(Vault::create_cancellable(&path, PW, &options, &mut |_, _| {}, &|| false).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"an existing file");
+    assert!(Vault::create_cancellable(&path, PW, &options, &mut |_, _| {}, &|| true).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"an existing file");
+}
+
 struct Tmp {
     _dir: tempfile::TempDir,
     path: PathBuf,

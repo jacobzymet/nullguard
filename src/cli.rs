@@ -289,7 +289,7 @@ const MAX_KEYFILE_BYTES: u64 = 4096;
 
 /// Read and parse a keyfile: refuse one other users can read, and read it
 /// into one pre-sized, wiped-on-drop buffer.
-fn read_keyfile(path: &Path) -> Result<Keyfile> {
+pub fn read_keyfile(path: &Path) -> Result<Keyfile> {
     let what = || format!("reading keyfile {}", path.display());
     let file = std::fs::File::open(path).with_context(what)?;
     check_keyfile_permissions(path, &file)?;

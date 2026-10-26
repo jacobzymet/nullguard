@@ -6,6 +6,11 @@ license = "MIT"
 description = "Encrypted vault containers that mount as drives. A small, quantum-resistant VeraCrypt alternative."
 rust-version = "1.89"
 
+[workspace]
+members = ["desktop"]
+default-members = ["."]
+resolver = "3"
+
 [dependencies]
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize", "parallel"] }

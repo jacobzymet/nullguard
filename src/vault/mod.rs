@@ -136,6 +136,21 @@ impl Vault {
         opts: &CreateOptions,
         progress: &mut dyn FnMut(u64, u64),
     ) -> Result<(), Error> {
+        Self::create_cancellable(path, password, opts, progress, &|| false)
+    }
+
+    /// Create a vault with cooperative cancellation. A cancelled creation
+    /// removes only the file this call created, as with any other failure.
+    pub fn create_cancellable(
+        path: &Path,
+        password: &[u8],
+        opts: &CreateOptions,
+        progress: &mut dyn FnMut(u64, u64),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), Error> {
+        if cancelled() {
+            return Err(Error::Usage("vault creation cancelled".into()));
+        }
         opts.kdf.validate_for_new_slot()?;
         let chunk_size = opts.chunk_size.unwrap_or_else(|| auto_chunk_size(opts.size));
         let chunk_count = opts.size.saturating_sub(DATA_OFFSET) / chunk_stride(chunk_size);
@@ -162,7 +177,10 @@ impl Vault {
             let len = header.file_len();
             file.set_len(len)?;
             if opts.fill_random {
-                fill_random(&file, DATA_OFFSET, len, progress)?;
+                fill_random(&file, DATA_OFFSET, len, progress, cancelled)?;
+            }
+            if cancelled() {
+                return Err(Error::Usage("vault creation cancelled".into()));
             }
             let bytes = header.to_bytes();
             write_all_at(&file, &bytes, PRIMARY_OFFSET)?;
@@ -453,11 +471,14 @@ fn data_aead(master: &SecretKey) -> Result<Aead, Error> {
     Ok(Aead::new(derive_subkey(master, LABEL_DATA_KEY)?))
 }
 
-fn fill_random(file: &File, start: u64, end: u64, progress: &mut dyn FnMut(u64, u64)) -> Result<(), Error> {
+fn fill_random(file: &File, start: u64, end: u64, progress: &mut dyn FnMut(u64, u64), cancelled: &dyn Fn() -> bool) -> Result<(), Error> {
     const STEP: usize = 4 << 20;
     let mut buf = vec![0u8; STEP];
     let mut pos = start;
     while pos < end {
+        if cancelled() {
+            return Err(Error::Usage("vault creation cancelled".into()));
+        }
         let n = STEP.min((end - pos) as usize);
         crate::crypto::random::fill(&mut buf[..n])?;
         write_all_at(file, &buf[..n], pos)?;
