@@ -36,6 +36,10 @@ jobs:
           toolchain: stable
           components: clippy
       - run: cargo clippy --workspace --locked --all-targets ${{ matrix.features }} -- -D warnings
+      - name: Public documentation
+        run: cargo doc --workspace --locked --no-deps ${{ matrix.features }}
+        env:
+          RUSTDOCFLAGS: -D warnings
       - run: cargo test --workspace --locked ${{ matrix.features }}
 
   mount-test:

@@ -24,6 +24,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::crypto::{Aead, Argon2Params, CryptoError, Keyfile, SecretKey, ct_eq, derive_subkey};
+use crate::crypto::secret::ProtectedKey;
 use chunks::{ChunkStore, read_exact_at, write_all_at};
 use fs::Fs;
 use header::{BACKUP_OFFSET, DATA_OFFSET, HEADER_AREA, Header, HeaderError, PRIMARY_OFFSET, chunk_stride};
@@ -120,7 +121,7 @@ pub fn auto_chunk_size(size: u64) -> u32 {
 pub struct Vault {
     file: File,
     header: Header,
-    master: SecretKey,
+    master: ProtectedKey,
     path: PathBuf,
     read_only: bool,
     /// Security-relevant observations (a damaged header copy etc.). Callers
@@ -159,6 +160,8 @@ impl Vault {
             HeaderError::Malformed("too few chunks") => Error::Usage("vault size is too small".into()),
             other => other.into(),
         })?;
+        let aead = data_aead(&master)?;
+        drop(master); // do not retain a plaintext master during random filling
 
         // Only the owner may read the vault: other local users shouldn't even
         // get a copy to attack offline. (Private from the moment it exists,
@@ -185,7 +188,7 @@ impl Vault {
             let bytes = header.to_bytes();
             write_all_at(&file, &bytes, PRIMARY_OFFSET)?;
             write_all_at(&file, &bytes, BACKUP_OFFSET)?;
-            let store = ChunkStore::new(file.try_clone()?, &header, data_aead(&master)?, false);
+            let store = ChunkStore::new(file.try_clone()?, &header, aead, false);
             let fs = Fs::format(store, header.hash())?;
             drop(fs);
             file.sync_all()?;
@@ -279,6 +282,9 @@ impl Vault {
                     note(Error::WrongCredentials);
                     continue;
                 }
+                Err(HeaderError::Crypto(CryptoError::MemoryProtection)) => {
+                    return Err(CryptoError::MemoryProtection.into());
+                }
                 // E.g. a tampered copy demanding more memory than exists:
                 // that must not stop us from trying the other copy.
                 Err(e) => {
@@ -286,8 +292,10 @@ impl Vault {
                     continue;
                 }
             };
-            let store = ChunkStore::new(file.try_clone()?, &header, data_aead(&master)?, true);
-            match fs::current_header_hash(&store) {
+            let master = ProtectedKey::new(master)?;
+            let aead = master.with_key(data_aead)??;
+            let store = ChunkStore::new(file.try_clone()?, &header, aead, true);
+            match fs::current_header_hash(&store)? {
                 Some(current) if ct_eq(&current, &header.hash()) => {
                     found = Some((i, header, master));
                     break;
@@ -340,7 +348,8 @@ impl Vault {
     /// Open the filesystem inside the vault. The filesystem's own warnings
     /// are in `Fs::warnings`; the vault's stay in [`Vault::warnings`].
     pub fn into_fs(self) -> Result<Fs, Error> {
-        let store = ChunkStore::new(self.file.try_clone()?, &self.header, data_aead(&self.master)?, self.read_only);
+        let aead = self.master.with_key(data_aead)??;
+        let store = ChunkStore::new(self.file.try_clone()?, &self.header, aead, self.read_only);
         Fs::open(store, self.header.hash())
     }
 
@@ -374,10 +383,11 @@ impl Vault {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
+        let aead = self.master.with_key(data_aead)??;
         let bytes = new.to_bytes();
         write_all_at(&self.file, &bytes, BACKUP_OFFSET)?;
         self.file.sync_data()?;
-        let store = ChunkStore::new(self.file.try_clone()?, &self.header, data_aead(&self.master)?, false);
+        let store = ChunkStore::new(self.file.try_clone()?, &self.header, aead, false);
         let mut fs = Fs::open(store, self.header.hash())?;
         fs.commit_header_change(new.hash())?;
         drop(fs);
@@ -391,14 +401,14 @@ impl Vault {
     pub fn change_password(&mut self, new_password: &[u8], kdf: Argon2Params) -> Result<(), Error> {
         kdf.validate_for_new_slot()?;
         let mut h = self.header.clone();
-        h.set_password(&self.master, new_password, kdf)?;
+        self.master.with_key(|master| h.set_password(master, new_password, kdf))??;
         self.write_header(h)
     }
 
     /// Allow `keyfile` to unlock this vault.
     pub fn add_keyfile(&mut self, keyfile: &Keyfile) -> Result<(), Error> {
         let mut h = self.header.clone();
-        h.add_keyfile(&self.master, keyfile)?;
+        self.master.with_key(|master| h.add_keyfile(master, keyfile))??;
         self.write_header(h)
     }
 
@@ -470,7 +480,7 @@ fn stale_copy_warning(name: &str) -> String {
 }
 
 fn data_aead(master: &SecretKey) -> Result<Aead, Error> {
-    Ok(Aead::new(derive_subkey(master, LABEL_DATA_KEY)?))
+    Ok(Aead::new(derive_subkey(master, LABEL_DATA_KEY)?)?)
 }
 
 fn fill_random(file: &File, start: u64, end: u64, progress: &mut dyn FnMut(u64, u64), cancelled: &dyn Fn() -> bool) -> Result<(), Error> {

@@ -5,9 +5,12 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod key_memory;
+
 /// Reduce what an attacker with access to this machine could extract from
 /// the running process: no core dumps (which would contain keys), and on
-/// Linux no ptrace attach or /proc/<pid>/mem access by other processes of
+/// Linux no ptrace attach or `/proc/<pid>/mem` access by other processes of
 /// the same user.
 /// On Windows, refuse new memory-access/injection handles before accepting
 /// secrets. This is process-object hardening, not a sandbox or a replacement
@@ -432,6 +435,28 @@ pub mod win {
         .map_err(io::Error::from_raw_os_error)
     }
 
+    /// Encrypt one retained 256-bit key in place for this process only.
+    pub(crate) fn protect_key_memory(key: &mut [u8; crate::crypto::KEY_LEN]) -> io::Result<()> {
+        use windows_sys::Win32::Security::Cryptography::{
+            CRYPTPROTECTMEMORY_BLOCK_SIZE, CRYPTPROTECTMEMORY_SAME_PROCESS, CryptProtectMemory,
+        };
+        const { assert!(crate::crypto::KEY_LEN.is_multiple_of(CRYPTPROTECTMEMORY_BLOCK_SIZE as usize)) };
+        // SAFETY: the array is writable for its full length, a multiple of
+        // the API's block size. SAME_PROCESS is also used when decrypting.
+        let ok = unsafe { CryptProtectMemory(key.as_mut_ptr().cast(), key.len() as u32, CRYPTPROTECTMEMORY_SAME_PROCESS) };
+        if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    /// Decrypt a copy of a key encrypted by [`protect_key_memory`]. The
+    /// caller owns the zeroizing buffer and wipes it on success or failure.
+    pub(crate) fn unprotect_key_memory(key: &mut [u8; crate::crypto::KEY_LEN]) -> io::Result<()> {
+        use windows_sys::Win32::Security::Cryptography::{CRYPTPROTECTMEMORY_SAME_PROCESS, CryptUnprotectMemory};
+        // SAFETY: the writable array has the same fixed size and flags as
+        // the buffer passed to CryptProtectMemory. No pointer is retained.
+        let ok = unsafe { CryptUnprotectMemory(key.as_mut_ptr().cast(), key.len() as u32, CRYPTPROTECTMEMORY_SAME_PROCESS) };
+        if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
     /// Keep keys and decrypted data out of crash reports (the Windows
     /// counterpart of disabling core dumps), for this process only:
     ///
@@ -521,7 +546,7 @@ pub mod win {
         Ok(format!("D:P(A;;FA;;;{})(A;;FA;;;SY)", current_user_sid()?))
     }
 
-    /// [`private_sddl`] as Windows writes it back (it shortens some
+    /// The private security descriptor as Windows writes it back (it shortens some
     /// well-known accounts, such as the built-in Administrator to "LA"):
     /// what [`permissions_sddl`] reports for a private file.
     pub fn private_permissions_sddl() -> io::Result<String> {

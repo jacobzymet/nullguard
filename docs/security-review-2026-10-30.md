@@ -68,8 +68,9 @@ permissions; the restricted execution runner changes ACL behavior.
 
 ## Remaining work and limits
 
-- Retained keys are still plaintext in RAM, with best-effort page locking
-  and wiping. The previously blocked RAM-encryption refactor was not applied.
+- Retained keys were plaintext in RAM at the time of this review. The
+  subsequent [RAM key protection](ram-key-protection.md) change
+  encrypts retained master/data keys; its validation is documented separately.
 - Windows hardening restricts fresh process handles. Existing handles,
   thread-object attacks, privileged callers and compromised hosts remain
   outside that protection. It is not equivalent to VeraCrypt's driver.

@@ -22,7 +22,7 @@
 use std::fs::File;
 use std::io;
 
-use crate::crypto::{Aead, NONCE_LEN, TAG_LEN, ct_eq};
+use crate::crypto::{Aead, CryptoError, NONCE_LEN, TAG_LEN, ct_eq};
 
 use super::Error;
 use super::header::{DATA_OFFSET, Header, VAULT_ID_LEN, chunk_stride};
@@ -100,7 +100,10 @@ impl ChunkStore {
         }
         self.aead
             .open(&nonce, &self.aad(index), out, &tag)
-            .map_err(|_| Error::ChunkAuth { chunk: index })?;
+            .map_err(|error| match error {
+                CryptoError::MemoryProtection => Error::Crypto(error),
+                _ => Error::ChunkAuth { chunk: index },
+            })?;
         Ok(nonce)
     }
 

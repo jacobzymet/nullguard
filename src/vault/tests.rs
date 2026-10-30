@@ -56,6 +56,64 @@ fn open_fs(t: &Tmp) -> Fs {
     Vault::open(&t.path, Credential::Password(PW), false).unwrap().into_fs().unwrap()
 }
 
+fn store_with_key_failure(vault: &Vault, successful_uses: usize) -> ChunkStore {
+    let mut aead = vault.master.with_key(data_aead).unwrap().unwrap();
+    aead.fail_once_after(successful_uses);
+    ChunkStore::new(vault.file.try_clone().unwrap(), &vault.header, aead, false)
+}
+
+#[test]
+fn key_memory_failures_stop_recovery_instead_of_falling_back() {
+    let t = new_vault();
+    let vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    // Fail either superblock, then fail the newest metadata after both
+    // superblocks succeeded. A fallback would use the still-working key.
+    for successful_uses in [0, 1, 2] {
+        let store = store_with_key_failure(&vault, successful_uses);
+        assert!(matches!(Fs::open(store, vault.header.hash()), Err(Error::Crypto(CryptoError::MemoryProtection))));
+    }
+    for successful_uses in [0, 1] {
+        let store = store_with_key_failure(&vault, successful_uses);
+        assert!(matches!(fs::current_header_hash(&store), Err(Error::Crypto(CryptoError::MemoryProtection))));
+        assert_eq!(fs::current_header_hash(&store).unwrap(), Some(vault.header.hash()));
+    }
+}
+
+#[test]
+fn key_memory_failures_wipe_chunk_reads_and_leave_writes_untouched() {
+    let t = new_vault();
+    let vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    let mut before = vec![0; vault.header.file_len() as usize];
+    read_exact_at(&vault.file, &mut before, 0).unwrap();
+    let mut out = vec![0xA7; vault.header.chunk_size as usize];
+    let store = store_with_key_failure(&vault, 0);
+    assert!(matches!(store.read(0, None, &mut out), Err(Error::Crypto(CryptoError::MemoryProtection))));
+    assert!(out.iter().all(|&byte| byte == 0));
+    store.read(0, None, &mut out).unwrap();
+
+    let store = store_with_key_failure(&vault, 0);
+    assert!(matches!(store.write(0, &out), Err(Error::Crypto(CryptoError::MemoryProtection))));
+    let mut after = vec![0; before.len()];
+    read_exact_at(&vault.file, &mut after, 0).unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn key_memory_failure_before_header_write_keeps_credentials_unchanged() {
+    let t = new_vault();
+    let before = std::fs::read(&t.path).unwrap();
+    {
+        let mut vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+        // Password wrapping succeeds, then recovering the data key for
+        // write_header fails before either header copy is written.
+        vault.master.fail_once_after(1);
+        assert!(matches!(vault.change_password(PW2, KDF), Err(Error::Crypto(CryptoError::MemoryProtection))));
+    }
+    assert_eq!(std::fs::read(&t.path).unwrap(), before);
+    Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW2), false), Err(Error::WrongCredentials)));
+}
+
 fn patch(path: &Path, offset: u64, f: impl FnOnce(&mut [u8])) {
     let file = OpenOptions::new().read(true).write(true).open(path).unwrap();
     let mut b = [0u8; 1];
@@ -491,9 +549,10 @@ fn header_change_interrupted_between_its_two_commits_is_finished() {
         // copy, then one commit naming it, then a crash.
         let v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
         let mut new = v.header.clone();
-        new.set_password(&v.master, PW2, KDF).unwrap();
+        v.master.with_key(|master| new.set_password(master, PW2, KDF)).unwrap().unwrap();
         write_all_at(&v.file, &new.to_bytes(), BACKUP_OFFSET).unwrap();
-        let store = ChunkStore::new(v.file.try_clone().unwrap(), &v.header, data_aead(&v.master).unwrap(), false);
+        let aead = v.master.with_key(data_aead).unwrap().unwrap();
+        let store = ChunkStore::new(v.file.try_clone().unwrap(), &v.header, aead, false);
         let mut fs = Fs::open(store, v.header.hash()).unwrap();
         fs.commit_once_under(new.hash()).unwrap();
         fs.abandon();

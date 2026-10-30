@@ -31,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::crypto::{NONCE_LEN, ct_eq};
+use crate::crypto::{CryptoError, NONCE_LEN, ct_eq};
 
 use super::Error;
 use super::chunks::ChunkStore;
@@ -467,6 +467,7 @@ impl Fs {
         for slot in 0..SUPERBLOCK_SLOTS {
             match read_superblock(&fs.store, slot) {
                 Ok(sb) => supers.push(sb),
+                Err(e @ Error::Crypto(CryptoError::MemoryProtection)) => return Err(e),
                 Err(e) => fs.warnings.push(format!(
                     "superblock {slot} is unreadable ({e}). This means damage or tampering; \
                      the vault may have been rolled back by one commit."
@@ -499,6 +500,7 @@ impl Fs {
                     }
                     return Ok(fs);
                 }
+                Err(e @ Error::Crypto(CryptoError::MemoryProtection)) => return Err(e),
                 Err(e) => last_err = Some(e),
             }
         }
@@ -1396,13 +1398,19 @@ impl Fs {
 // file contents wipe themselves (`Name`, `Zeroizing`) when dropped.
 
 /// The hash of the vault header that the newest readable superblock was
-/// committed under: the vault's current header. `None` if no superblock
-/// decrypts (wrong key, or the vault is destroyed).
-pub(crate) fn current_header_hash(store: &ChunkStore) -> Option<[u8; 32]> {
-    (0..SUPERBLOCK_SLOTS)
-        .filter_map(|slot| read_superblock(store, slot).ok())
-        .max_by_key(|sb| sb.generation)
-        .map(|sb| sb.header_hash)
+/// committed under: the vault's current header. `Ok(None)` if no superblock
+/// authenticates. A local memory-protection failure is returned as an error
+/// instead of being treated as corruption or prompting an older fallback.
+pub(crate) fn current_header_hash(store: &ChunkStore) -> Result<Option<[u8; 32]>, Error> {
+    let mut newest: Option<Superblock> = None;
+    for slot in 0..SUPERBLOCK_SLOTS {
+        match read_superblock(store, slot) {
+            Ok(sb) if newest.as_ref().is_none_or(|old| sb.generation >= old.generation) => newest = Some(sb),
+            Err(e @ Error::Crypto(CryptoError::MemoryProtection)) => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(newest.map(|sb| sb.header_hash))
 }
 
 fn read_superblock(store: &ChunkStore, slot: u64) -> Result<Superblock, Error> {

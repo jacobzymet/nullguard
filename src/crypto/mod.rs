@@ -17,6 +17,7 @@
 pub mod aead;
 pub mod kdf;
 pub mod keyfile;
+mod memory;
 pub mod random;
 pub mod secret;
 
@@ -41,6 +42,8 @@ pub enum CryptoError {
     Kdf,
     #[error("the operating system's random number generator failed")]
     Rng,
+    #[error("the operating system could not protect or unlock key memory")]
+    MemoryProtection,
     #[error("invalid parameters: {0}")]
     InvalidParams(&'static str),
     #[error("invalid encoding: {0}")]

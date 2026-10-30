@@ -485,7 +485,7 @@ The main differences:
 | Header rollback | An old volume header backup restores old passwords/keyfiles | An old header is refused, even if a superblock is also destroyed |
 | What a cloud observer sees between versions | Which 16-byte blocks changed (deterministic per sector) | Which chunks changed; rewritten data is indistinguishable from random |
 | Password hashing | PBKDF2; Argon2id is also available for non-system volumes since 1.26.29 | Argon2id, 1 GiB by default (memory-hard) |
-| Windows memory protections | Driver-enforced process-memory access protection and optional RAM key encryption | Restricts new process-memory handles, locks key pages where possible, and wipes keys on drop; no RAM key encryption |
+| Windows memory protections | Driver-enforced process-memory access protection and optional RAM key encryption | Restricts new process-memory handles; encrypts retained master/data keys using Windows memory protection, with page locking and wiping |
 | Algorithm choice | 5 ciphers, cascades and 5 hashes; unlocking tries the combinations | One cipher, one password hash, one hash function |
 | Code base | Large C/C++ and assembly, its own kernel driver, bootloader | Small Rust, user space only (on Windows, mounting uses the separately installed WinFsp driver) |
 | Plausible deniability | Hidden volumes | Not offered (a vault is recognizable as one) |
@@ -603,6 +603,12 @@ synced to the cloud).
   reports it. Argon2's working memory and the file names held by the
   filesystem, listings and lookups are wiped when no longer needed, but
   are too large to lock: use encrypted swap.
+- Retained vault master/data keys stay encrypted in RAM on Windows, Linux
+  and macOS. Operations decrypt separate temporary copies and wipe them
+  afterwards, including on failure or panic. Protection failures stop the
+  operation without a plaintext fallback. Passwords, keyfile credentials
+  and decrypted file caches are outside this encryption boundary. See
+  [RAM key protection](docs/ram-key-protection.md) for the mechanisms and limits.
 - `--password-stdin` reads from the raw input handle into a wiped buffer,
   so the password does not remain in the standard input buffer while a
   vault is mounted.
@@ -630,6 +636,10 @@ synced to the cloud).
   options.
 - Core dumps are disabled. The process is marked non-dumpable, blocking
   `ptrace` and `/proc/<pid>/mem` access by other processes of the same user.
+- RAM-wrapping keys use dedicated, strictly locked pages, inaccessible
+  between encryption/decryption operations and surrounded by guard pages.
+  The kernel excludes these mappings from ordinary core dumps and fork
+  children. Failure to lock or protect them stops the operation.
 - `get` holds destination folders open and uses directory-relative,
   no-follow operations, preventing a folder-to-link swap from redirecting
   output. `put` lists and enters source folders through their open handles.
@@ -646,6 +656,10 @@ synced to the cloud).
   use `0700`.
 - Core dumps are disabled. Debugger attachment is refused with
   `PT_DENY_ATTACH`.
+- RAM-wrapping keys use dedicated, strictly locked pages, inaccessible
+  between encryption/decryption operations and surrounded by guard pages.
+  These mappings are excluded from fork children and request wired-page
+  zeroing on deallocation. Failure to lock or protect them stops the operation.
 - `get` holds destination folders open and uses directory-relative,
   no-follow operations, preventing a folder-to-link swap from redirecting
   output. `put` lists and enters source folders through their open handles.
@@ -681,8 +695,9 @@ synced to the cloud).
   cannot be installed. This is user-space hardening, not VeraCrypt's
   driver-enforced protection: existing handles, thread-object attacks,
   administrators with debug privileges and malware running as you remain
-  outside the guarantee. Keys are not encrypted in RAM; page locking and
-  wiping do not prevent cold-boot attacks or privileged memory capture.
+  outside the guarantee.
+- Retained vault master keys and chunk-encryption keys are encrypted in
+  RAM with Windows `CryptProtectMemory`, restricted to the same process.
 - Crash reports exclude heap
   memory, and a crash ends the process before a dump is taken. Mounting
   excludes `nullguard.exe` from Windows Error Reporting for the current
@@ -1008,7 +1023,9 @@ src/
   cli.rs         command line
   platform.rs    process hardening, no-follow file access for `get` and `put`,
                  Windows file permissions
-                 (with mount/winfsp.rs, the only code with `unsafe`)
+  platform/
+    key_memory.rs  locked, guarded Unix RAM-wrapping key pages
+                 (platform code and mount/winfsp.rs contain the `unsafe`)
 tests/cli.rs     end-to-end tests of the binary
 scripts/mount-test.sh  real FUSE mount test (Linux)
 desktop/
