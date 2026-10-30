@@ -9,7 +9,11 @@
 /// the running process: no core dumps (which would contain keys), and on
 /// Linux no ptrace attach or /proc/<pid>/mem access by other processes of
 /// the same user.
-pub fn harden_process() {
+/// On Windows, refuse new memory-access/injection handles before accepting
+/// secrets. This is process-object hardening, not a sandbox or a replacement
+/// for driver-enforced isolation. Existing handles and administrators with
+/// debug privileges remain outside this protection.
+pub fn harden_process() -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
@@ -26,7 +30,10 @@ pub fn harden_process() {
         }
     }
     #[cfg(windows)]
-    win::suppress_crash_reports();
+    {
+        win::suppress_crash_reports();
+        win::restrict_process_access()?;
+    }
     #[cfg(target_os = "macos")]
     {
         // The macOS counterpart: refuse debugger attachment (lldb, dtrace
@@ -36,6 +43,7 @@ pub fn harden_process() {
             libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0);
         }
     }
+    Ok(())
 }
 
 /// Real user id of this process (0 on Windows).
@@ -381,6 +389,47 @@ pub mod win {
         // SAFETY: allocated by ConvertSidToStringSidW.
         unsafe { LocalFree(text.cast()) };
         s
+    }
+
+    /// Restrict future OpenProcess calls, including calls by this user.
+    /// OWNER RIGHTS deliberately replaces the owner's implicit WRITE_DAC
+    /// grant: otherwise another process of the same user could undo this.
+    /// Keep limited queries, waiting, termination and READ_CONTROL available
+    /// for process supervision. SYSTEM retains full access. This cannot
+    /// revoke handles opened before startup hardening, protect thread
+    /// objects, or stop an administrator exercising debug privileges.
+    pub(super) fn restrict_process_access() -> io::Result<()> {
+        use std::sync::OnceLock;
+        use windows_sys::Win32::Security::{PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity};
+        use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+
+        // Applying the ACL removes ordinary WRITE_DAC access, so do it only
+        // once. Cache failures too: callers must not silently continue.
+        static RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
+        (*RESULT.get_or_init(|| {
+            let allowed = READ_CONTROL | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE;
+            let sddl = to_wide(&format!("D:P(A;;GA;;;SY)(A;;0x{allowed:08x};;;OW)"));
+            let mut sd: *mut c_void = null_mut();
+            // SAFETY: valid NUL-terminated SDDL; Windows allocates sd. Only
+            // this process's DACL is changed, and sd is freed after use.
+            unsafe {
+                if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, null_mut()) == 0 {
+                    return Err(io::Error::last_os_error().raw_os_error().unwrap_or(1));
+                }
+                let ok = SetKernelObjectSecurity(
+                    GetCurrentProcess(),
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    sd,
+                );
+                let result = if ok == 0 { Err(io::Error::last_os_error().raw_os_error().unwrap_or(1)) } else { Ok(()) };
+                LocalFree(sd);
+                result
+            }
+        }))
+        .map_err(io::Error::from_raw_os_error)
     }
 
     /// Keep keys and decrypted data out of crash reports (the Windows

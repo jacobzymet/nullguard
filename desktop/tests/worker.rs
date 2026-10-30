@@ -31,7 +31,7 @@ fn encoded(path: &Path) -> Vec<u8> {
 
 fn request(path: &Path, operation: Value) -> Value {
     json!({"operation": operation, "vault": encoded(path), "mountpoint": [],
-        "keyfile": null, "password": PASSWORD, "read_only": false})
+        "keyfile": null, "password": PASSWORD.as_bytes(), "read_only": false})
 }
 
 struct Worker {
@@ -150,7 +150,7 @@ fn verifies_existing_vault_and_rejects_wrong_password() {
     worker.until("Verified");
     worker.exit(true);
     let mut wrong = request(&path, json!("Verify"));
-    wrong["password"] = json!("a definitely wrong password");
+    wrong["password"] = json!(b"a definitely wrong password".as_slice());
     let mut worker = Worker::start(wrong);
     worker.until("Error");
     worker.exit(false);
@@ -199,7 +199,7 @@ fn verifies_with_a_keyfile_using_the_existing_permission_checks() {
     opened.add_keyfile(&key).unwrap();
     drop(opened);
     let mut req = request(&path, json!("Verify"));
-    req["password"] = json!("");
+    req["password"] = json!([]);
     req["keyfile"] = json!(encoded(&keypath));
     let mut worker = Worker::start(req);
     worker.until("Verified");
@@ -209,7 +209,7 @@ fn verifies_with_a_keyfile_using_the_existing_permission_checks() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&keypath, std::fs::Permissions::from_mode(0o644)).unwrap();
         let mut req = request(&path, json!("Verify"));
-        req["password"] = json!("");
+        req["password"] = json!([]);
         req["keyfile"] = json!(encoded(&keypath));
         let mut worker = Worker::start(req);
         worker.until("Error");

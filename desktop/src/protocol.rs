@@ -80,8 +80,51 @@ pub struct Request {
     pub vault: LocalPath,
     pub mountpoint: LocalPath,
     pub keyfile: Option<LocalPath>,
+    #[serde(with = "password_bytes")]
     pub password: Zeroizing<String>,
     pub read_only: bool,
+}
+
+// JSON string escapes are decoded through serde_json's ordinary Vec scratch
+// buffer, which is not wiped. A numeric byte array avoids putting a decoded
+// password in that buffer. Bound the decoded bytes before allocating more,
+// and keep both the byte buffer and the resulting string zeroizing.
+mod password_bytes {
+    use serde::{Deserializer, Serializer, de::{Error, SeqAccess, Visitor}};
+    use zeroize::Zeroizing;
+
+    pub fn serialize<S: Serializer>(password: &str, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(password.as_bytes())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Zeroizing<String>, D::Error> {
+        struct Password;
+        impl<'de> Visitor<'de> for Password {
+            type Value = Zeroizing<String>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a bounded UTF-8 byte array")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+                let limit = nullguard::cli::MAX_PASSWORD_BYTES;
+                let mut bytes = Zeroizing::new(Vec::with_capacity(limit));
+                while let Some(byte) = sequence.next_element::<u8>()? {
+                    if bytes.len() == limit {
+                        return Err(A::Error::custom("password exceeds the byte limit"));
+                    }
+                    bytes.push(byte);
+                }
+                let text = std::str::from_utf8(&bytes)
+                    .map_err(|_| A::Error::custom("password is not valid UTF-8"))?;
+                Ok(Zeroizing::new(text.to_owned()))
+            }
+        }
+        // Serde's default type errors can include the rejected value. Never
+        // relay that value to the GUI if a malformed request uses a string.
+        deserializer.deserialize_seq(Password)
+            .map_err(|_| D::Error::custom("invalid password encoding or length"))
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -123,6 +166,49 @@ pub fn read_packet(input: &mut impl Read) -> Result<Option<Zeroizing<Vec<u8>>>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_with(password: &str) -> Request {
+        Request {
+            operation: Operation::Verify,
+            vault: LocalPath::new(Path::new("test.ngv")),
+            mountpoint: LocalPath::new(Path::new("")),
+            keyfile: None,
+            password: Zeroizing::new(password.to_owned()),
+            read_only: true,
+        }
+    }
+
+    #[test]
+    fn passwords_use_byte_arrays_and_roundtrip_special_characters() {
+        let password = "quotes \" backslash \\ tab\t unicode 🔒";
+        let request = request_with(password);
+        let packet = serde_json::to_vec(&request).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&packet).unwrap();
+        assert!(value["password"].is_array());
+        let decoded: Request = serde_json::from_slice(&packet).unwrap();
+        assert_eq!(&*decoded.password, password);
+    }
+
+    #[test]
+    fn password_decode_limits_and_invalid_utf8_fail_without_echoing_input() {
+        let request = request_with("");
+        let mut value = serde_json::to_value(&request).unwrap();
+        for invalid in [
+            serde_json::json!([255]),
+            serde_json::json!(vec![65u8; nullguard::cli::MAX_PASSWORD_BYTES + 1]),
+            serde_json::json!("do not echo this password"),
+        ] {
+            value["password"] = invalid;
+            let error = match serde_json::from_value::<Request>(value.clone()) {
+                Ok(_) => panic!("invalid password encoding was accepted"),
+                Err(error) => error.to_string(),
+            };
+            assert!(!error.contains("do not echo this password"));
+        }
+        let request = request_with(&"a".repeat(nullguard::cli::MAX_PASSWORD_BYTES));
+        let packet = serde_json::to_vec(&request).unwrap();
+        assert!(serde_json::from_slice::<Request>(&packet).is_ok());
+    }
 
     #[test]
     fn packets_are_bounded_and_not_read_ahead() {

@@ -6,14 +6,15 @@ quantum-resistant alternative to VeraCrypt, written in Rust.
 A nullguard vault is a single ordinary file. Unlock it with a password or a
 keyfile and it appears as a normal folder. Everything inside (file contents,
 names, sizes, directory structure) is encrypted and authenticated. Lock it,
-and it's an opaque blob that detects any tampering.
+and it's an opaque blob that detects tampering with its authenticated contents.
 
 - **A portable CLI, plus an optional desktop app.** The CLI has no installer, no runtime, no DLLs, no driver of its
   own. Copy `nullguard` (or `nullguard.exe`) onto a USB stick next to
   your vault and go.
 - **Audited cryptography.** XChaCha20-Poly1305 for data, Argon2id for
   passwords and SHA-256 for hashing, all from audited Rust crates.
-- **Tamper-evident.** Every byte is authenticated. Modified, moved, swapped
+- **Tamper-evident.** Stored files and filesystem metadata are authenticated.
+  Modified, moved, swapped
   or *replayed* (rolled back) blocks are detected, and so is an old header
   put back to revive a removed keyfile or an old password.
 - **Crash-safe.** Copy-on-write with atomic commits: pulling the plug leaves
@@ -483,11 +484,17 @@ The main differences:
 | Integrity | XTS mode is unauthenticated: modified sectors decrypt to garbage silently, and blocks can be swapped or rolled back undetected | Every chunk is authenticated (AEAD) and bound to its position and exact version; tampering and rollback are detected |
 | Header rollback | An old volume header backup restores old passwords/keyfiles | An old header is refused, even if a superblock is also destroyed |
 | What a cloud observer sees between versions | Which 16-byte blocks changed (deterministic per sector) | Which chunks changed; rewritten data is indistinguishable from random |
-| Password hashing | PBKDF2 by default (not memory-hard: cheap on GPUs) | Argon2id, 1 GiB by default (memory-hard) |
+| Password hashing | PBKDF2; Argon2id is also available for non-system volumes since 1.26.29 | Argon2id, 1 GiB by default (memory-hard) |
+| Windows memory protections | Driver-enforced process-memory access protection and optional RAM key encryption | Restricts new process-memory handles, locks key pages where possible, and wipes keys on drop; no RAM key encryption |
 | Algorithm choice | 5 ciphers, cascades and 5 hashes; unlocking tries the combinations | One cipher, one password hash, one hash function |
 | Code base | Large C/C++ and assembly, its own kernel driver, bootloader | Small Rust, user space only (on Windows, mounting uses the separately installed WinFsp driver) |
 | Plausible deniability | Hidden volumes | Not offered (a vault is recognizable as one) |
 | Independent audit | Yes (2016, 2020) | **Not yet** |
+
+VeraCrypt's [current KDF documentation](https://veracrypt.io/en/Header%20Key%20Derivation.html)
+describes both PBKDF2 and Argon2id. When Argon2id is selected, its default is
+416 MiB and 6 passes; nullguard's default is 1 GiB and 4 passes. These
+settings alone do not establish which implementation is safer overall.
 
 ## Threat model
 
@@ -514,9 +521,13 @@ stick, cloud sync provider, backup operator, border search of a locked device).
 **2. Someone who can modify the vault file while it is locked** (malicious
 cloud storage, an "evil maid" with access to the file, a compromised backup).
 
-- **Any change is detected.** Every chunk is AEAD-authenticated with its
+- **Changes to stored files and metadata are detected.** Each allocated
+  chunk is AEAD-authenticated with its
   vault ID and position as associated data, so flipped bits, moved chunks and
   chunks copied from another vault are rejected.
+  Unused random space and superseded chunks are not authenticated by the
+  current filesystem state; changes to those bytes are not necessarily
+  detected. Truncated containers and extra trailing bytes are refused.
 - **Rollback of individual chunks is detected.** The authenticated metadata
   records the exact nonce each data chunk must have, so restoring an older
   (validly encrypted) version of a chunk fails.
@@ -662,8 +673,17 @@ synced to the cloud).
   replaced while copying. It refuses links, folders owned by another
   user, and file replacements through short 8.3 aliases such as
   `REPORT~1.PDF`. `put` holds each source folder on the way open.
-- Other ordinary processes of the same user can read nullguard's memory;
-  this falls under malware running as you. Crash reports exclude heap
+- Before accepting credentials, the CLI, desktop app and desktop workers
+  restrict new process handles to limited queries, waiting, termination
+  and reading permissions. New handles for reading/writing process memory,
+  injection, handle duplication and changing the process's permissions are
+  refused, including for the same user. Startup fails if this restriction
+  cannot be installed. This is user-space hardening, not VeraCrypt's
+  driver-enforced protection: existing handles, thread-object attacks,
+  administrators with debug privileges and malware running as you remain
+  outside the guarantee. Keys are not encrypted in RAM; page locking and
+  wiping do not prevent cold-boot attacks or privileged memory capture.
+- Crash reports exclude heap
   memory, and a crash ends the process before a dump is taken. Mounting
   excludes `nullguard.exe` from Windows Error Reporting for the current
   user, a lasting setting under
@@ -826,7 +846,7 @@ chunk area is filled with random bytes.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | magic `NULLGARD` |
-| 8 | 2 | version = 4 (3 is still supported) |
+| 8 | 2 | version = 4 (older versions are refused) |
 | 10 | 16 | vault ID (random) |
 | 26 | 4 | chunk size: power of two, 4 KiB to 1 MiB |
 | 30 | 8 | chunk count N (≥ 16) |

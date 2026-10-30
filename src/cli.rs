@@ -489,7 +489,7 @@ fn check_real_name(path: &Path, name: &OsStr) -> io::Result<()> {
 }
 
 pub fn run() -> Result<()> {
-    crate::platform::harden_process();
+    crate::platform::harden_process().context("could not enable process memory protection")?;
     let cli = Cli::parse();
     match cli.command {
         Command::Create { vault, size, kdf, password_stdin } => {

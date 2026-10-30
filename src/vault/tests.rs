@@ -117,6 +117,47 @@ fn create_write_reopen_read() {
 }
 
 #[test]
+fn opening_rejects_both_truncated_and_extended_vaults() {
+    for delta in [-1i64, 1] {
+        let t = new_vault();
+        let file = OpenOptions::new().write(true).open(&t.path).unwrap();
+        let len = file.metadata().unwrap().len();
+        file.set_len(len.checked_add_signed(delta).unwrap()).unwrap();
+        drop(file);
+        for read_only in [true, false] {
+            assert!(matches!(
+                Vault::open(&t.path, Credential::Password(PW), read_only),
+                Err(Error::Corrupt(_))
+            ), "a vault with size delta {delta} was accepted");
+        }
+    }
+}
+
+#[test]
+fn unused_space_is_outside_the_authentication_guarantee() {
+    let t = new_vault();
+    let header = Vault::peek_header(&t.path).unwrap();
+    // Formatting uses only the superblocks and the first metadata chunks.
+    // Changing a free chunk must not be described as detectable tampering.
+    patch(&t.path, chunk_offset(&t, header.chunk_count - 1), |b| b[0] ^= 1);
+    let mut fs = open_fs(&t);
+    assert!(fs.warnings.is_empty());
+    assert!(fs.verify().unwrap().bad_blocks.is_empty());
+}
+
+#[test]
+fn invalid_container_length_is_rejected_before_header_repair() {
+    let t = new_vault();
+    patch(&t.path, PRIMARY_OFFSET, |b| b[0] ^= 1);
+    let before = header_area(&t.path);
+    let file = OpenOptions::new().write(true).open(&t.path).unwrap();
+    file.set_len(file.metadata().unwrap().len() + 1).unwrap();
+    drop(file);
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), false), Err(Error::Corrupt(_))));
+    assert_eq!(header_area(&t.path), before, "invalid containers must not be repaired");
+}
+
+#[test]
 fn random_fill_vault() {
     let mut o = opts(2 << 20);
     o.fill_random = true;

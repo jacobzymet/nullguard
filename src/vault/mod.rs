@@ -302,6 +302,15 @@ impl Vault {
             return Err(err.unwrap_or(Error::WrongCredentials));
         };
 
+        // Check the complete container geometry before repairing either
+        // header. Otherwise appended bytes pass verification unnoticed.
+        let actual_len = file.metadata()?.len();
+        if actual_len != header.file_len() {
+            let problem = if actual_len < header.file_len() { "is truncated" } else { "has unexpected trailing bytes" };
+            return Err(Error::Corrupt(format!(
+                "the vault file {problem} ({actual_len} bytes, expected {})", header.file_len()
+            )));
+        }
         let mut warnings = Vec::new();
         let current = header.to_bytes();
         let (name, offset, other) = if i == 0 { ("backup", BACKUP_OFFSET, &backup) } else { ("primary", PRIMARY_OFFSET, &primary) };
@@ -316,13 +325,6 @@ impl Vault {
                      password or keyfile change, or tampering). It has been restored from the current header."
                 ));
             }
-        }
-        let actual_len = file.metadata()?.len();
-        if actual_len < header.file_len() {
-            return Err(Error::Corrupt(format!(
-                "the vault file is truncated ({actual_len} bytes, expected {})",
-                header.file_len()
-            )));
         }
         Ok(Self { file, header, master, path: path.to_owned(), read_only, warnings })
     }
