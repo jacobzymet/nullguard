@@ -2,7 +2,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use nullguard::{
@@ -12,6 +12,11 @@ use nullguard::{
 use serde_json::{Value, json};
 
 const PASSWORD: &str = "test vault long password";
+
+// A concurrent Unix fork can briefly inherit another test's locked fixture
+// descriptor until exec closes it. Keep fixture creation/reopening and worker
+// launches in separate tests from overlapping; production lock checks stay strict.
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn encoded(path: &Path) -> Vec<u8> {
     #[cfg(unix)]
@@ -148,6 +153,7 @@ fn vault(path: &Path) {
 
 #[test]
 fn verifies_existing_vault_and_rejects_wrong_password() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("vault.ngv");
     vault(&path);
@@ -163,6 +169,7 @@ fn verifies_existing_vault_and_rejects_wrong_password() {
 
 #[test]
 fn worker_is_ready_before_credentials_and_honors_actual_kdf_consent() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut worker = Worker::spawn();
     let ready = worker.until("Ready");
     assert_eq!(ready["Ready"]["protocol_version"], 1);
@@ -188,6 +195,7 @@ fn worker_is_ready_before_credentials_and_honors_actual_kdf_consent() {
 
 #[test]
 fn cancelling_creation_removes_partial_vault_and_preserves_existing_files() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cancelled.ngv");
     let create = json!({"Create": {"size": 1_u64 << 32, "low_memory": true}});
@@ -206,6 +214,7 @@ fn cancelling_creation_removes_partial_vault_and_preserves_existing_files() {
 
 #[test]
 fn verifies_with_a_keyfile_using_the_existing_permission_checks() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("vault.ngv");
     vault(&path);
@@ -250,6 +259,7 @@ fn verifies_with_a_keyfile_using_the_existing_permission_checks() {
 #[test]
 #[ignore = "requires an installed FUSE/WinFsp driver; run by native mount CI"]
 fn mount_lock_reopen_and_parent_disconnect_commit_files() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("vault.ngv");
     #[cfg(unix)]
