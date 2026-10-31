@@ -50,6 +50,13 @@ pub fn rekey(
     kdf: Argon2Params,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<RekeyReport, Error> {
+    rekey_with_kdf_limits(path, cred, new_password, kdf, progress, crate::crypto::kdf::KdfLimits::STANDARD)
+}
+
+/// Rekey with an explicit resource approval for unlocking the old vault.
+pub fn rekey_with_kdf_limits(path: &Path, cred: Credential<'_>, new_password: &[u8],
+    kdf: Argon2Params, progress: &mut dyn FnMut(u64, u64), limits: crate::crypto::kdf::KdfLimits,
+) -> Result<RekeyReport, Error> {
     // Work on the real file: renaming over a symbolic link would replace
     // the link and leave the old-key vault in place where it points.
     let shown = temp_path(path);
@@ -64,7 +71,7 @@ pub fn rekey(
     }
     // Opened for writing only to hold the exclusive lock: nothing else may
     // change the vault while it is being copied.
-    let old = Vault::open(path, cred, false)?;
+    let old = Vault::open_with_kdf_limits(path, cred, false, limits)?;
     let mut report = RekeyReport { keyfiles_dropped: old.header().keyfiles.len(), ..Default::default() };
     report.warnings = old.warnings.clone();
     let size = old.header().file_len();
@@ -78,14 +85,14 @@ pub fn rekey(
     Vault::create(&tmp, new_password, &opts, progress)?;
 
     let result = (|| {
-        let mut new_fs = Vault::open(&tmp, Credential::Password(new_password), false)?.into_fs()?;
+        let mut new_fs = Vault::open_with_kdf_limits(&tmp, Credential::Password(new_password), false, crate::crypto::kdf::KdfLimits::FORMAT_MAX)?.into_fs()?;
         new_fs.set_auto_commit(false);
         copy_tree(&mut old_fs, &mut new_fs, &mut report)?;
         new_fs.commit()?;
         drop(new_fs);
 
         // Authenticate every block of the copy, and check nothing is missing.
-        let mut check = Vault::open(&tmp, Credential::Password(new_password), true)?.into_fs()?;
+        let mut check = Vault::open_with_kdf_limits(&tmp, Credential::Password(new_password), true, crate::crypto::kdf::KdfLimits::FORMAT_MAX)?.into_fs()?;
         let v = check.verify()?;
         if !v.bad_blocks.is_empty() || !check.warnings.is_empty() {
             return Err(Error::Corrupt("the new vault failed verification; the old vault is unchanged".into()));

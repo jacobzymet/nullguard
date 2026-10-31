@@ -1,0 +1,46 @@
+name: Parser fuzzing
+
+on:
+  push:
+    paths: ['src/**', 'fuzz/**', 'Cargo.lock', '.github/workflows/fuzz.yml']
+  pull_request:
+    paths: ['src/**', 'fuzz/**', 'Cargo.lock', '.github/workflows/fuzz.yml']
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [header, superblock, metadata, keyfile]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: nightly
+          components: rust-src
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Fuzz the parser
+        working-directory: fuzz
+        env:
+          FUZZ_SECONDS: ${{ github.event_name == 'schedule' && '600' || '60' }}
+        run: |
+          mkdir -p corpus/${{ matrix.target }} artifacts/${{ matrix.target }}
+          cp seeds/${{ matrix.target }}/* corpus/${{ matrix.target }}/
+          cargo +nightly fuzz run ${{ matrix.target }} corpus/${{ matrix.target }} -- -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -max_len=1048576 -timeout=15
+      - name: Preserve failing inputs
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: fuzz-failures-${{ matrix.target }}
+          path: fuzz/artifacts/**
+          if-no-files-found: ignore

@@ -49,6 +49,19 @@ const SUPER_FIXED_LEN: usize = 8 + 8 + 32 + 8 + 32 + 4;
 const EXTENT_LEN: usize = 12;
 
 const CACHE_CAPACITY: usize = 256;
+const CACHE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_METADATA_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BITMAP_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_INODES: u64 = 100_000;
+const MAX_BLOCK_REFS: usize = MAX_METADATA_BYTES / 40;
+const MAX_READ_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) fn check_resource_geometry(chunk_count: u64) -> Result<(), Error> {
+    if chunk_count.div_ceil(64) > MAX_BITMAP_BYTES / 8 {
+        return Err(Error::ResourceLimit("allocation map exceeds 64 MiB"));
+    }
+    Ok(())
+}
 const COMMIT_INTERVAL: Duration = Duration::from_secs(2);
 
 const KIND_FILE: u8 = 1;
@@ -277,6 +290,7 @@ impl Bitmap {
     /// Fallible version: a huge (e.g. sparse, petabyte-sized) vault fails
     /// cleanly instead of aborting the process.
     fn try_new(len: u64) -> Result<Self, Error> {
+        check_resource_geometry(len)?;
         let n = usize::try_from(len.div_ceil(64)).map_err(|_| Error::NoSpace)?;
         let mut words = Vec::new();
         words
@@ -337,11 +351,12 @@ impl Bitmap {
 struct Cache {
     map: HashMap<u64, Zeroizing<Vec<u8>>>,
     order: VecDeque<u64>,
+    bytes: usize,
 }
 
 impl Cache {
     fn new() -> Self {
-        Self { map: HashMap::new(), order: VecDeque::new() }
+        Self { map: HashMap::new(), order: VecDeque::new(), bytes: 0 }
     }
 
     fn get(&self, chunk: u64) -> Option<&[u8]> {
@@ -349,18 +364,23 @@ impl Cache {
     }
 
     fn insert(&mut self, chunk: u64, data: Zeroizing<Vec<u8>>) {
-        if self.map.insert(chunk, data).is_none() {
+        self.bytes += data.len();
+        if let Some(old) = self.map.insert(chunk, data) {
+            self.bytes -= old.len();
+        } else {
             self.order.push_back(chunk);
         }
-        while self.order.len() > CACHE_CAPACITY {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
+        while self.order.len() > CACHE_CAPACITY || self.bytes > CACHE_BYTES {
+            if let Some(old) = self.order.pop_front()
+                && let Some(data) = self.map.remove(&old) {
+                self.bytes -= data.len();
             }
         }
     }
 
     fn remove(&mut self, chunk: u64) {
-        if self.map.remove(&chunk).is_some() {
+        if let Some(data) = self.map.remove(&chunk) {
+            self.bytes -= data.len();
             self.order.retain(|&c| c != chunk);
         }
     }
@@ -370,6 +390,7 @@ pub struct Fs {
     store: ChunkStore,
     chunk_size: u64,
     inodes: HashMap<u64, Inode>,
+    block_refs: usize,
     next_ino: u64,
     generation: u64,
     /// SHA-256 of the vault header in use, recorded in every commit.
@@ -435,6 +456,7 @@ impl Fs {
             chunk_size: store.chunk_size() as u64,
             store,
             inodes: HashMap::new(),
+            block_refs: 0,
             next_ino: ROOT_INO + 1,
             generation: 0,
             header_hash,
@@ -467,7 +489,7 @@ impl Fs {
         for slot in 0..SUPERBLOCK_SLOTS {
             match read_superblock(&fs.store, slot) {
                 Ok(sb) => supers.push(sb),
-                Err(e @ Error::Crypto(CryptoError::MemoryProtection)) => return Err(e),
+                Err(e @ (Error::Crypto(CryptoError::MemoryProtection | CryptoError::ResourceLimit(_)) | Error::ResourceLimit(_))) => return Err(e),
                 Err(e) => fs.warnings.push(format!(
                     "superblock {slot} is unreadable ({e}). This means damage or tampering; \
                      the vault may have been rolled back by one commit."
@@ -500,7 +522,7 @@ impl Fs {
                     }
                     return Ok(fs);
                 }
-                Err(e @ Error::Crypto(CryptoError::MemoryProtection)) => return Err(e),
+                Err(e @ (Error::Crypto(CryptoError::MemoryProtection | CryptoError::ResourceLimit(_)) | Error::ResourceLimit(_))) => return Err(e),
                 Err(e) => last_err = Some(e),
             }
         }
@@ -510,6 +532,9 @@ impl Fs {
     fn load_metadata(&mut self, sb: &Superblock) -> Result<(), Error> {
         let cs = self.chunk_size as usize;
         let blob_len = sb.meta_chunks.len() * cs;
+        if blob_len > MAX_METADATA_BYTES {
+            return Err(Error::ResourceLimit("metadata exceeds 64 MiB"));
+        }
         let mut blob = Zeroizing::new(Vec::new());
         blob.try_reserve_exact(blob_len)
             .map_err(|_| Error::Corrupt("not enough memory to load the vault's metadata".into()))?;
@@ -536,8 +561,11 @@ impl Fs {
                 return Err(Error::Corrupt("metadata chunk referenced twice".into()));
             }
         }
+        let mut block_refs: usize = 0;
         for inode in inodes.values() {
             if let Node::File { blocks, .. } = &inode.node {
+                block_refs = block_refs.checked_add(blocks.len()).filter(|&n| n <= MAX_BLOCK_REFS)
+                    .ok_or(Error::ResourceLimit("too many stored block references"))?;
                 for b in blocks.values() {
                     if b.chunk >= self.store.chunk_count() || !bitmap.set(b.chunk) {
                         return Err(Error::Corrupt("data chunk out of range or referenced twice".into()));
@@ -552,6 +580,7 @@ impl Fs {
             }
         }
         self.inodes = inodes;
+        self.block_refs = block_refs;
         self.next_ino = next_ino;
         self.bitmap = bitmap;
         self.generation = sb.generation;
@@ -610,7 +639,11 @@ impl Fs {
         }
         self.check_writable()?;
         let started = Instant::now();
-        let blob = encode_metadata(self.next_ino, &self.inodes, self.reachable());
+        let order = self.reachable();
+        if self.inodes.len() as u64 > MAX_INODES || metadata_len(&self.inodes, &order) > MAX_METADATA_BYTES {
+            return Err(Error::ResourceLimit("filesystem metadata limit reached"));
+        }
+        let blob = encode_metadata(self.next_ino, &self.inodes, order);
         let cs = self.chunk_size as usize;
         let nchunks = blob.len().div_ceil(cs).max(1);
 
@@ -977,6 +1010,9 @@ impl Fs {
 
     fn add_entry(&mut self, parent: u64, name: &[u8], perm: u16, node: Node) -> Result<u64, Error> {
         self.check_writable()?;
+        if self.inodes.len() as u64 >= MAX_INODES {
+            return Err(Error::ResourceLimit("filesystem exceeds 100000 inodes"));
+        }
         validate_name(name)?;
         if self.dir_entries(parent)?.contains_key(name) {
             return Err(Error::Exists);
@@ -1032,6 +1068,7 @@ impl Fs {
 
     fn destroy_inode(&mut self, ino: u64) {
         if let Some(Inode { node: Node::File { blocks, .. }, .. }) = self.inodes.remove(&ino) {
+            self.block_refs -= blocks.len();
             for b in blocks.into_values() {
                 self.free_chunk(b.chunk);
             }
@@ -1163,12 +1200,13 @@ impl Fs {
 
     /// Read up to `len` bytes at `offset`. Fails if any block in range fails
     /// authentication (no partial plaintext of a tampered block is returned).
+    /// Returns at most 8 MiB per call; callers continue at the returned offset.
     pub fn read(&mut self, ino: u64, offset: u64, len: usize) -> Result<Zeroizing<Vec<u8>>, Error> {
         let (size, _) = self.file_parts(ino)?;
         if offset >= size || len == 0 {
             return Ok(Zeroizing::new(Vec::new()));
         }
-        let end = size.min(offset.saturating_add(len as u64));
+        let end = size.min(offset.saturating_add(len.min(MAX_READ_BYTES) as u64));
         let cs = self.chunk_size;
         let mut out = Zeroizing::new(Vec::with_capacity((end - offset) as usize));
         let mut buf = Zeroizing::new(vec![0u8; cs as usize]);
@@ -1201,6 +1239,8 @@ impl Fs {
         };
         if let Some(o) = old {
             self.free_chunk(o.chunk);
+        } else {
+            self.block_refs += 1;
         }
         Ok(())
     }
@@ -1228,6 +1268,9 @@ impl Fs {
         let mut pos = offset;
         while pos < end {
             let idx = pos / cs;
+            if self.block_refs >= MAX_BLOCK_REFS && self.block_ref(ino, idx)?.is_none() {
+                return Err(Error::ResourceLimit("too many stored block references"));
+            }
             let bstart = idx * cs;
             let to = end.min(bstart + cs);
             let whole = pos == bstart && to == bstart + cs;
@@ -1272,6 +1315,7 @@ impl Fs {
                 Node::File { blocks, .. } => blocks.split_off(&keep).into_values().collect(),
                 _ => Vec::new(),
             };
+            self.block_refs -= dropped.len();
             for b in dropped {
                 self.free_chunk(b.chunk);
             }
@@ -1406,7 +1450,7 @@ pub(crate) fn current_header_hash(store: &ChunkStore) -> Result<Option<[u8; 32]>
     for slot in 0..SUPERBLOCK_SLOTS {
         match read_superblock(store, slot) {
             Ok(sb) if newest.as_ref().is_none_or(|old| sb.generation >= old.generation) => newest = Some(sb),
-            Err(e @ Error::Crypto(CryptoError::MemoryProtection)) => return Err(e),
+            Err(e @ (Error::Crypto(CryptoError::MemoryProtection | CryptoError::ResourceLimit(_)) | Error::ResourceLimit(_))) => return Err(e),
             _ => {}
         }
     }
@@ -1430,6 +1474,9 @@ fn parse_superblock(buf: &[u8], chunk_count: u64) -> Result<Superblock, Error> {
     let generation = r.u64().map_err(bad)?;
     let header_hash = r.array::<32>().map_err(bad)?;
     let meta_len = r.u64().map_err(bad)?;
+    if meta_len > MAX_METADATA_BYTES as u64 {
+        return Err(Error::ResourceLimit("metadata exceeds 64 MiB"));
+    }
     let meta_hash = r.array::<32>().map_err(bad)?;
     let n = r.u32().map_err(bad)? as u64;
     // How many metadata chunks there must be. Checked before anything is
@@ -1536,14 +1583,15 @@ fn put_ts(out: &mut Vec<u8>, t: Timestamp) {
 /// allocated once: a growing buffer would move, leaving unwiped copies of
 /// the name table behind.
 fn metadata_len(inodes: &HashMap<u64, Inode>, order: &[u64]) -> usize {
-    let mut len = 8 + 8 + 8;
+    let mut len: usize = 8 + 8 + 8;
     for ino in order {
-        len += 8 + 1 + 2 + 4 * 12;
-        len += match &inodes[ino].node {
-            Node::File { blocks, .. } => 8 + 8 + 40 * blocks.len(),
-            Node::Dir { entries, .. } => 8 + 4 + entries.keys().map(|n| 2 + n.len() + 8).sum::<usize>(),
+        len = len.saturating_add(8 + 1 + 2 + 4 * 12);
+        let extra = match &inodes[ino].node {
+            Node::File { blocks, .. } => 16usize.saturating_add(40usize.saturating_mul(blocks.len())),
+            Node::Dir { entries, .. } => entries.keys().fold(12usize, |len, n| len.saturating_add(10 + n.len())),
             Node::Symlink { target } => 4 + target.len(),
         };
+        len = len.saturating_add(extra);
     }
     len
 }
@@ -1605,6 +1653,9 @@ fn decode_metadata(
     chunk_size: u64,
     max_file_size: u64,
 ) -> Result<(u64, HashMap<u64, Inode>), Error> {
+    if blob.len() > MAX_METADATA_BYTES {
+        return Err(Error::ResourceLimit("metadata exceeds 64 MiB"));
+    }
     let bad = |what: &str| Error::Corrupt(format!("malformed metadata: {what}"));
     let mut r = Reader::new(blob);
     let e = |_| bad("truncated");
@@ -1613,6 +1664,9 @@ fn decode_metadata(
     }
     let next_ino = r.u64().map_err(e)?;
     let count = r.u64().map_err(e)?;
+    if count > MAX_INODES {
+        return Err(Error::ResourceLimit("filesystem exceeds 100000 inodes"));
+    }
     // Each inode takes at least 59 bytes (its fixed fields), which bounds
     // `count` by the blob.
     if count == 0 || count > blob.len() as u64 / 59 {
@@ -1760,6 +1814,73 @@ impl Fs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzz_seed_metadata_and_superblock_are_valid() {
+        decode_metadata(include_bytes!("../../fuzz/seeds/metadata/root-only"), 4096, 1 << 40).expect("valid metadata seed");
+        let seed = include_bytes!("../../fuzz/seeds/superblock/one-extent");
+        let count = u64::from_le_bytes(seed[..8].try_into().unwrap()) % (1 << 24);
+        let mut bytes = [0; 4096];
+        bytes[..seed.len() - 8].copy_from_slice(&seed[8..]);
+        parse_superblock(&bytes, count).expect("valid superblock seed");
+    }
+
+    #[test]
+    fn oversized_metadata_and_bitmaps_fail_before_allocation() {
+        assert!(matches!(Bitmap::try_new(MAX_BITMAP_BYTES * 8 + 1), Err(Error::ResourceLimit(_))));
+        let mut bytes = vec![0; 4096];
+        bytes[..8].copy_from_slice(SUPER_MAGIC);
+        bytes[48..56].copy_from_slice(&(MAX_METADATA_BYTES as u64 + 1).to_le_bytes());
+        assert!(matches!(parse_superblock(&bytes, 1 << 30), Err(Error::ResourceLimit(_))));
+        let mut metadata = META_MAGIC.to_vec();
+        metadata.extend_from_slice(&1u64.to_le_bytes());
+        metadata.extend_from_slice(&(MAX_INODES + 1).to_le_bytes());
+        assert!(matches!(decode_metadata(&metadata, 4096, 1 << 40), Err(Error::ResourceLimit(_))));
+    }
+
+    #[test]
+    fn decrypted_cache_is_bounded_by_bytes_and_counts_replacements() {
+        let mut cache = Cache::new();
+        for i in 0..20 {
+            cache.insert(i, Zeroizing::new(vec![0; 1024 * 1024]));
+            assert!(cache.bytes <= CACHE_BYTES);
+        }
+        assert!(cache.get(0).is_none());
+        cache.insert(19, Zeroizing::new(vec![0; 16]));
+        let bytes = cache.bytes;
+        cache.remove(19);
+        assert_eq!(cache.bytes, bytes - 16);
+        assert_eq!(cache.bytes, cache.map.values().map(|v| v.len()).sum());
+    }
+
+    #[test]
+    fn live_block_accounting_survives_rewrites_truncation_and_unlink() {
+        use crate::vault::{CreateOptions, Credential, Vault};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.ngv");
+        let password = b"long test passphrase";
+        Vault::create(&path, password, &CreateOptions {
+            size: 32 << 20, kdf: crate::crypto::Argon2Params::LOW_MEMORY,
+            chunk_size: Some(4096), fill_random: false,
+        }, &mut |_, _| {}).unwrap();
+        let mut fs = Vault::open(&path, Credential::Password(password), false).unwrap().into_fs().unwrap();
+        fs.set_auto_commit(false);
+        let file = fs.create_file(ROOT_INO, b"file", 0o600).unwrap();
+        fs.write(file, 0, &[1; 4096]).unwrap();
+        fs.write(file, 4096, &[2; 4096]).unwrap();
+        fs.write(file, 0, &[3; 4096]).unwrap();
+        assert_eq!(fs.block_refs, 2);
+        fs.set_attr(file, &SetAttr { size: Some(4096), ..Default::default() }).unwrap();
+        assert_eq!(fs.block_refs, 1);
+        fs.set_attr(file, &SetAttr { size: Some(24 << 20), ..Default::default() }).unwrap();
+        assert_eq!(fs.read(file, 0, usize::MAX).unwrap().len(), MAX_READ_BYTES);
+        fs.commit().unwrap();
+        drop(fs);
+        let mut fs = Vault::open(&path, Credential::Password(password), false).unwrap().into_fs().unwrap();
+        assert_eq!(fs.block_refs, 1);
+        fs.unlink(ROOT_INO, b"file").unwrap();
+        assert_eq!(fs.block_refs, 0);
+    }
 
     #[test]
     fn timestamps_roundtrip() {

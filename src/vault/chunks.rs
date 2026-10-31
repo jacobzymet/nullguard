@@ -101,7 +101,7 @@ impl ChunkStore {
         self.aead
             .open(&nonce, &self.aad(index), out, &tag)
             .map_err(|error| match error {
-                CryptoError::MemoryProtection => Error::Crypto(error),
+                CryptoError::MemoryProtection | CryptoError::ResourceLimit(_) => Error::Crypto(error),
                 _ => Error::ChunkAuth { chunk: index },
             })?;
         Ok(nonce)
@@ -128,7 +128,7 @@ impl ChunkStore {
     /// Flush all writes to stable storage.
     pub fn sync(&self) -> Result<(), Error> {
         if !self.read_only {
-            self.file.sync_data()?;
+            sync_data(&self.file)?;
         }
         Ok(())
     }
@@ -157,6 +157,15 @@ pub(crate) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Res
 }
 
 pub(crate) fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(prefix) = fault::next() {
+        write_all_at_impl(file, &buf[..prefix.min(buf.len())], offset)?;
+        return Err(io::Error::other("injected torn write"));
+    }
+    write_all_at_impl(file, buf, offset)
+}
+
+fn write_all_at_impl(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
@@ -175,5 +184,44 @@ pub(crate) fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<(
             }
         }
         Ok(())
+    }
+}
+
+pub(crate) fn sync_data(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    if fault::next().is_some() { return Err(io::Error::other("injected flush failure")); }
+    file.sync_data()
+}
+
+pub(crate) fn sync_all(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    if fault::next().is_some() { return Err(io::Error::other("injected flush failure")); }
+    file.sync_all()
+}
+
+/// Thread-local, one-shot write/flush faults; absent from production builds.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+    #[derive(Clone, Copy)]
+    struct Plan { remaining: usize, prefix: usize, fired: bool }
+    thread_local! { static PLAN: Cell<Option<Plan>> = const { Cell::new(None) }; }
+    struct Restore(Option<Plan>);
+    impl Drop for Restore { fn drop(&mut self) { PLAN.with(|p| p.set(self.0)); } }
+    pub(super) fn next() -> Option<usize> {
+        PLAN.with(|state| {
+            let mut plan = state.get()?;
+            if plan.fired { return None; }
+            let result = if plan.remaining == 0 { plan.fired = true; Some(plan.prefix) }
+                else { plan.remaining -= 1; None };
+            state.set(Some(plan));
+            result
+        })
+    }
+    pub(crate) fn after<T>(operations: usize, prefix: usize, action: impl FnOnce() -> T) -> (T, bool) {
+        let _restore = Restore(PLAN.with(|p| p.replace(Some(Plan { remaining: operations, prefix, fired: false }))));
+        let result = action();
+        let fired = PLAN.with(|p| p.get().unwrap().fired);
+        (result, fired)
     }
 }

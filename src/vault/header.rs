@@ -339,7 +339,12 @@ impl Header {
     /// An error means key derivation or OS key-memory protection failed
     /// (for example a header asking for more memory than the machine has).
     pub fn unlock_with_password(&self, password: &[u8]) -> Result<Option<SecretKey>, HeaderError> {
-        let kek = kdf::derive_key(password, &self.salt, &self.kdf)?;
+        self.unlock_with_password_with_limits(password, kdf::KdfLimits::STANDARD)
+    }
+
+    /// Unlock with an explicit resource approval for the actual header.
+    pub fn unlock_with_password_with_limits(&self, password: &[u8], limits: kdf::KdfLimits) -> Result<Option<SecretKey>, HeaderError> {
+        let kek = kdf::derive_key_with_limits(password, &self.salt, &self.kdf, limits)?;
         match self.password.open(&kek, &self.slot_aad()) {
             Ok(master) => Ok(Some(master)),
             Err(CryptoError::AuthFailed) => Ok(None),
@@ -419,6 +424,14 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzz_seed_headers_use_the_current_format() {
+        for bytes in [include_bytes!("../../fuzz/seeds/header/no-keyfiles"), include_bytes!("../../fuzz/seeds/header/one-keyfile")] {
+            let header = Header::parse(bytes).expect("valid header seed");
+            assert_eq!(header.to_bytes().as_slice(), bytes);
+        }
+    }
     use crate::crypto::kdf::TEST_PARAMS;
 
     const PW: &[u8] = b"correct horse battery staple";

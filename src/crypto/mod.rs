@@ -44,6 +44,8 @@ pub enum CryptoError {
     Rng,
     #[error("the operating system could not protect or unlock key memory")]
     MemoryProtection,
+    #[error("resource limit: {0}")]
+    ResourceLimit(&'static str),
     #[error("invalid parameters: {0}")]
     InvalidParams(&'static str),
     #[error("invalid encoding: {0}")]

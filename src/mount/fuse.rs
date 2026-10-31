@@ -49,6 +49,7 @@ fn errno(e: &Error) -> Errno {
         Error::NameTooLong => libc::ENAMETOOLONG,
         Error::FileTooBig => libc::EFBIG,
         Error::NoSpace => libc::ENOSPC,
+        Error::ResourceLimit(_) => libc::EDQUOT,
         Error::ReadOnly => libc::EROFS,
         Error::ChunkAuth { .. } | Error::Rollback { .. } | Error::Corrupt(_) => {
             // Integrity failures are security events: always report them.

@@ -10,6 +10,21 @@ const PW: &str = "correct horse battery staple";
 const PW2: &str = "an even better passphrase here";
 const FAST_KDF: [&str; 1] = ["--low-memory"];
 
+#[test]
+fn expensive_header_cost_requires_explicit_opt_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("costly.ngv");
+    nullguard::vault::Vault::create(&path, PW.as_bytes(), &nullguard::vault::CreateOptions {
+        size: 4 << 20,
+        kdf: nullguard::crypto::Argon2Params { iterations: 5, ..nullguard::crypto::Argon2Params::LOW_MEMORY },
+        chunk_size: Some(4096), fill_random: false,
+    }, &mut |_, _| {}).unwrap();
+    let password = format!("{PW}\n");
+    let error = fails(&["verify", s(&path), "--password-stdin"], &password);
+    assert!(error.contains("approved limits"), "{error}");
+    ok(&["verify", s(&path), "--password-stdin", "--allow-expensive-kdf"], &password);
+}
+
 fn ng(args: &[impl AsRef<OsStr>], stdin: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_nullguard"))
         .args(args)

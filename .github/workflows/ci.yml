@@ -25,7 +25,7 @@ jobs:
             features: ""
           # macOS runners can't load macFUSE; type-check and test without mounting.
           - os: macos-latest
-            features: "--features nullguard/macos-no-mount,nullguard-desktop/macos-no-mount"
+            features: "--features nullguard/macos-no-mount,nullguard-desktop/macos-no-mount,nullguard-worker/macos-no-mount"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -61,7 +61,7 @@ jobs:
       - name: Mount test (as root, adds cross-user ownership and isolation checks)
         run: sudo ./scripts/mount-test.sh target/release/nullguard
       - name: Desktop create, mount, lock, reopen, and parent disconnect
-        run: cargo test -p nullguard-desktop --locked --test worker -- --ignored --test-threads=1
+        run: cargo test -p nullguard-worker --locked --test worker -- --ignored --test-threads=1
 
   mount-test-windows:
     runs-on: windows-latest
@@ -78,7 +78,7 @@ jobs:
         shell: bash
         run: ./scripts/mount-test-windows.sh target/release/nullguard.exe
       - name: Desktop create, mount, lock, reopen, and parent disconnect (WinFsp)
-        run: cargo test -p nullguard-desktop --locked --test worker -- --ignored --test-threads=1
+        run: cargo test -p nullguard-worker --locked --test worker -- --ignored --test-threads=1
 
   # Known-vulnerable or yanked dependencies fail the build.
   audit:
@@ -151,7 +151,7 @@ jobs:
           targets: ${{ matrix.target }}
       - if: matrix.os == 'macos-latest'
         run: brew install --cask macfuse && brew install pkgconf
-      - run: cargo build -p nullguard-desktop --release --locked --target ${{ matrix.target }}
+      - run: cargo build -p nullguard-desktop -p nullguard-worker --release --locked --target ${{ matrix.target }}
       - name: Package desktop app and checksums
         shell: bash
         run: ./scripts/package-desktop.sh ${{ matrix.target }}

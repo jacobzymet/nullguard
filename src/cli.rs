@@ -167,6 +167,9 @@ enum Command {
 
 #[derive(Args, Clone)]
 struct UnlockArgs {
+    /// Allow password hashing above normal defaults, only for a trusted vault.
+    #[arg(long)]
+    allow_expensive_kdf: bool,
     /// Unlock with a keyfile instead of the password.
     #[arg(long, short)]
     keyfile: Option<PathBuf>,
@@ -380,7 +383,9 @@ fn unlock(path: &Path, args: &UnlockArgs, read_only: bool) -> Result<(Vault, Pro
         eprintln!("WARNING: {w}");
     }
     eprintln!("Unlocking (deriving key)...");
-    let v = Vault::open(path, u.credential(), read_only).with_context(|| format!("opening {}", path.display()))?;
+    let limits = if args.allow_expensive_kdf { crate::crypto::kdf::KdfLimits::FORMAT_MAX }
+        else { crate::crypto::kdf::KdfLimits::STANDARD };
+    let v = Vault::open_with_kdf_limits(path, u.credential(), read_only, limits).with_context(|| format!("opening {}", path.display()))?;
     warn_all(&v.warnings);
     Ok((v, p, u))
 }
@@ -570,7 +575,9 @@ pub fn run() -> Result<()> {
             let current = Unlocker::from_args(&u, &p)?;
             let pw = p.new_password("vault password")?;
             eprintln!("Unlocking, then creating the new vault next to the old one...");
-            let r = vault::rekey::rekey(&vault, current.credential(), pw.as_bytes(), kdf.params(), &mut fill_progress())
+            let limits = if u.allow_expensive_kdf { crate::crypto::kdf::KdfLimits::FORMAT_MAX }
+                else { crate::crypto::kdf::KdfLimits::STANDARD };
+            let r = vault::rekey::rekey_with_kdf_limits(&vault, current.credential(), pw.as_bytes(), kdf.params(), &mut fill_progress(), limits)
                 .with_context(|| format!("rekeying {}", vault.display()))?;
             warn_all(&r.warnings);
             println!(
@@ -1389,6 +1396,21 @@ fn remove(fs: &mut Fs, parent: u64, name: &[u8], recursive: bool, depth: usize) 
 mod tests {
     use super::*;
 
+    fn reopen_fixture<T>(mut open: impl FnMut() -> Result<T>) -> T {
+        // Concurrent subprocess tests can inherit a lock until exec closes
+        // their CLOEXEC descriptors. Wait only for this fixture-release race;
+        // production locking and deliberate InUse tests remain unchanged.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match open() {
+                Ok(value) => return value,
+                Err(error) if matches!(error.downcast_ref::<vault::Error>(), Some(vault::Error::InUse))
+                    && std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error) => panic!("fixture reopen failed: {error:#}"),
+            }
+        }
+    }
+
     #[test]
     fn mount_open_keeps_timed_commits_enabled() {
         let dir = tempfile::tempdir().unwrap();
@@ -1399,19 +1421,19 @@ mod tests {
         let password = b"correct horse battery staple";
         let opts = CreateOptions { size: 1 << 20, kdf: Argon2Params::LOW_MEMORY, chunk_size: Some(4096), fill_random: false };
         Vault::create(&path, password, &opts, &mut |_, _| {}).unwrap();
-        let mut vault = Vault::open(&path, Credential::Password(password), false).unwrap();
+        let mut vault = reopen_fixture(|| Vault::open(&path, Credential::Password(password), false).map_err(anyhow::Error::from));
         vault.add_keyfile(&key).unwrap();
         drop(vault);
-        let args = UnlockArgs { keyfile: Some(key_path), password_stdin: false };
+        let args = UnlockArgs { keyfile: Some(key_path), password_stdin: false, allow_expensive_kdf: false };
         // Exercise the actual opening helper used by the mount command.
-        let mut fs = open_fs(&path, &args, false).unwrap();
+        let mut fs = reopen_fixture(|| open_fs(&path, &args, false));
         let ino = fs.create_file(vault::fs::ROOT_INO, b"timed", 0o600).unwrap();
         fs.write(ino, 0, b"persist without an explicit flush").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2200));
         fs.maybe_commit().unwrap();
         assert!(!fs.is_dirty(), "mount opening disabled periodic commits");
         drop(fs); // no explicit commit or clean unmount
-        let mut fs = open_fs(&path, &args, true).unwrap();
+        let mut fs = reopen_fixture(|| open_fs(&path, &args, true));
         let ino = fs.resolve("/timed").unwrap();
         assert_eq!(&*fs.read(ino, 0, 100).unwrap(), b"persist without an explicit flush");
     }

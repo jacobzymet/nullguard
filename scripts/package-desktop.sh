@@ -8,6 +8,7 @@ case "$target" in
     bundle="$output/Nullguard.app"
     mkdir -p "$bundle/Contents/MacOS"
     cp "target/$target/release/nullguard-desktop" "$bundle/Contents/MacOS/nullguard-desktop"
+    cp "target/$target/release/nullguard-worker" "$bundle/Contents/MacOS/nullguard-worker"
     cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -26,8 +27,10 @@ PLIST
     (cd "$output" && ditto -c -k --keepParent Nullguard.app Nullguard-macos.zip)
     rm -rf "$bundle"
     ;;
-  *windows*) cp "target/$target/release/nullguard-desktop.exe" "$output/" ;;
-  *linux*) tar -czf "$output/nullguard-desktop-linux.tar.gz" -C "target/$target/release" nullguard-desktop ;;
+  *windows*)
+    python scripts/package-desktop-windows.py "$target" "$output"
+    ;;
+  *linux*) tar -czf "$output/nullguard-desktop-linux.tar.gz" -C "target/$target/release" nullguard-desktop nullguard-worker ;;
   *) echo "Unsupported desktop target: $target" >&2; exit 1 ;;
 esac
 cd "$output"

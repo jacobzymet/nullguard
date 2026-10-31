@@ -91,6 +91,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fuzz_seed_keyfile_is_valid() {
+        Keyfile::decode(include_str!("../../fuzz/seeds/keyfile/key")).expect("valid keyfile seed");
+    }
+
+    #[test]
     fn encode_decode_roundtrip() {
         let k = Keyfile::generate().unwrap();
         let back = Keyfile::decode(&k.encode()).unwrap();

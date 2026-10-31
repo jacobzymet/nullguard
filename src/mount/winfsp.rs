@@ -366,6 +366,7 @@ fn status(e: Error) -> NTSTATUS {
         Error::NameTooLong => STATUS_NAME_TOO_LONG,
         Error::FileTooBig => STATUS_FILE_TOO_LARGE,
         Error::NoSpace => STATUS_DISK_FULL,
+        Error::ResourceLimit(_) => windows_sys::Win32::Foundation::STATUS_QUOTA_EXCEEDED,
         Error::ReadOnly => STATUS_MEDIA_WRITE_PROTECTED,
         e @ (Error::ChunkAuth { .. } | Error::Rollback { .. } | Error::Corrupt(_)) => {
             // Integrity failures are security events: always report them.

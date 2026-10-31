@@ -35,6 +35,14 @@ running as you while the vault is unlocked).
   in `src/platform.rs`, its guarded-memory submodule, and our own minimal
   WinFsp bindings in `src/mount/winfsp.rs` (Windows only).
 - CI runs `cargo audit` against the RustSec advisory database on every push.
+- Parser fuzzing runs on relevant changes and daily, with bounded execution
+  and retained failure inputs. Deterministic tests inject torn writes and
+  flush failures into commits and password changes.
+- Desktop vault work uses a headless helper with no GUI dependencies,
+  bounded worker admission, and resource approval checked at derivation.
+  Windows helpers additionally prohibit dynamic code, legacy extension
+  points and child-process creation. This is not a full OS sandbox; see
+  [architecture hardening](docs/architecture-hardening-2026-10-31.md).
 - [RAM key protection](docs/ram-key-protection.md) encrypts retained master/data
   keys on Windows, Linux and macOS. Windows uses the OS memory-protection API;
   Linux/macOS use authenticated encryption with wrapping keys in locked,

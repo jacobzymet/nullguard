@@ -7,7 +7,7 @@ description = "Encrypted vault containers that mount as drives. A small, quantum
 rust-version = "1.89"
 
 [workspace]
-members = ["desktop"]
+members = ["desktop", "worker"]
 default-members = ["."]
 resolver = "3"
 
@@ -52,6 +52,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Kernel",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
 

@@ -13,6 +13,86 @@ const KDF: Argon2Params = Argon2Params { memory_kib: Argon2Params::MIN_CREATE_ME
 const PASSWORD_SLOT: u64 = 82;
 
 #[test]
+fn expensive_unlock_requires_explicit_approval_at_actual_open() {
+    let options = CreateOptions { kdf: Argon2Params { iterations: 5, ..KDF }, ..opts(4 << 20) };
+    let t = new_vault_with(options);
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), true), Err(Error::Crypto(CryptoError::ResourceLimit(_)))));
+    let vault = Vault::open_with_kdf_limits(&t.path, Credential::Password(PW), true, crate::crypto::kdf::KdfLimits::FORMAT_MAX).unwrap();
+    vault.into_fs().unwrap();
+}
+
+#[test]
+fn oversized_newest_metadata_is_not_treated_as_recoverable_corruption() {
+    let t = new_vault();
+    let vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    let store = ChunkStore::new(vault.file.try_clone().unwrap(), &vault.header, vault.master.with_key(data_aead).unwrap().unwrap(), false);
+    let mut bytes = vec![0; store.chunk_size() as usize];
+    store.read(0, None, &mut bytes).unwrap();
+    bytes[48..56].copy_from_slice(&(fs::MAX_METADATA_BYTES as u64 + 1).to_le_bytes());
+    store.write(0, &bytes).unwrap();
+    assert!(matches!(fs::current_header_hash(&store), Err(Error::ResourceLimit(_))));
+    assert!(matches!(Fs::open(store, vault.header.hash()), Err(Error::ResourceLimit(_))));
+}
+
+#[test]
+fn torn_commit_writes_and_failed_flushes_preserve_a_complete_state() {
+    for operation in 0..4 {
+        for prefix in [0, 2048] {
+            let t = new_vault();
+            let mut fs = open_fs(&t);
+            fs.set_auto_commit(false);
+            let ino = fs.create_file(ROOT_INO, b"file", 0o600).unwrap();
+            fs.write(ino, 0, b"old").unwrap();
+            fs.commit().unwrap();
+            fs.write(ino, 0, b"new").unwrap();
+            fs.create_file(ROOT_INO, b"added", 0o600).unwrap();
+            let (result, fired) = chunks::fault::after(operation, prefix, || fs.commit());
+            assert!(fired && result.is_err(), "operation {operation}");
+            if operation >= 2 { assert!(fs.write(ino, 0, b"retry").is_err()); }
+            drop(fs);
+            let mut fs = open_fs(&t);
+            let ino = fs.resolve("file").unwrap();
+            let data = fs.read(ino, 0, 3).unwrap();
+            assert!(data.as_slice() == b"old" || data.as_slice() == b"new");
+            assert_eq!(fs.resolve("added").is_ok(), data.as_slice() == b"new");
+        }
+    }
+}
+
+#[test]
+fn password_changes_survive_each_torn_write_or_flush_failure() {
+    for operation in 0..12 {
+        let t = new_vault();
+        let mut vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+        let (result, fired) = chunks::fault::after(operation, 2048, || vault.change_password(PW2, KDF));
+        assert!(fired && result.is_err(), "operation {operation}");
+        drop(vault);
+        let old = Vault::open(&t.path, Credential::Password(PW), true);
+        let new = Vault::open(&t.path, Credential::Password(PW2), true);
+        assert!(old.is_ok() || new.is_ok(), "both credentials lost at operation {operation}");
+        if let Ok(vault) = old { vault.into_fs().unwrap(); }
+        if let Ok(vault) = new { vault.into_fs().unwrap(); }
+    }
+}
+
+#[test]
+fn header_io_failure_blocks_retries_on_the_same_vault() {
+    let t = new_vault();
+    let mut vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    let (result, fired) = chunks::fault::after(5, 2048, || vault.change_password(PW2, KDF));
+    assert!(fired && result.is_err());
+    assert!(result.unwrap_err().to_string().contains("both old and new credentials"));
+    let mut before = vec![0; vault.header.file_len() as usize];
+    read_exact_at(&vault.file, &mut before, 0).unwrap();
+    assert!(vault.change_password(PW2, KDF).is_err());
+    let mut after = vec![0; before.len()];
+    read_exact_at(&vault.file, &mut after, 0).unwrap();
+    assert!(after == before, "retrying after a failed header update must not overwrite recovery state");
+    drop(vault);
+    Vault::open(&t.path, Credential::Password(PW2), true).unwrap().into_fs().unwrap();
+}
+
+#[test]
 fn cancelled_creation_removes_only_its_partial_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cancelled.ngv");

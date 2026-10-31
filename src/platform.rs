@@ -21,15 +21,15 @@ pub fn harden_process() -> std::io::Result<()> {
     {
         let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         // SAFETY: setrlimit with a valid pointer to an initialized rlimit.
-        unsafe {
-            libc::setrlimit(libc::RLIMIT_CORE, &zero);
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
     }
     #[cfg(target_os = "linux")]
     {
         // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes no pointers.
-        unsafe {
-            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
     }
     #[cfg(windows)]
@@ -42,11 +42,21 @@ pub fn harden_process() -> std::io::Result<()> {
         // The macOS counterpart: refuse debugger attachment (lldb, dtrace
         // and task_for_pid-based memory readers) for this process's lifetime.
         // SAFETY: PT_DENY_ATTACH ignores the pid/addr/data arguments.
-        unsafe {
-            libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0);
+        if unsafe { libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
     }
     Ok(())
+}
+
+/// Harden the headless worker before it reads any request or credentials.
+/// Windows workers need neither generated executable code nor child processes.
+/// This reduces available mechanisms after a compromise; it is not a full
+/// filesystem/network sandbox.
+pub fn harden_worker_process() -> std::io::Result<()> {
+    #[cfg(windows)]
+    win::restrict_worker_capabilities()?;
+    harden_process()
 }
 
 /// Real user id of this process (0 on Windows).
@@ -433,6 +443,32 @@ pub mod win {
             }
         }))
         .map_err(io::Error::from_raw_os_error)
+    }
+
+    pub(super) fn restrict_worker_capabilities() -> io::Result<()> {
+        use windows_sys::Win32::System::Threading::{SetProcessMitigationPolicy,
+            ProcessDynamicCodePolicy, ProcessExtensionPointDisablePolicy, ProcessChildProcessPolicy};
+        use windows_sys::Win32::System::SystemServices::{
+            PROCESS_MITIGATION_DYNAMIC_CODE_POLICY, PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY,
+            PROCESS_MITIGATION_CHILD_PROCESS_POLICY,
+        };
+        let mut dynamic = PROCESS_MITIGATION_DYNAMIC_CODE_POLICY::default();
+        dynamic.Anonymous.Flags = 1; // ProhibitDynamicCode, no opt-out/downgrade
+        let mut extension = PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY::default();
+        extension.Anonymous.Flags = 1; // DisableExtensionPoints
+        let mut child = PROCESS_MITIGATION_CHILD_PROCESS_POLICY::default();
+        child.Anonymous.Flags = 1; // NoChildProcessCreation
+        // SAFETY: documented Windows structures with only their first policy
+        // bit enabled. Policies apply solely to this worker, before keys are
+        // read. GUI processes retain their ordinary graphics/launch behavior.
+        unsafe {
+            if SetProcessMitigationPolicy(ProcessDynamicCodePolicy, (&dynamic as *const PROCESS_MITIGATION_DYNAMIC_CODE_POLICY).cast(), std::mem::size_of_val(&dynamic)) == 0
+                || SetProcessMitigationPolicy(ProcessExtensionPointDisablePolicy, (&extension as *const PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY).cast(), std::mem::size_of_val(&extension)) == 0
+                || SetProcessMitigationPolicy(ProcessChildProcessPolicy, (&child as *const PROCESS_MITIGATION_CHILD_PROCESS_POLICY).cast(), std::mem::size_of_val(&child)) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 
     /// Encrypt one retained 256-bit key in place for this process only.

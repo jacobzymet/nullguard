@@ -1,4 +1,4 @@
-//! Exercise the actual desktop executable and its private pipe protocol.
+//! Exercise the headless worker executable and its private pipe protocol.
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -41,18 +41,14 @@ struct Worker {
 }
 
 impl Worker {
-    fn start(request: Value) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_nullguard-desktop"));
+    fn spawn() -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_nullguard-worker"));
         command
-            .arg("--mount-worker")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().unwrap();
-        let mut input = child.stdin.take().unwrap();
-        serde_json::to_writer(&mut input, &request).unwrap();
-        input.write_all(b"\n").unwrap();
-        input.flush().unwrap();
+        let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
         let (sender, events) = mpsc::channel();
         std::thread::spawn(move || {
@@ -72,6 +68,15 @@ impl Worker {
             input: Some(input),
             events,
         }
+    }
+
+    fn start(request: Value) -> Self {
+        let mut worker = Self::spawn();
+        let input = worker.input.as_mut().unwrap();
+        serde_json::to_writer(&mut *input, &request).unwrap();
+        input.write_all(b"\n").unwrap();
+        input.flush().unwrap();
+        worker
     }
 
     fn send(&mut self, control: &str) {
@@ -154,6 +159,31 @@ fn verifies_existing_vault_and_rejects_wrong_password() {
     let mut worker = Worker::start(wrong);
     worker.until("Error");
     worker.exit(false);
+}
+
+#[test]
+fn worker_is_ready_before_credentials_and_honors_actual_kdf_consent() {
+    let mut worker = Worker::spawn();
+    let ready = worker.until("Ready");
+    assert_eq!(ready["Ready"]["protocol_version"], 1);
+    worker.input.take();
+    worker.until("Error");
+    worker.exit(false);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("costly.ngv");
+    Vault::create(&path, PASSWORD.as_bytes(), &CreateOptions {
+        size: 4 << 20, kdf: Argon2Params { iterations: 5, ..Argon2Params::LOW_MEMORY },
+        chunk_size: Some(4096), fill_random: false,
+    }, &mut |_, _| {}).unwrap();
+    let mut worker = Worker::start(request(&path, json!("Verify")));
+    assert!(worker.until("Error")["Error"].as_str().unwrap().contains("approved limits"));
+    worker.exit(false);
+    let mut approved = request(&path, json!("Verify"));
+    approved["allow_expensive_kdf"] = json!(true);
+    let mut worker = Worker::start(approved);
+    worker.until("Verified");
+    worker.exit(true);
 }
 
 #[test]

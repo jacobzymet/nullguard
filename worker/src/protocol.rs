@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 pub const MAX_PACKET: usize = 256 * 1024;
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// OS-native path encoding preserves non-UTF-8 Unix names and Windows UTF-16.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -83,6 +84,8 @@ pub struct Request {
     #[serde(with = "password_bytes")]
     pub password: Zeroizing<String>,
     pub read_only: bool,
+    #[serde(default)]
+    pub allow_expensive_kdf: bool,
 }
 
 // JSON string escapes are decoded through serde_json's ordinary Vec scratch
@@ -135,6 +138,7 @@ pub enum Control {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Event {
+    Ready { protocol_version: u32 },
     Progress { fraction: f32 },
     Created,
     Mounted,
@@ -175,6 +179,7 @@ mod tests {
             keyfile: None,
             password: Zeroizing::new(password.to_owned()),
             read_only: true,
+            allow_expensive_kdf: false,
         }
     }
 

@@ -14,6 +14,7 @@ use nullguard::{
 };
 
 use crate::protocol::{Control, Event, Operation, Request, read_packet};
+use nullguard_worker::validate_password;
 
 #[derive(Clone)]
 struct Emitter(Arc<Mutex<io::Stdout>>);
@@ -30,6 +31,7 @@ impl Emitter {
 
 pub fn run() -> Result<()> {
     let emitter = Emitter(Arc::new(Mutex::new(io::stdout())));
+    emitter.send(&Event::Ready { protocol_version: crate::protocol::PROTOCOL_VERSION });
     let result = serve(emitter.clone());
     if let Err(e) = &result {
         emitter.send(&Event::Error(format!("{e:#}")));
@@ -65,14 +67,15 @@ fn serve(out: Emitter) -> Result<()> {
     let path = request.vault.decode()?;
     let mountpoint = request.mountpoint.decode()?;
     let cancelled = Arc::new(AtomicBool::new(false));
-    let (commands, receiver) = mpsc::channel();
+    let (commands, receiver) = mpsc::sync_channel(1);
     let control_cancelled = cancelled.clone();
     std::thread::spawn(move || {
         while let Ok(Some(packet)) = read_packet(&mut input) {
             match serde_json::from_slice::<Control>(&packet) {
                 Ok(Control::Lock) => {
-                    if commands.send(Command::Lock).is_err() {
-                        break;
+                    match commands.try_send(Command::Lock) {
+                        Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
                     }
                 }
                 Ok(Control::Cancel) => {
@@ -141,7 +144,8 @@ fn serve(out: Emitter) -> Result<()> {
         mount::check_mountpoint(&mountpoint)?;
     }
     let vault =
-        Vault::open(&path, credential, request.read_only || verifying).with_context(|| {
+        Vault::open_with_kdf_limits(&path, credential, request.read_only || verifying,
+            if request.allow_expensive_kdf && !creating { kdf::KdfLimits::FORMAT_MAX } else { kdf::KdfLimits::STANDARD }).with_context(|| {
             if creating {
                 "The vault was created, but could not be unlocked"
             } else {
@@ -229,16 +233,6 @@ fn serve(out: Emitter) -> Result<()> {
     // This means mount() returned after its final commit. The GUI additionally
     // waits for this process to exit before displaying Locked.
     out.send(&Event::Finished);
-    Ok(())
-}
-
-pub fn validate_password(password: &str) -> Result<()> {
-    if password.len() > nullguard::cli::MAX_PASSWORD_BYTES {
-        bail!("The password is too long (maximum 4096 bytes).");
-    }
-    if password.chars().count() < nullguard::cli::MIN_PASSWORD_CHARS {
-        bail!("Use at least 12 characters. A few random words work well.");
-    }
     Ok(())
 }
 

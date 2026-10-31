@@ -243,6 +243,12 @@ operations run in these workers. **Locked** appears only after the worker
 exits. OS and input-method buffers are outside the app's memory-wiping
 guarantees, as with other desktop password fields.
 
+Each vault uses the separate `nullguard-worker` executable, which has no
+GUI, graphics, tray or file-dialog dependencies. Keep it beside the desktop
+executable; the macOS app bundle includes it automatically. The app checks
+the worker protocol before sending credentials. At most four workers run
+per app instance, with one expensive startup operation at a time.
+
 **Advanced** offers read-only unlocking and an integrity check. Password
 changes, keyfile generation and management, rekeying, and offline file
 operations currently use the [CLI](#commands).
@@ -277,6 +283,7 @@ To build and launch from source, install Rust **1.95 or newer** and run from
 the repository root:
 
 ```bash
+cargo build -p nullguard-worker --release --locked
 cargo run -p nullguard-desktop --release --locked
 ```
 
@@ -290,19 +297,22 @@ To build and launch from source with Rust **1.95 or newer** and macFUSE
 installed, run from the repository root:
 
 ```bash
+cargo build -p nullguard-worker --release --locked
 cargo run -p nullguard-desktop --release --locked
 ```
 
 ### Desktop on Windows
 
-Install [WinFsp 2.x](https://winfsp.dev/), then open
-`nullguard-desktop.exe`. Each unlocked vault receives a free drive letter.
+Install [WinFsp 2.x](https://winfsp.dev/), extract the complete desktop ZIP,
+then open `nullguard-desktop.exe`. Keep `nullguard-worker.exe` beside it.
+Each unlocked vault receives a free drive letter.
 The GUI does not open a console window.
 
 To build and launch from source with Rust **1.95 or newer**, run in
 PowerShell from the repository root:
 
 ```powershell
+cargo build -p nullguard-worker --release --locked
 cargo run -p nullguard-desktop --release --locked
 ```
 
@@ -312,7 +322,7 @@ On Linux and Windows, run `cargo test --workspace --locked` to include the
 CLI and desktop tests. On macOS, use:
 
 ```bash
-cargo test --workspace --locked --features nullguard/macos-no-mount,nullguard-desktop/macos-no-mount
+cargo test --workspace --locked --features nullguard/macos-no-mount,nullguard-desktop/macos-no-mount,nullguard-worker/macos-no-mount
 ```
 
 Native Linux and Windows CI also test actual desktop worker creation,
@@ -357,6 +367,12 @@ random words (a diceware passphrase) is ideal: the KDF makes each guess
 expensive, but nothing can save a guessable password. Passwords are Unicode
 NFC-normalized before use, so a password with accents unlocks the same vault
 on every OS and keyboard.
+
+Unlocking rejects password hashing above normal defaults unless explicitly
+approved. For a trusted high-cost vault, use `--allow-expensive-kdf` with
+commands that unlock it, or approve the warning in the desktop app. The
+limit is checked against the actual opened header, even if the file changed
+after a warning was displayed. Password-hashing costs are never reduced.
 
 ## Platform support
 
@@ -470,6 +486,8 @@ cargo +nightly fuzz run header seeds/header -- -max_total_time=600
 ```
 
 The other targets are `superblock`, `metadata` and `keyfile`.
+CI runs all four parsers on relevant pushes/pull requests and daily, using
+AddressSanitizer with time and memory limits. Failing inputs are retained.
 
 ---
 
@@ -875,8 +893,11 @@ chunk area is filled with random bytes.
 The cipher is always XChaCha20-Poly1305, so the header doesn't store it.
 Parsing is strict: unknown versions, out-of-range values and non-zero
 padding are rejected, so every header has exactly one valid encoding.
-Argon2 parameters are capped when *reading* (≤ 4 GiB, ≤ 64 passes, ≤ 64
-lanes), so a crafted vault can't exhaust memory or CPU.
+The format caps Argon2 parameters (≤ 4 GiB, ≤ 64 passes, ≤ 64 lanes).
+Unlocking normally permits at most 1 GiB, 4 passes and 4 lanes. Higher costs
+require explicit approval; simultaneous derivations in one process share a
+4 GiB reservation ceiling. These are allocation/work limits, not an OS-wide
+memory quota.
 
 **Wrapped key** (104 bytes): `nonce (24) ‖ commitment (32) ‖ ciphertext (32) ‖ tag (16)`, where
 
@@ -1030,15 +1051,26 @@ tests/cli.rs     end-to-end tests of the binary
 scripts/mount-test.sh  real FUSE mount test (Linux)
 desktop/
   src/app.rs          egui desktop interface and session states
-  src/worker.rs       vault operations and mounts in isolated worker processes
-  src/protocol.rs     bounded private-pipe messages, OS-native paths
+  src/admission.rs    live-worker and expensive-startup limits
+  src/session.rs      worker launch, protocol handshake, lifecycle and diagnostics
   src/secret_input.rs masked password input without plaintext undo history
   src/paths.rs        private settings, mount locations, file-manager opening
   src/tray.rs         platform tray / menu-bar integration
+worker/
+  src/main.rs         headless worker startup and process protections
+  src/worker.rs       vault operations and mounting, without GUI dependencies
+  src/protocol.rs     bounded private-pipe messages, OS-native paths
   tests/worker.rs     real executable and native-mount integration tests
 ```
 
 ## Limitations and roadmap
+
+Operational limits: 64 MiB of encoded filesystem metadata, 100,000 inodes,
+a 64 MiB allocation bitmap, and a 16 MiB decrypted-chunk cache per filesystem.
+Oversized existing vaults fail with a resource-limit error; nullguard never
+uses an older commit to bypass these limits. The on-disk format is unchanged.
+See [architecture hardening](docs/architecture-hardening-2026-10-31.md) for
+the boundaries, compatibility notes and remaining work.
 
 - **An independent security audit.**
 - **Incremental metadata** (a B-tree instead of rewriting all metadata per
