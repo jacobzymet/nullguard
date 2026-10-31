@@ -40,6 +40,9 @@ jobs:
         run: cargo doc --workspace --locked --no-deps ${{ matrix.features }}
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: Windows test caller privileges
+        if: runner.os == 'Windows'
+        run: whoami /priv
       - run: cargo test --workspace --locked ${{ matrix.features }}
 
   mount-test:

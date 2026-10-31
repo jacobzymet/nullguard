@@ -138,3 +138,26 @@ The existing CI matrix runs native macOS tests and Linux/Windows mount
 workflows. Those checks must pass for this revision before treating it as
 release-validated. Local cross-compilation does not prove macOS runtime
 behavior, and passing tests do not constitute an independent security audit.
+
+## CI follow-up (2026-10-31)
+
+The [first pushed run](https://github.com/jacobzymet/nullguard/actions/runs/41040146588)
+passed native macOS/Linux tests, both Linux/Windows mount workflows and the
+dependency audit. Its Windows process-access test failed because a restricted
+handle was granted; the caller's privilege level was not controlled by that test.
+
+The revised test probes with privileges removed from a thread-local copy of
+the caller's token, preserving identity and group membership. Every access
+right must succeed before hardening and be denied afterwards. It also checks
+that supervision stays available, that nested/panicking probes restore the
+exact original thread token, and that a caller holding enabled debug privilege
+can exercise the documented privileged exception. CI logs the Windows caller's
+privileges to make environment differences visible.
+
+Local validation passed: 171 Windows workspace tests, including the three
+process-protection tests; one native mount test remains skipped locally.
+
+This follows Microsoft's [process access model](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights)
+and [`CreateRestrictedToken` contract](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-createrestrictedtoken).
+The revised Windows test still requires a successful native CI run before
+the change is considered release-validated.
