@@ -41,8 +41,16 @@ running as you while the vault is unlocked).
 - Desktop vault work uses a headless helper with no GUI dependencies,
   bounded worker admission, and resource approval checked at derivation.
   Windows helpers additionally prohibit dynamic code, legacy extension
-  points and child-process creation. This is not a full OS sandbox; see
-  [architecture hardening](docs/architecture-hardening-2026-10-31.md).
+  points and child-process creation. Linux workers confine syscalls after
+  vault/native-mount setup; a keyless broker retains only the protocol needed
+  to unmount one fixed mount. Windows/macOS and initial Linux setup do not
+  have this filesystem/network confinement. See
+  [current hardening and limits](docs/security-hardening-2026-11-01.md).
+- Verification bounds traversal and diagnostic memory independently of tree
+  depth and preserves total failure counts when diagnostic samples are capped.
+- CI signs provenance for default-branch/version-tag binaries and desktop
+  packages, with no signing permissions in PR/build jobs. This does not replace
+  native OS code signing or an independent audit.
 - [RAM key protection](docs/ram-key-protection.md) encrypts retained master/data
   keys on Windows, Linux and macOS. Windows uses the OS memory-protection API;
   Linux/macOS use authenticated encryption with wrapping keys in locked,

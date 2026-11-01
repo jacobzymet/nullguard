@@ -8,6 +8,9 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod key_memory;
 
+#[cfg(target_os = "linux")]
+pub mod worker_sandbox;
+
 /// Reduce what an attacker with access to this machine could extract from
 /// the running process: no core dumps (which would contain keys), and on
 /// Linux no ptrace attach or `/proc/<pid>/mem` access by other processes of

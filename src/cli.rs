@@ -529,6 +529,10 @@ pub fn run() -> Result<()> {
                 read_only,
                 no_exec,
                 allow_outside_links,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                before_serve: None,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                unmount_broker: None,
                 on_ready: Some(Box::new(move || {
                     eprintln!(
                         "Vault mounted at {}. Press Ctrl-C here, or run `nullguard unmount {}`, to lock it.",
@@ -680,13 +684,16 @@ pub fn run() -> Result<()> {
             for (path, idx, err) in &r.bad_blocks {
                 eprintln!("BAD: {} block {idx}: {err}", display_name(path.as_bytes()));
             }
+            if r.bad_blocks_total > r.bad_blocks.len() as u64 {
+                eprintln!("Further block diagnostics omitted (bounded report); {} total failures.", r.bad_blocks_total);
+            }
             for p in &problems {
                 eprintln!("BAD: {p}");
             }
-            if !r.bad_blocks.is_empty() || !problems.is_empty() {
+            if r.bad_blocks_total != 0 || !problems.is_empty() {
                 bail!(
                     "verification FAILED ({} bad block(s), {} other problem(s)): the vault was modified or damaged",
-                    r.bad_blocks.len(),
+                    r.bad_blocks_total,
                     problems.len()
                 );
             }

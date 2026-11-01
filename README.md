@@ -249,13 +249,21 @@ executable; the macOS app bundle includes it automatically. The app checks
 the worker protocol before sending credentials. At most four workers run
 per app instance, with one expensive startup operation at a time.
 
+On Linux, workers install kernel syscall restrictions after vault/native-mount
+setup. While serving, they cannot open new file paths, use network sockets or
+execute programs; a separate keyless broker handles clean unmounting. Initial
+unlock/setup and Windows/macOS workers do not have this filesystem/network
+confinement. See [hardening details](docs/security-hardening-2026-11-01.md).
+
 **Advanced** offers read-only unlocking and an integrity check. Password
 changes, keyfile generation and management, rekeying, and offline file
 operations currently use the [CLI](#commands).
 
 Download builds from the successful [CI workflow's artifacts](https://github.com/jacobzymet/nullguard/actions/workflows/ci.yml):
 choose the `nullguard-desktop-…` artifact for your OS. These builds are
-currently unsigned; macOS builds are not notarized.
+currently lack OS code signatures; macOS builds are not notarized. Default-branch
+and version-tag builds generate signed provenance after all build jobs pass;
+see [verifying downloads](docs/security-hardening-2026-11-01.md#verifying-downloads).
 
 ### Desktop on Linux
 

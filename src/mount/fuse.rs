@@ -469,9 +469,12 @@ pub fn mount(fs: Fs, mountpoint: &Path, opts: &MountOptions) -> Result<(), Error
     let unmounter = Arc::new(Mutex::new(session.unmount_callable()));
     {
         let unmounter = unmounter.clone();
+        let broker = opts.unmount_broker.clone();
         let handler = ctrlc::set_handler(move || {
             eprintln!("\nnullguard: unmounting...");
-            if let Ok(mut u) = unmounter.lock() {
+            if let Some(broker) = &broker {
+                if let Err(error) = broker() { eprintln!("nullguard: could not unmount: {error}"); }
+            } else if let Ok(mut u) = unmounter.lock() {
                 let _ = u.unmount();
             }
         });
@@ -481,6 +484,8 @@ pub fn mount(fs: Fs, mountpoint: &Path, opts: &MountOptions) -> Result<(), Error
             );
         }
     }
+
+    if let Some(prepare) = &opts.before_serve { prepare()?; }
 
     // Background commits while dirty.
     let stop = Arc::new(AtomicBool::new(false));

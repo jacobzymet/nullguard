@@ -477,6 +477,50 @@ fn modified_data_chunk_is_detected() {
     assert!(matches!(fs.read(f, 0, 4096), Err(Error::ChunkAuth { .. })));
     let report = fs.verify().unwrap();
     assert_eq!(report.bad_blocks.len(), 1);
+    assert_eq!(report.bad_blocks_total, 1);
+}
+
+#[test]
+fn verification_bounds_diagnostics_but_counts_every_failure() {
+    let t = new_vault();
+    let mut fs = open_fs(&t);
+    fs.set_auto_commit(false);
+    let mut parent = ROOT_INO;
+    for _ in 0..100 {
+        parent = fs.mkdir(parent, &[b'z'; 255], 0o700).unwrap();
+    }
+    let file = fs.create_file(parent, b"file", 0o600).unwrap();
+    fs.write(file, 0, &vec![0x42; 200 * 4096]).unwrap();
+    fs.commit().unwrap();
+    let chunks = fs.chunks_of(file);
+    drop(fs);
+    for chunk in chunks {
+        patch(&t.path, chunk_offset(&t, chunk) + 24, |bytes| bytes[0] ^= 1);
+    }
+    let report = open_fs(&t).verify().unwrap();
+    assert_eq!((report.blocks_checked, report.bad_blocks_total), (200, 200));
+    assert!(!report.bad_blocks.is_empty() && report.bad_blocks.len() < 200);
+    assert!(report.bad_blocks.iter().all(|(path, _, _)| path.len() <= 4096
+        && path.contains(&format!("[inode {file}]"))));
+    assert!(report.bad_blocks.iter().map(|(path, _, error)| path.len() + error.len()).sum::<usize>() <= 64 * 1024);
+}
+
+#[test]
+fn verification_stops_on_local_key_failure_and_skips_unlinked_open_files() {
+    let t = new_vault();
+    let mut fs = open_fs(&t);
+    let file = fs.create_file(ROOT_INO, b"file", 0o600).unwrap();
+    fs.write(file, 0, b"data").unwrap();
+    fs.commit().unwrap();
+    drop(fs);
+    let vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    // Two superblocks and one metadata chunk are read while opening.
+    let store = store_with_key_failure(&vault, 3);
+    let mut fs = Fs::open(store, vault.header.hash()).unwrap();
+    assert!(matches!(fs.verify(), Err(Error::Crypto(CryptoError::MemoryProtection))));
+    fs.open_file(file).unwrap();
+    fs.unlink(ROOT_INO, b"file").unwrap();
+    assert_eq!(fs.verify().unwrap().files, 0);
 }
 
 #[test]

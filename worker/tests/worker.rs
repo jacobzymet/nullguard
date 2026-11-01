@@ -47,7 +47,14 @@ struct Worker {
 
 impl Worker {
     fn spawn() -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_nullguard-worker"));
+        let declared = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nullguard-worker"));
+        // Cross-built Linux tests can run in a native runtime with a different
+        // host path syntax. Cargo still places the executable next to deps/.
+        let executable = if declared.is_file() { declared } else {
+            std::env::current_exe().unwrap().parent().unwrap().parent().unwrap()
+                .join(if cfg!(windows) { "nullguard-worker.exe" } else { "nullguard-worker" })
+        };
+        let mut command = Command::new(executable);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -55,6 +62,14 @@ impl Worker {
         let mut child = command.spawn().unwrap();
         let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
+        let diagnostics = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(diagnostics).lines() {
+                let line = line.unwrap();
+                assert!(!line.contains(PASSWORD), "diagnostics leaked the password");
+                eprintln!("worker diagnostic: {line}");
+            }
+        });
         let (sender, events) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(output).lines() {
@@ -307,4 +322,35 @@ fn mount_lock_reopen_and_parent_disconnect_commit_files() {
     worker.send("Lock");
     worker.until("Finished");
     worker.exit(true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires FUSE; run by native mount CI"]
+fn broker_cleans_up_after_a_worker_crash() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.ngv");
+    vault(&path);
+    let mountpoint = dir.path().join("mounted");
+    std::fs::create_dir(&mountpoint).unwrap();
+    let mut req = request(&path, json!("Unlock"));
+    req["mountpoint"] = json!(encoded(&mountpoint));
+    let mut worker = Worker::start(req);
+    worker.until("Mounted");
+    let mut file = std::fs::File::create(mountpoint.join("saved.txt")).unwrap();
+    file.write_all(b"durable before crash").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    worker.child.kill().unwrap();
+    worker.exit(false);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read_dir(&mountpoint).is_err() {
+        assert!(Instant::now() < deadline, "broker left a disconnected mount behind");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(std::fs::read_dir(&mountpoint).unwrap().next().is_none());
+    let mut fs = Vault::open(&path, Credential::Password(PASSWORD.as_bytes()), true).unwrap().into_fs().unwrap();
+    let file = fs.resolve("/saved.txt").unwrap();
+    assert_eq!(&*fs.read(file, 0, 100).unwrap(), b"durable before crash");
 }

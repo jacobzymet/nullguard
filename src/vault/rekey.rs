@@ -94,7 +94,7 @@ pub fn rekey_with_kdf_limits(path: &Path, cred: Credential<'_>, new_password: &[
         // Authenticate every block of the copy, and check nothing is missing.
         let mut check = Vault::open_with_kdf_limits(&tmp, Credential::Password(new_password), true, crate::crypto::kdf::KdfLimits::FORMAT_MAX)?.into_fs()?;
         let v = check.verify()?;
-        if !v.bad_blocks.is_empty() || !check.warnings.is_empty() {
+        if v.bad_blocks_total != 0 || !check.warnings.is_empty() {
             return Err(Error::Corrupt("the new vault failed verification; the old vault is unchanged".into()));
         }
         if (v.files, v.dirs, v.symlinks) != (report.files, report.dirs, report.symlinks) {

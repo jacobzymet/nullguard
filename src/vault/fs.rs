@@ -55,6 +55,9 @@ const MAX_BITMAP_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INODES: u64 = 100_000;
 const MAX_BLOCK_REFS: usize = MAX_METADATA_BYTES / 40;
 const MAX_READ_BYTES: usize = 8 * 1024 * 1024;
+const MAX_VERIFY_DIAGNOSTICS: usize = 128;
+const MAX_VERIFY_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+const MAX_VERIFY_PATH_BYTES: usize = 4096;
 
 pub(crate) fn check_resource_geometry(chunk_count: u64) -> Result<(), Error> {
     if chunk_count.div_ceil(64) > MAX_BITMAP_BYTES / 8 {
@@ -250,6 +253,9 @@ pub struct VerifyReport {
     pub dirs: u64,
     pub symlinks: u64,
     pub blocks_checked: u64,
+    /// Total failures, including those omitted from the bounded diagnostic sample.
+    pub bad_blocks_total: u64,
+    /// A bounded sample; paths may be abbreviated and include the inode number.
     pub bad_blocks: Vec<(String, u64, String)>,
 }
 
@@ -1379,45 +1385,75 @@ impl Fs {
     /// Decrypt and authenticate every block of every file.
     pub fn verify(&mut self) -> Result<VerifyReport, Error> {
         let mut report = VerifyReport::default();
-        // Paths hold file names: built in wiped buffers sized up front (a
-        // growing string would leave unwiped copies behind when it moves).
-        let mut stack = vec![(ROOT_INO, Zeroizing::new(String::from("/")))];
+        // Queue only inode IDs, never complete paths or cloned inodes. A deep
+        // tree with pending siblings otherwise consumes quadratic memory.
+        let mut diagnostic_bytes = 0;
         let mut buf = Zeroizing::new(vec![0u8; self.chunk_size as usize]);
-        while let Some((ino, path)) = stack.pop() {
-            let inode = self.inode(ino)?.clone();
-            match inode.node {
-                Node::Dir { entries, .. } => {
-                    report.dirs += 1;
-                    for (name, child) in entries {
-                        let base = if path.as_str() == "/" { "" } else { path.as_str() };
-                        // At most 3 bytes per name byte (an invalid byte
-                        // becomes the 3-byte replacement character).
-                        let mut p = Zeroizing::new(String::with_capacity(base.len() + 1 + 3 * name.len()));
-                        p.push_str(base);
-                        p.push('/');
-                        for chunk in name.utf8_chunks() {
-                            p.push_str(chunk.valid());
-                            if !chunk.invalid().is_empty() {
-                                p.push(char::REPLACEMENT_CHARACTER);
-                            }
-                        }
-                        stack.push((child, p));
-                    }
-                }
+        for ino in self.reachable() {
+            match &self.inode(ino)?.node {
+                Node::Dir { .. } => report.dirs += 1,
                 Node::Symlink { .. } => report.symlinks += 1,
                 Node::File { blocks, .. } => {
                     report.files += 1;
-                    for (&idx, b) in &blocks {
+                    for (&idx, b) in blocks {
                         report.blocks_checked += 1;
                         // Bypass the cache: check what is on disk.
                         if let Err(e) = self.store.read(b.chunk, Some(&b.nonce), &mut buf) {
-                            report.bad_blocks.push((path.to_string(), idx, e.to_string()));
+                            // A local protection failure is not damaged data and
+                            // must stop verification instead of being sampled.
+                            if matches!(e, Error::Crypto(CryptoError::MemoryProtection | CryptoError::ResourceLimit(_)) | Error::ResourceLimit(_)) {
+                                return Err(e);
+                            }
+                            report.bad_blocks_total += 1;
+                            if report.bad_blocks.len() < MAX_VERIFY_DIAGNOSTICS
+                                && diagnostic_bytes + MAX_VERIFY_PATH_BYTES + 1024 <= MAX_VERIFY_DIAGNOSTIC_BYTES {
+                                let path = self.verification_path(ino)?;
+                                let mut error = e.to_string();
+                                let mut end = error.len().min(1024);
+                                while !error.is_char_boundary(end) { end -= 1; }
+                                error.truncate(end);
+                                diagnostic_bytes += path.len() + error.len();
+                                report.bad_blocks.push((path.to_string(), idx, error));
+                            }
                         }
                     }
                 }
             }
         }
         Ok(report)
+    }
+
+    /// Build only the bounded suffix needed for a retained diagnostic. The
+    /// metadata is a validated tree; parent links already exist in memory.
+    fn verification_path(&self, ino: u64) -> Result<Zeroizing<String>, Error> {
+        let mut parts = Vec::new();
+        let mut current = ino;
+        let mut budget = MAX_VERIFY_PATH_BYTES - 64; // abbreviation + inode ID
+        while current != ROOT_INO {
+            let parent = *self.parents.get(&current).ok_or(Error::NotFound)?;
+            let (name, _) = self.dir_entries(parent)?.iter()
+                .find(|(_, child)| **child == current).ok_or(Error::NotFound)?;
+            // Replacing each invalid UTF-8 byte needs at most three bytes.
+            let cost = 1 + 3 * name.len();
+            if cost > budget { break; }
+            budget -= cost;
+            parts.push(name);
+            current = parent;
+        }
+        let mut path = Zeroizing::new(String::with_capacity(MAX_VERIFY_PATH_BYTES));
+        if current != ROOT_INO { path.push_str("/…"); }
+        for name in parts.into_iter().rev() {
+            path.push('/');
+            for chunk in name.utf8_chunks() {
+                path.push_str(chunk.valid());
+                if !chunk.invalid().is_empty() { path.push(char::REPLACEMENT_CHARACTER); }
+            }
+        }
+        if current != ROOT_INO {
+            use std::fmt::Write;
+            let _ = write!(path, " [inode {ino}]");
+        }
+        Ok(path)
     }
 }
 

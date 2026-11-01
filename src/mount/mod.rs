@@ -28,6 +28,12 @@ pub struct MountOptions {
     pub allow_outside_links: bool,
     /// Called once the filesystem is mounted.
     pub on_ready: Option<Box<dyn Fn() + Send>>,
+    /// Install Unix worker confinement after native mount setup, before serving.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub before_serve: Option<Box<dyn Fn() -> Result<(), Error> + Send>>,
+    /// Optional external unmount broker for a confined Unix worker.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub unmount_broker: Option<std::sync::Arc<dyn Fn() -> Result<(), Error> + Send + Sync>>,
 }
 
 /// Whether this build can mount vaults.
