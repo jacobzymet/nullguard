@@ -10,6 +10,7 @@ use chacha20poly1305::XChaCha20Poly1305;
 use chacha20poly1305::aead::{AeadInOut, KeyInit};
 
 use super::{CryptoError, SecretKey, random};
+use super::secret::ProtectedKey;
 
 /// Nonce length stored with every ciphertext.
 pub const NONCE_LEN: usize = 24;
@@ -20,16 +21,25 @@ pub const CIPHER_NAME: &str = "xchacha20-poly1305";
 
 /// An XChaCha20-Poly1305 key.
 pub struct Aead {
-    key: SecretKey,
+    key: ProtectedKey,
 }
 
 impl Aead {
-    pub fn new(key: SecretKey) -> Self {
-        Self { key }
+    /// Retain the key, encrypted in memory. Refuse to construct
+    /// a cipher if the operating system cannot protect it.
+    pub fn new(key: SecretKey) -> Result<Self, CryptoError> {
+        Ok(Self { key: ProtectedKey::new(key)? })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_once_after(&mut self, successful_uses: usize) {
+        self.key.fail_once_after(successful_uses);
     }
 
     fn cipher(&self) -> Result<XChaCha20Poly1305, CryptoError> {
-        XChaCha20Poly1305::new_from_slice(self.key.expose()).map_err(|_| CryptoError::InvalidKey)
+        self.key.with_key(|key| {
+            XChaCha20Poly1305::new_from_slice(key.expose()).map_err(|_| CryptoError::InvalidKey)
+        })?
     }
 
     /// Encrypt `buf` in place under a fresh random nonce.
@@ -55,9 +65,9 @@ impl Aead {
         Ok(tag.into())
     }
 
-    /// Decrypt `buf` in place. On failure `buf` is wiped and
-    /// [`CryptoError::AuthFailed`] is returned: the data was modified, the
-    /// wrong key was used, or the nonce/AAD don't match.
+    /// Decrypt `buf` in place, wiping it on any failure. Authentication
+    /// failures return [`CryptoError::AuthFailed`]; local key-memory
+    /// failures return [`CryptoError::MemoryProtection`].
     pub fn open(
         &self,
         nonce: &[u8; NONCE_LEN],
@@ -65,12 +75,14 @@ impl Aead {
         buf: &mut [u8],
         tag: &[u8; TAG_LEN],
     ) -> Result<(), CryptoError> {
-        let result = self.cipher()?.decrypt_inout_detached(&(*nonce).into(), aad, buf.into(), &(*tag).into());
+        let result = self.cipher().and_then(|cipher| {
+            cipher.decrypt_inout_detached(&(*nonce).into(), aad, buf.into(), &(*tag).into())
+                .map_err(|_| CryptoError::AuthFailed)
+        });
         if result.is_err() {
             zeroize::Zeroize::zeroize(buf);
-            return Err(CryptoError::AuthFailed);
         }
-        Ok(())
+        result
     }
 }
 
@@ -79,7 +91,21 @@ mod tests {
     use super::*;
 
     fn aead() -> Aead {
-        Aead::new(SecretKey::generate().unwrap())
+        Aead::new(SecretKey::generate().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn local_key_failure_wipes_output_and_can_be_retried() {
+        let mut aead = aead();
+        let mut bytes = b"a plaintext block".to_vec();
+        let (nonce, tag) = aead.seal(b"test", &mut bytes).unwrap();
+        let ciphertext = bytes.clone();
+        aead.fail_once_after(0);
+        assert_eq!(aead.open(&nonce, b"test", &mut bytes, &tag), Err(CryptoError::MemoryProtection));
+        assert!(bytes.iter().all(|&byte| byte == 0));
+        bytes.copy_from_slice(&ciphertext);
+        aead.open(&nonce, b"test", &mut bytes, &tag).unwrap();
+        assert_eq!(bytes, b"a plaintext block");
     }
 
     #[test]
@@ -156,7 +182,7 @@ mod tests {
         nonce.copy_from_slice(&hex("404142434445464748494a4b4c4d4e4f5051525354555657"));
         let aad = hex("50515253c0c1c2c3c4c5c6c7");
         let mut buf = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.".to_vec();
-        let a = Aead::new(SecretKey::from_bytes(&mut key));
+        let a = Aead::new(SecretKey::from_bytes(&mut key)).unwrap();
         let tag = a.seal_with_nonce(&nonce, &aad, &mut buf).unwrap();
         assert_eq!(
             buf,

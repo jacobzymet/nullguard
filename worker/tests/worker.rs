@@ -1,8 +1,8 @@
-//! Exercise the actual desktop executable and its private pipe protocol.
+//! Exercise the headless worker executable and its private pipe protocol.
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use nullguard::{
@@ -12,6 +12,11 @@ use nullguard::{
 use serde_json::{Value, json};
 
 const PASSWORD: &str = "test vault long password";
+
+// A concurrent Unix fork can briefly inherit another test's locked fixture
+// descriptor until exec closes it. Keep fixture creation/reopening and worker
+// launches in separate tests from overlapping; production lock checks stay strict.
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn encoded(path: &Path) -> Vec<u8> {
     #[cfg(unix)]
@@ -31,7 +36,7 @@ fn encoded(path: &Path) -> Vec<u8> {
 
 fn request(path: &Path, operation: Value) -> Value {
     json!({"operation": operation, "vault": encoded(path), "mountpoint": [],
-        "keyfile": null, "password": PASSWORD, "read_only": false})
+        "keyfile": null, "password": PASSWORD.as_bytes(), "read_only": false})
 }
 
 struct Worker {
@@ -41,19 +46,30 @@ struct Worker {
 }
 
 impl Worker {
-    fn start(request: Value) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_nullguard-desktop"));
+    fn spawn() -> Self {
+        let declared = std::path::PathBuf::from(env!("CARGO_BIN_EXE_nullguard-worker"));
+        // Cross-built Linux tests can run in a native runtime with a different
+        // host path syntax. Cargo still places the executable next to deps/.
+        let executable = if declared.is_file() { declared } else {
+            std::env::current_exe().unwrap().parent().unwrap().parent().unwrap()
+                .join(if cfg!(windows) { "nullguard-worker.exe" } else { "nullguard-worker" })
+        };
+        let mut command = Command::new(executable);
         command
-            .arg("--mount-worker")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().unwrap();
-        let mut input = child.stdin.take().unwrap();
-        serde_json::to_writer(&mut input, &request).unwrap();
-        input.write_all(b"\n").unwrap();
-        input.flush().unwrap();
+        let input = child.stdin.take().unwrap();
         let output = child.stdout.take().unwrap();
+        let diagnostics = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(diagnostics).lines() {
+                let line = line.unwrap();
+                assert!(!line.contains(PASSWORD), "diagnostics leaked the password");
+                eprintln!("worker diagnostic: {line}");
+            }
+        });
         let (sender, events) = mpsc::channel();
         std::thread::spawn(move || {
             for line in BufReader::new(output).lines() {
@@ -72,6 +88,15 @@ impl Worker {
             input: Some(input),
             events,
         }
+    }
+
+    fn start(request: Value) -> Self {
+        let mut worker = Self::spawn();
+        let input = worker.input.as_mut().unwrap();
+        serde_json::to_writer(&mut *input, &request).unwrap();
+        input.write_all(b"\n").unwrap();
+        input.flush().unwrap();
+        worker
     }
 
     fn send(&mut self, control: &str) {
@@ -143,6 +168,7 @@ fn vault(path: &Path) {
 
 #[test]
 fn verifies_existing_vault_and_rejects_wrong_password() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("vault.ngv");
     vault(&path);
@@ -150,14 +176,41 @@ fn verifies_existing_vault_and_rejects_wrong_password() {
     worker.until("Verified");
     worker.exit(true);
     let mut wrong = request(&path, json!("Verify"));
-    wrong["password"] = json!("a definitely wrong password");
+    wrong["password"] = json!(b"a definitely wrong password".as_slice());
     let mut worker = Worker::start(wrong);
     worker.until("Error");
     worker.exit(false);
 }
 
 #[test]
+fn worker_is_ready_before_credentials_and_honors_actual_kdf_consent() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut worker = Worker::spawn();
+    let ready = worker.until("Ready");
+    assert_eq!(ready["Ready"]["protocol_version"], 1);
+    worker.input.take();
+    worker.until("Error");
+    worker.exit(false);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("costly.ngv");
+    Vault::create(&path, PASSWORD.as_bytes(), &CreateOptions {
+        size: 4 << 20, kdf: Argon2Params { iterations: 5, ..Argon2Params::LOW_MEMORY },
+        chunk_size: Some(4096), fill_random: false,
+    }, &mut |_, _| {}).unwrap();
+    let mut worker = Worker::start(request(&path, json!("Verify")));
+    assert!(worker.until("Error")["Error"].as_str().unwrap().contains("approved limits"));
+    worker.exit(false);
+    let mut approved = request(&path, json!("Verify"));
+    approved["allow_expensive_kdf"] = json!(true);
+    let mut worker = Worker::start(approved);
+    worker.until("Verified");
+    worker.exit(true);
+}
+
+#[test]
 fn cancelling_creation_removes_partial_vault_and_preserves_existing_files() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cancelled.ngv");
     let create = json!({"Create": {"size": 1_u64 << 32, "low_memory": true}});
@@ -176,6 +229,7 @@ fn cancelling_creation_removes_partial_vault_and_preserves_existing_files() {
 
 #[test]
 fn verifies_with_a_keyfile_using_the_existing_permission_checks() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("vault.ngv");
     vault(&path);
@@ -199,7 +253,7 @@ fn verifies_with_a_keyfile_using_the_existing_permission_checks() {
     opened.add_keyfile(&key).unwrap();
     drop(opened);
     let mut req = request(&path, json!("Verify"));
-    req["password"] = json!("");
+    req["password"] = json!([]);
     req["keyfile"] = json!(encoded(&keypath));
     let mut worker = Worker::start(req);
     worker.until("Verified");
@@ -209,7 +263,7 @@ fn verifies_with_a_keyfile_using_the_existing_permission_checks() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&keypath, std::fs::Permissions::from_mode(0o644)).unwrap();
         let mut req = request(&path, json!("Verify"));
-        req["password"] = json!("");
+        req["password"] = json!([]);
         req["keyfile"] = json!(encoded(&keypath));
         let mut worker = Worker::start(req);
         worker.until("Error");
@@ -220,6 +274,7 @@ fn verifies_with_a_keyfile_using_the_existing_permission_checks() {
 #[test]
 #[ignore = "requires an installed FUSE/WinFsp driver; run by native mount CI"]
 fn mount_lock_reopen_and_parent_disconnect_commit_files() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("vault.ngv");
     #[cfg(unix)]
@@ -267,4 +322,35 @@ fn mount_lock_reopen_and_parent_disconnect_commit_files() {
     worker.send("Lock");
     worker.until("Finished");
     worker.exit(true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires FUSE; run by native mount CI"]
+fn broker_cleans_up_after_a_worker_crash() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vault.ngv");
+    vault(&path);
+    let mountpoint = dir.path().join("mounted");
+    std::fs::create_dir(&mountpoint).unwrap();
+    let mut req = request(&path, json!("Unlock"));
+    req["mountpoint"] = json!(encoded(&mountpoint));
+    let mut worker = Worker::start(req);
+    worker.until("Mounted");
+    let mut file = std::fs::File::create(mountpoint.join("saved.txt")).unwrap();
+    file.write_all(b"durable before crash").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    worker.child.kill().unwrap();
+    worker.exit(false);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read_dir(&mountpoint).is_err() {
+        assert!(Instant::now() < deadline, "broker left a disconnected mount behind");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(std::fs::read_dir(&mountpoint).unwrap().next().is_none());
+    let mut fs = Vault::open(&path, Credential::Password(PASSWORD.as_bytes()), true).unwrap().into_fs().unwrap();
+    let file = fs.resolve("/saved.txt").unwrap();
+    assert_eq!(&*fs.read(file, 0, 100).unwrap(), b"durable before crash");
 }

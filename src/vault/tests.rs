@@ -13,6 +13,86 @@ const KDF: Argon2Params = Argon2Params { memory_kib: Argon2Params::MIN_CREATE_ME
 const PASSWORD_SLOT: u64 = 82;
 
 #[test]
+fn expensive_unlock_requires_explicit_approval_at_actual_open() {
+    let options = CreateOptions { kdf: Argon2Params { iterations: 5, ..KDF }, ..opts(4 << 20) };
+    let t = new_vault_with(options);
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), true), Err(Error::Crypto(CryptoError::ResourceLimit(_)))));
+    let vault = Vault::open_with_kdf_limits(&t.path, Credential::Password(PW), true, crate::crypto::kdf::KdfLimits::FORMAT_MAX).unwrap();
+    vault.into_fs().unwrap();
+}
+
+#[test]
+fn oversized_newest_metadata_is_not_treated_as_recoverable_corruption() {
+    let t = new_vault();
+    let vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    let store = ChunkStore::new(vault.file.try_clone().unwrap(), &vault.header, vault.master.with_key(data_aead).unwrap().unwrap(), false);
+    let mut bytes = vec![0; store.chunk_size() as usize];
+    store.read(0, None, &mut bytes).unwrap();
+    bytes[48..56].copy_from_slice(&(fs::MAX_METADATA_BYTES as u64 + 1).to_le_bytes());
+    store.write(0, &bytes).unwrap();
+    assert!(matches!(fs::current_header_hash(&store), Err(Error::ResourceLimit(_))));
+    assert!(matches!(Fs::open(store, vault.header.hash()), Err(Error::ResourceLimit(_))));
+}
+
+#[test]
+fn torn_commit_writes_and_failed_flushes_preserve_a_complete_state() {
+    for operation in 0..4 {
+        for prefix in [0, 2048] {
+            let t = new_vault();
+            let mut fs = open_fs(&t);
+            fs.set_auto_commit(false);
+            let ino = fs.create_file(ROOT_INO, b"file", 0o600).unwrap();
+            fs.write(ino, 0, b"old").unwrap();
+            fs.commit().unwrap();
+            fs.write(ino, 0, b"new").unwrap();
+            fs.create_file(ROOT_INO, b"added", 0o600).unwrap();
+            let (result, fired) = chunks::fault::after(operation, prefix, || fs.commit());
+            assert!(fired && result.is_err(), "operation {operation}");
+            if operation >= 2 { assert!(fs.write(ino, 0, b"retry").is_err()); }
+            drop(fs);
+            let mut fs = open_fs(&t);
+            let ino = fs.resolve("file").unwrap();
+            let data = fs.read(ino, 0, 3).unwrap();
+            assert!(data.as_slice() == b"old" || data.as_slice() == b"new");
+            assert_eq!(fs.resolve("added").is_ok(), data.as_slice() == b"new");
+        }
+    }
+}
+
+#[test]
+fn password_changes_survive_each_torn_write_or_flush_failure() {
+    for operation in 0..12 {
+        let t = new_vault();
+        let mut vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+        let (result, fired) = chunks::fault::after(operation, 2048, || vault.change_password(PW2, KDF));
+        assert!(fired && result.is_err(), "operation {operation}");
+        drop(vault);
+        let old = Vault::open(&t.path, Credential::Password(PW), true);
+        let new = Vault::open(&t.path, Credential::Password(PW2), true);
+        assert!(old.is_ok() || new.is_ok(), "both credentials lost at operation {operation}");
+        if let Ok(vault) = old { vault.into_fs().unwrap(); }
+        if let Ok(vault) = new { vault.into_fs().unwrap(); }
+    }
+}
+
+#[test]
+fn header_io_failure_blocks_retries_on_the_same_vault() {
+    let t = new_vault();
+    let mut vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    let (result, fired) = chunks::fault::after(5, 2048, || vault.change_password(PW2, KDF));
+    assert!(fired && result.is_err());
+    assert!(result.unwrap_err().to_string().contains("both old and new credentials"));
+    let mut before = vec![0; vault.header.file_len() as usize];
+    read_exact_at(&vault.file, &mut before, 0).unwrap();
+    assert!(vault.change_password(PW2, KDF).is_err());
+    let mut after = vec![0; before.len()];
+    read_exact_at(&vault.file, &mut after, 0).unwrap();
+    assert!(after == before, "retrying after a failed header update must not overwrite recovery state");
+    drop(vault);
+    Vault::open(&t.path, Credential::Password(PW2), true).unwrap().into_fs().unwrap();
+}
+
+#[test]
 fn cancelled_creation_removes_only_its_partial_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cancelled.ngv");
@@ -54,6 +134,64 @@ fn new_vault() -> Tmp {
 
 fn open_fs(t: &Tmp) -> Fs {
     Vault::open(&t.path, Credential::Password(PW), false).unwrap().into_fs().unwrap()
+}
+
+fn store_with_key_failure(vault: &Vault, successful_uses: usize) -> ChunkStore {
+    let mut aead = vault.master.with_key(data_aead).unwrap().unwrap();
+    aead.fail_once_after(successful_uses);
+    ChunkStore::new(vault.file.try_clone().unwrap(), &vault.header, aead, false)
+}
+
+#[test]
+fn key_memory_failures_stop_recovery_instead_of_falling_back() {
+    let t = new_vault();
+    let vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    // Fail either superblock, then fail the newest metadata after both
+    // superblocks succeeded. A fallback would use the still-working key.
+    for successful_uses in [0, 1, 2] {
+        let store = store_with_key_failure(&vault, successful_uses);
+        assert!(matches!(Fs::open(store, vault.header.hash()), Err(Error::Crypto(CryptoError::MemoryProtection))));
+    }
+    for successful_uses in [0, 1] {
+        let store = store_with_key_failure(&vault, successful_uses);
+        assert!(matches!(fs::current_header_hash(&store), Err(Error::Crypto(CryptoError::MemoryProtection))));
+        assert_eq!(fs::current_header_hash(&store).unwrap(), Some(vault.header.hash()));
+    }
+}
+
+#[test]
+fn key_memory_failures_wipe_chunk_reads_and_leave_writes_untouched() {
+    let t = new_vault();
+    let vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    let mut before = vec![0; vault.header.file_len() as usize];
+    read_exact_at(&vault.file, &mut before, 0).unwrap();
+    let mut out = vec![0xA7; vault.header.chunk_size as usize];
+    let store = store_with_key_failure(&vault, 0);
+    assert!(matches!(store.read(0, None, &mut out), Err(Error::Crypto(CryptoError::MemoryProtection))));
+    assert!(out.iter().all(|&byte| byte == 0));
+    store.read(0, None, &mut out).unwrap();
+
+    let store = store_with_key_failure(&vault, 0);
+    assert!(matches!(store.write(0, &out), Err(Error::Crypto(CryptoError::MemoryProtection))));
+    let mut after = vec![0; before.len()];
+    read_exact_at(&vault.file, &mut after, 0).unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+fn key_memory_failure_before_header_write_keeps_credentials_unchanged() {
+    let t = new_vault();
+    let before = std::fs::read(&t.path).unwrap();
+    {
+        let mut vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+        // Password wrapping succeeds, then recovering the data key for
+        // write_header fails before either header copy is written.
+        vault.master.fail_once_after(1);
+        assert!(matches!(vault.change_password(PW2, KDF), Err(Error::Crypto(CryptoError::MemoryProtection))));
+    }
+    assert_eq!(std::fs::read(&t.path).unwrap(), before);
+    Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW2), false), Err(Error::WrongCredentials)));
 }
 
 fn patch(path: &Path, offset: u64, f: impl FnOnce(&mut [u8])) {
@@ -114,6 +252,47 @@ fn create_write_reopen_read() {
     assert_eq!(*fs.readlink(l).unwrap(), b"docs/hello.txt");
     let names: Vec<_> = fs.readdir(ROOT_INO).unwrap().into_iter().map(|e| e.name.to_vec()).collect();
     assert_eq!(names, vec![b".".to_vec(), b"..".to_vec(), b"docs".to_vec(), b"link".to_vec()]);
+}
+
+#[test]
+fn opening_rejects_both_truncated_and_extended_vaults() {
+    for delta in [-1i64, 1] {
+        let t = new_vault();
+        let file = OpenOptions::new().write(true).open(&t.path).unwrap();
+        let len = file.metadata().unwrap().len();
+        file.set_len(len.checked_add_signed(delta).unwrap()).unwrap();
+        drop(file);
+        for read_only in [true, false] {
+            assert!(matches!(
+                Vault::open(&t.path, Credential::Password(PW), read_only),
+                Err(Error::Corrupt(_))
+            ), "a vault with size delta {delta} was accepted");
+        }
+    }
+}
+
+#[test]
+fn unused_space_is_outside_the_authentication_guarantee() {
+    let t = new_vault();
+    let header = Vault::peek_header(&t.path).unwrap();
+    // Formatting uses only the superblocks and the first metadata chunks.
+    // Changing a free chunk must not be described as detectable tampering.
+    patch(&t.path, chunk_offset(&t, header.chunk_count - 1), |b| b[0] ^= 1);
+    let mut fs = open_fs(&t);
+    assert!(fs.warnings.is_empty());
+    assert!(fs.verify().unwrap().bad_blocks.is_empty());
+}
+
+#[test]
+fn invalid_container_length_is_rejected_before_header_repair() {
+    let t = new_vault();
+    patch(&t.path, PRIMARY_OFFSET, |b| b[0] ^= 1);
+    let before = header_area(&t.path);
+    let file = OpenOptions::new().write(true).open(&t.path).unwrap();
+    file.set_len(file.metadata().unwrap().len() + 1).unwrap();
+    drop(file);
+    assert!(matches!(Vault::open(&t.path, Credential::Password(PW), false), Err(Error::Corrupt(_))));
+    assert_eq!(header_area(&t.path), before, "invalid containers must not be repaired");
 }
 
 #[test]
@@ -298,6 +477,50 @@ fn modified_data_chunk_is_detected() {
     assert!(matches!(fs.read(f, 0, 4096), Err(Error::ChunkAuth { .. })));
     let report = fs.verify().unwrap();
     assert_eq!(report.bad_blocks.len(), 1);
+    assert_eq!(report.bad_blocks_total, 1);
+}
+
+#[test]
+fn verification_bounds_diagnostics_but_counts_every_failure() {
+    let t = new_vault();
+    let mut fs = open_fs(&t);
+    fs.set_auto_commit(false);
+    let mut parent = ROOT_INO;
+    for _ in 0..100 {
+        parent = fs.mkdir(parent, &[b'z'; 255], 0o700).unwrap();
+    }
+    let file = fs.create_file(parent, b"file", 0o600).unwrap();
+    fs.write(file, 0, &vec![0x42; 200 * 4096]).unwrap();
+    fs.commit().unwrap();
+    let chunks = fs.chunks_of(file);
+    drop(fs);
+    for chunk in chunks {
+        patch(&t.path, chunk_offset(&t, chunk) + 24, |bytes| bytes[0] ^= 1);
+    }
+    let report = open_fs(&t).verify().unwrap();
+    assert_eq!((report.blocks_checked, report.bad_blocks_total), (200, 200));
+    assert!(!report.bad_blocks.is_empty() && report.bad_blocks.len() < 200);
+    assert!(report.bad_blocks.iter().all(|(path, _, _)| path.len() <= 4096
+        && path.contains(&format!("[inode {file}]"))));
+    assert!(report.bad_blocks.iter().map(|(path, _, error)| path.len() + error.len()).sum::<usize>() <= 64 * 1024);
+}
+
+#[test]
+fn verification_stops_on_local_key_failure_and_skips_unlinked_open_files() {
+    let t = new_vault();
+    let mut fs = open_fs(&t);
+    let file = fs.create_file(ROOT_INO, b"file", 0o600).unwrap();
+    fs.write(file, 0, b"data").unwrap();
+    fs.commit().unwrap();
+    drop(fs);
+    let vault = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
+    // Two superblocks and one metadata chunk are read while opening.
+    let store = store_with_key_failure(&vault, 3);
+    let mut fs = Fs::open(store, vault.header.hash()).unwrap();
+    assert!(matches!(fs.verify(), Err(Error::Crypto(CryptoError::MemoryProtection))));
+    fs.open_file(file).unwrap();
+    fs.unlink(ROOT_INO, b"file").unwrap();
+    assert_eq!(fs.verify().unwrap().files, 0);
 }
 
 #[test]
@@ -450,9 +673,10 @@ fn header_change_interrupted_between_its_two_commits_is_finished() {
         // copy, then one commit naming it, then a crash.
         let v = Vault::open(&t.path, Credential::Password(PW), false).unwrap();
         let mut new = v.header.clone();
-        new.set_password(&v.master, PW2, KDF).unwrap();
+        v.master.with_key(|master| new.set_password(master, PW2, KDF)).unwrap().unwrap();
         write_all_at(&v.file, &new.to_bytes(), BACKUP_OFFSET).unwrap();
-        let store = ChunkStore::new(v.file.try_clone().unwrap(), &v.header, data_aead(&v.master).unwrap(), false);
+        let aead = v.master.with_key(data_aead).unwrap().unwrap();
+        let store = ChunkStore::new(v.file.try_clone().unwrap(), &v.header, aead, false);
         let mut fs = Fs::open(store, v.header.hash()).unwrap();
         fs.commit_once_under(new.hash()).unwrap();
         fs.abandon();

@@ -279,7 +279,7 @@ impl App {
         }
         let password = nullguard::crypto::kdf::normalize_password(self.password.as_str());
         if create.is_some() {
-            crate::worker::validate_password(&password)?;
+            nullguard_worker::validate_password(&password)?;
             let repeat = nullguard::crypto::kdf::normalize_password(self.repeat.as_str());
             if !nullguard::crypto::ct_eq(password.as_bytes(), repeat.as_bytes()) {
                 anyhow::bail!("The passwords do not match. Enter them again.");
@@ -333,6 +333,7 @@ impl App {
                 password
             },
             read_only: self.read_only,
+            allow_expensive_kdf: create.is_none() && self.allow_cost,
         };
         drop(self.password.take());
         drop(self.repeat.take());
@@ -405,6 +406,7 @@ impl App {
             };
             let item = &mut self.items[index];
             match message {
+                Message::Event(_, Event::Ready { .. }) => {}
                 Message::Event(_, Event::Progress { fraction }) => {
                     item.progress = fraction.clamp(0.0, 1.0)
                 }
@@ -413,7 +415,7 @@ impl App {
                     self.save();
                 }
                 Message::Event(_, Event::Mounted) => {
-                    if item.phase != Phase::Locking && !self.closing {
+                    if matches!(item.phase, Phase::Creating | Phase::Unlocking) && !self.closing && !item.had_error {
                         item.phase = Phase::Unlocked;
                         item.message = None;
                         if let Some(session) = &item.session

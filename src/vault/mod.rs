@@ -24,7 +24,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::crypto::{Aead, Argon2Params, CryptoError, Keyfile, SecretKey, ct_eq, derive_subkey};
-use chunks::{ChunkStore, read_exact_at, write_all_at};
+use crate::crypto::secret::ProtectedKey;
+use chunks::{ChunkStore, read_exact_at, write_all_at, sync_data, sync_all};
 use fs::Fs;
 use header::{BACKUP_OFFSET, DATA_OFFSET, HEADER_AREA, Header, HeaderError, PRIMARY_OFFSET, chunk_stride};
 
@@ -61,8 +62,14 @@ pub enum Error {
     InUse,
     #[error("the vault is opened read-only")]
     ReadOnly,
+    #[error("a previous header update failed; close and reopen the vault before continuing")]
+    HeaderUpdateFailed,
+    #[error("header update did not finish: {0}. Keep both old and new credentials, close the vault, and reopen it to resolve the committed state")]
+    HeaderUpdateIncomplete(#[source] Box<Error>),
     #[error("no space left in the vault")]
     NoSpace,
+    #[error("resource limit: {0}")]
+    ResourceLimit(&'static str),
     #[error("no such file or directory")]
     NotFound,
     #[error("already exists")]
@@ -120,9 +127,10 @@ pub fn auto_chunk_size(size: u64) -> u32 {
 pub struct Vault {
     file: File,
     header: Header,
-    master: SecretKey,
+    master: ProtectedKey,
     path: PathBuf,
     read_only: bool,
+    header_update_failed: bool,
     /// Security-relevant observations (a damaged header copy etc.). Callers
     /// must show these to the user.
     pub warnings: Vec<String>,
@@ -159,6 +167,9 @@ impl Vault {
             HeaderError::Malformed("too few chunks") => Error::Usage("vault size is too small".into()),
             other => other.into(),
         })?;
+        let aead = data_aead(&master)?;
+        fs::check_resource_geometry(header.chunk_count)?;
+        drop(master); // do not retain a plaintext master during random filling
 
         // Only the owner may read the vault: other local users shouldn't even
         // get a copy to attack offline. (Private from the moment it exists,
@@ -185,10 +196,10 @@ impl Vault {
             let bytes = header.to_bytes();
             write_all_at(&file, &bytes, PRIMARY_OFFSET)?;
             write_all_at(&file, &bytes, BACKUP_OFFSET)?;
-            let store = ChunkStore::new(file.try_clone()?, &header, data_aead(&master)?, false);
+            let store = ChunkStore::new(file.try_clone()?, &header, aead, false);
             let fs = Fs::format(store, header.hash())?;
             drop(fs);
-            file.sync_all()?;
+            sync_all(&file)?;
             Ok(())
         })();
         if result.is_err() {
@@ -220,6 +231,12 @@ impl Vault {
     /// (an interrupted change) or was tampered with: that is reported, and
     /// unless `read_only`, the copy is restored from the current header.
     pub fn open(path: &Path, cred: Credential<'_>, read_only: bool) -> Result<Self, Error> {
+        Self::open_with_kdf_limits(path, cred, read_only, crate::crypto::kdf::KdfLimits::STANDARD)
+    }
+
+    /// Open under an explicit approval for costly password derivation.
+    pub fn open_with_kdf_limits(path: &Path, cred: Credential<'_>, read_only: bool,
+        limits: crate::crypto::kdf::KdfLimits) -> Result<Self, Error> {
         let mut oo = OpenOptions::new();
         oo.read(true).write(!read_only);
         // Windows: while we write, no other process may open, rename or
@@ -270,7 +287,7 @@ impl Vault {
         let mut found = None;
         for (i, header) in candidates {
             let unlocked = match &cred {
-                Credential::Password(p) => header.unlock_with_password(p),
+                Credential::Password(p) => header.unlock_with_password_with_limits(p, limits),
                 Credential::Keyfile(k) => header.unlock_with_keyfile(k),
             };
             let master = match unlocked {
@@ -279,6 +296,9 @@ impl Vault {
                     note(Error::WrongCredentials);
                     continue;
                 }
+                Err(HeaderError::Crypto(error @ (CryptoError::MemoryProtection | CryptoError::ResourceLimit(_)))) => {
+                    return Err(error.into());
+                }
                 // E.g. a tampered copy demanding more memory than exists:
                 // that must not stop us from trying the other copy.
                 Err(e) => {
@@ -286,8 +306,10 @@ impl Vault {
                     continue;
                 }
             };
-            let store = ChunkStore::new(file.try_clone()?, &header, data_aead(&master)?, true);
-            match fs::current_header_hash(&store) {
+            let master = ProtectedKey::new(master)?;
+            let aead = master.with_key(data_aead)??;
+            let store = ChunkStore::new(file.try_clone()?, &header, aead, true);
+            match fs::current_header_hash(&store)? {
                 Some(current) if ct_eq(&current, &header.hash()) => {
                     found = Some((i, header, master));
                     break;
@@ -302,6 +324,15 @@ impl Vault {
             return Err(err.unwrap_or(Error::WrongCredentials));
         };
 
+        // Check the complete container geometry before repairing either
+        // header. Otherwise appended bytes pass verification unnoticed.
+        let actual_len = file.metadata()?.len();
+        if actual_len != header.file_len() {
+            let problem = if actual_len < header.file_len() { "is truncated" } else { "has unexpected trailing bytes" };
+            return Err(Error::Corrupt(format!(
+                "the vault file {problem} ({actual_len} bytes, expected {})", header.file_len()
+            )));
+        }
         let mut warnings = Vec::new();
         let current = header.to_bytes();
         let (name, offset, other) = if i == 0 { ("backup", BACKUP_OFFSET, &backup) } else { ("primary", PRIMARY_OFFSET, &primary) };
@@ -310,21 +341,14 @@ impl Vault {
                 warnings.push(stale_copy_warning(name));
             } else {
                 write_all_at(&file, &current, offset)?;
-                file.sync_data()?;
+                sync_data(&file)?;
                 warnings.push(format!(
                     "the {name} header copy did not match the vault's current header (an interrupted \
                      password or keyfile change, or tampering). It has been restored from the current header."
                 ));
             }
         }
-        let actual_len = file.metadata()?.len();
-        if actual_len < header.file_len() {
-            return Err(Error::Corrupt(format!(
-                "the vault file is truncated ({actual_len} bytes, expected {})",
-                header.file_len()
-            )));
-        }
-        Ok(Self { file, header, master, path: path.to_owned(), read_only, warnings })
+        Ok(Self { file, header, master, path: path.to_owned(), read_only, header_update_failed: false, warnings })
     }
 
     pub fn header(&self) -> &Header {
@@ -338,7 +362,9 @@ impl Vault {
     /// Open the filesystem inside the vault. The filesystem's own warnings
     /// are in `Fs::warnings`; the vault's stay in [`Vault::warnings`].
     pub fn into_fs(self) -> Result<Fs, Error> {
-        let store = ChunkStore::new(self.file.try_clone()?, &self.header, data_aead(&self.master)?, self.read_only);
+        if self.header_update_failed { return Err(Error::HeaderUpdateFailed); }
+        let aead = self.master.with_key(data_aead)??;
+        let store = ChunkStore::new(self.file.try_clone()?, &self.header, aead, self.read_only);
         Fs::open(store, self.header.hash())
     }
 
@@ -369,39 +395,56 @@ impl Vault {
     /// 3. Write the new header to the primary copy. A crash before this
     ///    leaves a stale primary, which the next writable open restores.
     fn write_header(&mut self, new: Header) -> Result<(), Error> {
-        if self.read_only {
-            return Err(Error::ReadOnly);
-        }
+        self.check_header_write()?;
+        let aead = self.master.with_key(data_aead)??;
         let bytes = new.to_bytes();
-        write_all_at(&self.file, &bytes, BACKUP_OFFSET)?;
-        self.file.sync_data()?;
-        let store = ChunkStore::new(self.file.try_clone()?, &self.header, data_aead(&self.master)?, false);
-        let mut fs = Fs::open(store, self.header.hash())?;
-        fs.commit_header_change(new.hash())?;
-        drop(fs);
-        write_all_at(&self.file, &bytes, PRIMARY_OFFSET)?;
-        self.file.sync_data()?;
-        self.header = new;
+        // A failed flush may already have committed the new header hash.
+        // Never retry with stale in-memory headers: overwriting the backup
+        // could destroy the only header matching that committed state.
+        self.header_update_failed = true;
+        let result: Result<(), Error> = (|| {
+            write_all_at(&self.file, &bytes, BACKUP_OFFSET)?;
+            sync_data(&self.file)?;
+            let store = ChunkStore::new(self.file.try_clone()?, &self.header, aead, false);
+            let mut fs = Fs::open(store, self.header.hash())?;
+            fs.commit_header_change(new.hash())?;
+            drop(fs);
+            write_all_at(&self.file, &bytes, PRIMARY_OFFSET)?;
+            sync_data(&self.file)?;
+            self.header = new;
+            Ok(())
+        })();
+        if let Err(error) = result { return Err(Error::HeaderUpdateIncomplete(Box::new(error))); }
+        self.header_update_failed = false;
+        Ok(())
+    }
+
+    fn check_header_write(&self) -> Result<(), Error> {
+        if self.header_update_failed { return Err(Error::HeaderUpdateFailed); }
+        if self.read_only { return Err(Error::ReadOnly); }
         Ok(())
     }
 
     /// Replace the password. Keyfiles are kept.
     pub fn change_password(&mut self, new_password: &[u8], kdf: Argon2Params) -> Result<(), Error> {
+        self.check_header_write()?;
         kdf.validate_for_new_slot()?;
         let mut h = self.header.clone();
-        h.set_password(&self.master, new_password, kdf)?;
+        self.master.with_key(|master| h.set_password(master, new_password, kdf))??;
         self.write_header(h)
     }
 
     /// Allow `keyfile` to unlock this vault.
     pub fn add_keyfile(&mut self, keyfile: &Keyfile) -> Result<(), Error> {
+        self.check_header_write()?;
         let mut h = self.header.clone();
-        h.add_keyfile(&self.master, keyfile)?;
+        self.master.with_key(|master| h.add_keyfile(master, keyfile))??;
         self.write_header(h)
     }
 
     /// Stop `keyfile` from unlocking this vault.
     pub fn remove_keyfile(&mut self, keyfile: &Keyfile) -> Result<(), Error> {
+        self.check_header_write()?;
         let mut h = self.header.clone();
         if !h.remove_keyfile(keyfile)? {
             return Err(Error::Usage("that keyfile can't unlock this vault".into()));
@@ -412,6 +455,7 @@ impl Vault {
     /// Remove every keyfile (for a lost keyfile: then add back the ones you
     /// still have). Returns how many were removed.
     pub fn remove_all_keyfiles(&mut self) -> Result<usize, Error> {
+        self.check_header_write()?;
         let n = self.header.keyfiles.len();
         if n == 0 {
             return Err(Error::Usage("this vault has no keyfiles".into()));
@@ -468,7 +512,7 @@ fn stale_copy_warning(name: &str) -> String {
 }
 
 fn data_aead(master: &SecretKey) -> Result<Aead, Error> {
-    Ok(Aead::new(derive_subkey(master, LABEL_DATA_KEY)?))
+    Ok(Aead::new(derive_subkey(master, LABEL_DATA_KEY)?)?)
 }
 
 fn fill_random(file: &File, start: u64, end: u64, progress: &mut dyn FnMut(u64, u64), cancelled: &dyn Fn() -> bool) -> Result<(), Error> {

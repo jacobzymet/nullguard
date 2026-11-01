@@ -113,7 +113,7 @@ impl WrappedKey {
         let mut buf = zeroize::Zeroizing::new(*master.expose());
         let nonce = random::array::<NONCE_LEN>()?;
         let commitment = key_commitment(&commit, &nonce, aad);
-        let tag = Aead::new(enc).seal_with_nonce(&nonce, aad, buf.as_mut_slice())?;
+        let tag = Aead::new(enc)?.seal_with_nonce(&nonce, aad, buf.as_mut_slice())?;
         Ok(Self { nonce, commitment, ciphertext: *buf, tag })
     }
 
@@ -125,7 +125,7 @@ impl WrappedKey {
             return Err(CryptoError::AuthFailed);
         }
         let mut buf = zeroize::Zeroizing::new(self.ciphertext);
-        Aead::new(enc).open(&self.nonce, aad, buf.as_mut_slice(), &self.tag)?;
+        Aead::new(enc)?.open(&self.nonce, aad, buf.as_mut_slice(), &self.tag)?;
         Ok(SecretKey::from_bytes(&mut buf))
     }
 
@@ -325,22 +325,45 @@ impl Header {
     fn keyfile_slot(&self, keyfile: &Keyfile) -> Result<Option<usize>, HeaderError> {
         let kek = keyfile.kek(&self.vault_id)?;
         let aad = self.slot_aad();
-        Ok(self.keyfiles.iter().position(|k| k.open(&kek, &aad).is_ok()))
+        for (i, slot) in self.keyfiles.iter().enumerate() {
+            match slot.open(&kek, &aad) {
+                Ok(_) => return Ok(Some(i)),
+                Err(CryptoError::AuthFailed) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(None)
     }
 
     /// Unlock with the password. `Ok(None)` means it's the wrong password.
-    /// An error means the key derivation itself failed (for example a
-    /// tampered header asking for more memory than the machine has).
+    /// An error means key derivation or OS key-memory protection failed
+    /// (for example a header asking for more memory than the machine has).
     pub fn unlock_with_password(&self, password: &[u8]) -> Result<Option<SecretKey>, HeaderError> {
-        let kek = kdf::derive_key(password, &self.salt, &self.kdf)?;
-        Ok(self.password.open(&kek, &self.slot_aad()).ok())
+        self.unlock_with_password_with_limits(password, kdf::KdfLimits::STANDARD)
+    }
+
+    /// Unlock with an explicit resource approval for the actual header.
+    pub fn unlock_with_password_with_limits(&self, password: &[u8], limits: kdf::KdfLimits) -> Result<Option<SecretKey>, HeaderError> {
+        let kek = kdf::derive_key_with_limits(password, &self.salt, &self.kdf, limits)?;
+        match self.password.open(&kek, &self.slot_aad()) {
+            Ok(master) => Ok(Some(master)),
+            Err(CryptoError::AuthFailed) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Unlock with a keyfile. `Ok(None)` means no slot accepts it.
     pub fn unlock_with_keyfile(&self, keyfile: &Keyfile) -> Result<Option<SecretKey>, HeaderError> {
         let kek = keyfile.kek(&self.vault_id)?;
         let aad = self.slot_aad();
-        Ok(self.keyfiles.iter().find_map(|k| k.open(&kek, &aad).ok()))
+        for slot in &self.keyfiles {
+            match slot.open(&kek, &aad) {
+                Ok(master) => return Ok(Some(master)),
+                Err(CryptoError::AuthFailed) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -401,6 +424,14 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fuzz_seed_headers_use_the_current_format() {
+        for bytes in [include_bytes!("../../fuzz/seeds/header/no-keyfiles"), include_bytes!("../../fuzz/seeds/header/one-keyfile")] {
+            let header = Header::parse(bytes).expect("valid header seed");
+            assert_eq!(header.to_bytes().as_slice(), bytes);
+        }
+    }
     use crate::crypto::kdf::TEST_PARAMS;
 
     const PW: &[u8] = b"correct horse battery staple";
