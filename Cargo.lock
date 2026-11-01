@@ -2126,11 +2126,24 @@ dependencies = [
  "eframe",
  "ksni",
  "nullguard",
+ "nullguard-worker",
  "rfd",
  "serde",
  "serde_json",
  "tempfile",
  "tray-icon",
+ "zeroize",
+]
+
+[[package]]
+name = "nullguard-worker"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "nullguard",
+ "serde",
+ "serde_json",
+ "tempfile",
  "zeroize",
 ]
 

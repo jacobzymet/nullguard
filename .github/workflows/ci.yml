@@ -25,7 +25,7 @@ jobs:
             features: ""
           # macOS runners can't load macFUSE; type-check and test without mounting.
           - os: macos-latest
-            features: "--features nullguard/macos-no-mount,nullguard-desktop/macos-no-mount"
+            features: "--features nullguard/macos-no-mount,nullguard-desktop/macos-no-mount,nullguard-worker/macos-no-mount"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -36,6 +36,13 @@ jobs:
           toolchain: stable
           components: clippy
       - run: cargo clippy --workspace --locked --all-targets ${{ matrix.features }} -- -D warnings
+      - name: Public documentation
+        run: cargo doc --workspace --locked --no-deps ${{ matrix.features }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Windows test caller privileges
+        if: runner.os == 'Windows'
+        run: whoami /priv
       - run: cargo test --workspace --locked ${{ matrix.features }}
 
   mount-test:
@@ -54,7 +61,12 @@ jobs:
       - name: Mount test (as root, adds cross-user ownership and isolation checks)
         run: sudo ./scripts/mount-test.sh target/release/nullguard
       - name: Desktop create, mount, lock, reopen, and parent disconnect
-        run: cargo test -p nullguard-desktop --locked --test worker -- --ignored --test-threads=1
+        run: cargo test -p nullguard-worker --locked --test worker -- --ignored --test-threads=1
+      - name: Worker broker cleanup and direct root mounts
+        run: |
+          worker_test=$(cargo test -p nullguard-worker --locked --test worker --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "worker" and .executable != null) | .executable')
+          test -n "$worker_test"
+          sudo "$worker_test" --ignored --test-threads=1
 
   mount-test-windows:
     runs-on: windows-latest
@@ -71,7 +83,7 @@ jobs:
         shell: bash
         run: ./scripts/mount-test-windows.sh target/release/nullguard.exe
       - name: Desktop create, mount, lock, reopen, and parent disconnect (WinFsp)
-        run: cargo test -p nullguard-desktop --locked --test worker -- --ignored --test-threads=1
+        run: cargo test -p nullguard-worker --locked --test worker -- --ignored --test-threads=1
 
   # Known-vulnerable or yanked dependencies fail the build.
   audit:
@@ -144,7 +156,7 @@ jobs:
           targets: ${{ matrix.target }}
       - if: matrix.os == 'macos-latest'
         run: brew install --cask macfuse && brew install pkgconf
-      - run: cargo build -p nullguard-desktop --release --locked --target ${{ matrix.target }}
+      - run: cargo build -p nullguard-desktop -p nullguard-worker --release --locked --target ${{ matrix.target }}
       - name: Package desktop app and checksums
         shell: bash
         run: ./scripts/package-desktop.sh ${{ matrix.target }}
@@ -152,3 +164,41 @@ jobs:
         with:
           name: nullguard-desktop-${{ matrix.target }}
           path: dist/desktop/*
+
+  # Sign provenance only for the default branch and version tags, after all
+  # native checks and both build jobs. PR build jobs never receive signing rights.
+  attest-binaries:
+    if: github.event_name == 'push' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v'))
+    needs: [release-binaries, desktop-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download this run's binaries and complete desktop packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'nullguard-x86_64-*' --pattern 'nullguard-aarch64-*' --pattern 'nullguard-desktop-*' --dir artifacts
+      - name: Sign build provenance
+        id: attest
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: artifacts/**
+      - name: Verify repository, workflow, ref, and commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while IFS= read -r -d '' artifact; do
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml" \
+              --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA"
+          done < <(find artifacts -type f -print0)
+      - name: Keep the signed bundle for offline verification
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: nullguard-provenance
+          path: ${{ steps.attest.outputs.bundle-path }}
+          if-no-files-found: error
+          overwrite: true

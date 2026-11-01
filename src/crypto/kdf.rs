@@ -2,11 +2,66 @@
 
 use argon2::{Algorithm, Argon2, Block, Params, Version};
 use zeroize::Zeroizing;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{CryptoError, SecretKey};
 
 /// Length of the per-slot random salt.
 pub const SALT_LEN: usize = 32;
+
+/// Operational approval for an untrusted header, checked at derivation time.
+/// Raising these limits never lowers a vault's password-hashing cost.
+#[derive(Clone, Copy, Debug)]
+pub struct KdfLimits {
+    pub memory_kib: u32,
+    pub iterations: u32,
+    pub parallelism: u32,
+}
+
+impl KdfLimits {
+    pub const STANDARD: Self = Self { memory_kib: Argon2Params::DEFAULT.memory_kib,
+        iterations: Argon2Params::DEFAULT.iterations, parallelism: Argon2Params::DEFAULT.parallelism };
+    /// Explicit opt-in for vaults exceeding the normal creation defaults.
+    pub const FORMAT_MAX: Self = Self {
+        memory_kib: Argon2Params::MAX_MEMORY_KIB,
+        iterations: Argon2Params::MAX_ITERATIONS,
+        parallelism: Argon2Params::MAX_PARALLELISM,
+    };
+
+    fn check(self, params: &Argon2Params) -> Result<(), CryptoError> {
+        if params.memory_kib > self.memory_kib || params.iterations > self.iterations
+            || params.parallelism > self.parallelism {
+            return Err(CryptoError::ResourceLimit("password hashing exceeds approved limits; approve expensive unlocking only for a trusted vault"));
+        }
+        Ok(())
+    }
+}
+
+// Cap simultaneous Argon2 allocations across library callers in this process.
+static RESERVED_KIB: AtomicU64 = AtomicU64::new(0);
+const TOTAL_KDF_KIB: u64 = 4 * 1024 * 1024;
+
+struct Reservation<'a> { counter: &'a AtomicU64, kib: u64 }
+
+impl<'a> Reservation<'a> {
+    fn reserve(counter: &'a AtomicU64, limit: u64, kib: u32) -> Result<Self, CryptoError> {
+        let kib = u64::from(kib);
+        let mut used = counter.load(Ordering::Acquire);
+        loop {
+            let total = used.checked_add(kib).filter(|&n| n <= limit)
+                .ok_or(CryptoError::ResourceLimit("too many simultaneous key derivations; wait for another unlock to finish"))?;
+            match counter.compare_exchange_weak(used, total, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(current) => used = current,
+            }
+        }
+        Ok(Self { counter, kib })
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) { self.counter.fetch_sub(self.kib, Ordering::AcqRel); }
+}
 
 /// Argon2id cost parameters, stored per key slot in the vault header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +132,7 @@ pub fn derive_key(
     params: &Argon2Params,
 ) -> Result<SecretKey, CryptoError> {
     params.validate()?;
+    let _reservation = Reservation::reserve(&RESERVED_KIB, TOTAL_KDF_KIB, params.memory_kib)?;
     let p = Params::new(params.memory_kib, params.iterations, params.parallelism, Some(32))
         .map_err(|_| CryptoError::InvalidParams("argon2 rejected parameters"))?;
     // Provide the working memory ourselves: the crate frees its own buffer
@@ -94,6 +150,15 @@ pub fn derive_key(
         .hash_password_into_with_memory(password, salt, out.expose_mut(), memory.as_mut_slice())
         .map_err(|_| CryptoError::Kdf)?;
     Ok(out)
+}
+
+/// Derive under a caller-approved resource ceiling. Check before allocation
+/// or hashing, including when the header changed since a UI preflight.
+pub fn derive_key_with_limits(password: &[u8], salt: &[u8; SALT_LEN], params: &Argon2Params,
+    limits: KdfLimits) -> Result<SecretKey, CryptoError> {
+    params.validate()?;
+    limits.check(params)?;
+    derive_key(password, salt, params)
 }
 
 /// Canonical form of a password before key derivation: Unicode NFC,
@@ -116,6 +181,32 @@ pub(crate) const TEST_PARAMS: Argon2Params = Argon2Params { memory_kib: 64, iter
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unapproved_cost_is_refused_before_allocation() {
+        let params = Argon2Params { memory_kib: Argon2Params::MAX_MEMORY_KIB, iterations: 64, parallelism: 4 };
+        assert!(matches!(derive_key_with_limits(b"test", &[0; SALT_LEN], &params, KdfLimits::STANDARD), Err(CryptoError::ResourceLimit(_))));
+        let tiny_limits = KdfLimits { memory_kib: TEST_PARAMS.memory_kib, iterations: 1, parallelism: 1 };
+        let a = derive_key_with_limits(b"test", &[0; SALT_LEN], &TEST_PARAMS, tiny_limits).unwrap();
+        let b = derive_key(b"test", &[0; SALT_LEN], &TEST_PARAMS).unwrap();
+        assert_eq!(a.expose(), b.expose());
+    }
+
+    #[test]
+    fn aggregate_reservations_release_on_error_and_unwind() {
+        let counter = AtomicU64::new(0);
+        {
+            let _first = Reservation::reserve(&counter, 8, 5).unwrap();
+            assert!(Reservation::reserve(&counter, 8, 4).is_err());
+            let result = std::panic::catch_unwind(|| {
+                let _rest = Reservation::reserve(&counter, 8, 3).unwrap();
+                panic!("derivation failed");
+            });
+            assert!(result.is_err());
+            assert_eq!(counter.load(Ordering::Relaxed), 5);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn deterministic_and_salted() {

@@ -5,37 +5,61 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod key_memory;
+
+#[cfg(target_os = "linux")]
+pub mod worker_sandbox;
+
 /// Reduce what an attacker with access to this machine could extract from
 /// the running process: no core dumps (which would contain keys), and on
-/// Linux no ptrace attach or /proc/<pid>/mem access by other processes of
+/// Linux no ptrace attach or `/proc/<pid>/mem` access by other processes of
 /// the same user.
-pub fn harden_process() {
+/// On Windows, refuse new memory-access/injection handles before accepting
+/// secrets. This is process-object hardening, not a sandbox or a replacement
+/// for driver-enforced isolation. Existing handles and administrators with
+/// debug privileges remain outside this protection.
+pub fn harden_process() -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         // SAFETY: setrlimit with a valid pointer to an initialized rlimit.
-        unsafe {
-            libc::setrlimit(libc::RLIMIT_CORE, &zero);
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
     }
     #[cfg(target_os = "linux")]
     {
         // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes no pointers.
-        unsafe {
-            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
     }
     #[cfg(windows)]
-    win::suppress_crash_reports();
+    {
+        win::suppress_crash_reports();
+        win::restrict_process_access()?;
+    }
     #[cfg(target_os = "macos")]
     {
         // The macOS counterpart: refuse debugger attachment (lldb, dtrace
         // and task_for_pid-based memory readers) for this process's lifetime.
         // SAFETY: PT_DENY_ATTACH ignores the pid/addr/data arguments.
-        unsafe {
-            libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0);
+        if unsafe { libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
     }
+    Ok(())
+}
+
+/// Harden the headless worker before it reads any request or credentials.
+/// Windows workers need neither generated executable code nor child processes.
+/// This reduces available mechanisms after a compromise; it is not a full
+/// filesystem/network sandbox.
+pub fn harden_worker_process() -> std::io::Result<()> {
+    #[cfg(windows)]
+    win::restrict_worker_capabilities()?;
+    harden_process()
 }
 
 /// Real user id of this process (0 on Windows).
@@ -383,6 +407,95 @@ pub mod win {
         s
     }
 
+    /// Restrict future OpenProcess calls, including calls by this user.
+    /// OWNER RIGHTS deliberately replaces the owner's implicit WRITE_DAC
+    /// grant: otherwise another process of the same user could undo this.
+    /// Keep limited queries, waiting, termination and READ_CONTROL available
+    /// for process supervision. SYSTEM retains full access. This cannot
+    /// revoke handles opened before startup hardening, protect thread
+    /// objects, or stop an administrator exercising debug privileges.
+    pub(super) fn restrict_process_access() -> io::Result<()> {
+        use std::sync::OnceLock;
+        use windows_sys::Win32::Security::{PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity};
+        use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+
+        // Applying the ACL removes ordinary WRITE_DAC access, so do it only
+        // once. Cache failures too: callers must not silently continue.
+        static RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
+        (*RESULT.get_or_init(|| {
+            let allowed = READ_CONTROL | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE;
+            let sddl = to_wide(&format!("D:P(A;;GA;;;SY)(A;;0x{allowed:08x};;;OW)"));
+            let mut sd: *mut c_void = null_mut();
+            // SAFETY: valid NUL-terminated SDDL; Windows allocates sd. Only
+            // this process's DACL is changed, and sd is freed after use.
+            unsafe {
+                if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut sd, null_mut()) == 0 {
+                    return Err(io::Error::last_os_error().raw_os_error().unwrap_or(1));
+                }
+                let ok = SetKernelObjectSecurity(
+                    GetCurrentProcess(),
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    sd,
+                );
+                let result = if ok == 0 { Err(io::Error::last_os_error().raw_os_error().unwrap_or(1)) } else { Ok(()) };
+                LocalFree(sd);
+                result
+            }
+        }))
+        .map_err(io::Error::from_raw_os_error)
+    }
+
+    pub(super) fn restrict_worker_capabilities() -> io::Result<()> {
+        use windows_sys::Win32::System::Threading::{SetProcessMitigationPolicy,
+            ProcessDynamicCodePolicy, ProcessExtensionPointDisablePolicy, ProcessChildProcessPolicy};
+        use windows_sys::Win32::System::SystemServices::{
+            PROCESS_MITIGATION_DYNAMIC_CODE_POLICY, PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY,
+            PROCESS_MITIGATION_CHILD_PROCESS_POLICY,
+        };
+        let mut dynamic = PROCESS_MITIGATION_DYNAMIC_CODE_POLICY::default();
+        dynamic.Anonymous.Flags = 1; // ProhibitDynamicCode, no opt-out/downgrade
+        let mut extension = PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY::default();
+        extension.Anonymous.Flags = 1; // DisableExtensionPoints
+        let mut child = PROCESS_MITIGATION_CHILD_PROCESS_POLICY::default();
+        child.Anonymous.Flags = 1; // NoChildProcessCreation
+        // SAFETY: documented Windows structures with only their first policy
+        // bit enabled. Policies apply solely to this worker, before keys are
+        // read. GUI processes retain their ordinary graphics/launch behavior.
+        unsafe {
+            if SetProcessMitigationPolicy(ProcessDynamicCodePolicy, (&dynamic as *const PROCESS_MITIGATION_DYNAMIC_CODE_POLICY).cast(), std::mem::size_of_val(&dynamic)) == 0
+                || SetProcessMitigationPolicy(ProcessExtensionPointDisablePolicy, (&extension as *const PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY).cast(), std::mem::size_of_val(&extension)) == 0
+                || SetProcessMitigationPolicy(ProcessChildProcessPolicy, (&child as *const PROCESS_MITIGATION_CHILD_PROCESS_POLICY).cast(), std::mem::size_of_val(&child)) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Encrypt one retained 256-bit key in place for this process only.
+    pub(crate) fn protect_key_memory(key: &mut [u8; crate::crypto::KEY_LEN]) -> io::Result<()> {
+        use windows_sys::Win32::Security::Cryptography::{
+            CRYPTPROTECTMEMORY_BLOCK_SIZE, CRYPTPROTECTMEMORY_SAME_PROCESS, CryptProtectMemory,
+        };
+        const { assert!(crate::crypto::KEY_LEN.is_multiple_of(CRYPTPROTECTMEMORY_BLOCK_SIZE as usize)) };
+        // SAFETY: the array is writable for its full length, a multiple of
+        // the API's block size. SAME_PROCESS is also used when decrypting.
+        let ok = unsafe { CryptProtectMemory(key.as_mut_ptr().cast(), key.len() as u32, CRYPTPROTECTMEMORY_SAME_PROCESS) };
+        if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    /// Decrypt a copy of a key encrypted by [`protect_key_memory`]. The
+    /// caller owns the zeroizing buffer and wipes it on success or failure.
+    pub(crate) fn unprotect_key_memory(key: &mut [u8; crate::crypto::KEY_LEN]) -> io::Result<()> {
+        use windows_sys::Win32::Security::Cryptography::{CRYPTPROTECTMEMORY_SAME_PROCESS, CryptUnprotectMemory};
+        // SAFETY: the writable array has the same fixed size and flags as
+        // the buffer passed to CryptProtectMemory. No pointer is retained.
+        let ok = unsafe { CryptUnprotectMemory(key.as_mut_ptr().cast(), key.len() as u32, CRYPTPROTECTMEMORY_SAME_PROCESS) };
+        if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    }
+
     /// Keep keys and decrypted data out of crash reports (the Windows
     /// counterpart of disabling core dumps), for this process only:
     ///
@@ -472,7 +585,7 @@ pub mod win {
         Ok(format!("D:P(A;;FA;;;{})(A;;FA;;;SY)", current_user_sid()?))
     }
 
-    /// [`private_sddl`] as Windows writes it back (it shortens some
+    /// The private security descriptor as Windows writes it back (it shortens some
     /// well-known accounts, such as the built-in Administrator to "LA"):
     /// what [`permissions_sddl`] reports for a private file.
     pub fn private_permissions_sddl() -> io::Result<String> {

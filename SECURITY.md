@@ -31,8 +31,29 @@ running as you while the vault is unlocked).
 - Cryptography comes only from audited crates: XChaCha20-Poly1305,
   Argon2id and SHA-256 (see the README's
   [cryptographic design](README.md#cryptographic-design)).
-- `unsafe` is denied crate-wide except for a few libc and Windows API calls
-  in `src/platform.rs` and our own minimal WinFsp bindings in
-  `src/mount/winfsp.rs` (Windows only).
+- `unsafe` is denied crate-wide except for libc and Windows API calls
+  in `src/platform.rs`, its guarded-memory submodule, and our own minimal
+  WinFsp bindings in `src/mount/winfsp.rs` (Windows only).
 - CI runs `cargo audit` against the RustSec advisory database on every push.
+- Parser fuzzing runs on relevant changes and daily, with bounded execution
+  and retained failure inputs. Deterministic tests inject torn writes and
+  flush failures into commits and password changes.
+- Desktop vault work uses a headless helper with no GUI dependencies,
+  bounded worker admission, and resource approval checked at derivation.
+  Windows helpers additionally prohibit dynamic code, legacy extension
+  points and child-process creation. Linux workers confine syscalls after
+  vault/native-mount setup; a keyless broker retains only the protocol needed
+  to unmount one fixed mount. Windows/macOS and initial Linux setup do not
+  have this filesystem/network confinement. See
+  [current hardening and limits](docs/security-hardening-2026-11-01.md).
+- Verification bounds traversal and diagnostic memory independently of tree
+  depth and preserves total failure counts when diagnostic samples are capped.
+- CI signs provenance for default-branch/version-tag binaries and desktop
+  packages, with no signing permissions in PR/build jobs. This does not replace
+  native OS code signing or an independent audit.
+- [RAM key protection](docs/ram-key-protection.md) encrypts retained master/data
+  keys on Windows, Linux and macOS. Windows uses the OS memory-protection API;
+  Linux/macOS use authenticated encryption with wrapping keys in locked,
+  guarded pages. Temporary keys are wiped after use. This does not protect
+  a compromised host or provide kernel isolation for Unix wrapping keys.
 - nullguard has **not yet had an independent security audit**.

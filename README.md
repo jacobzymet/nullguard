@@ -6,14 +6,15 @@ quantum-resistant alternative to VeraCrypt, written in Rust.
 A nullguard vault is a single ordinary file. Unlock it with a password or a
 keyfile and it appears as a normal folder. Everything inside (file contents,
 names, sizes, directory structure) is encrypted and authenticated. Lock it,
-and it's an opaque blob that detects any tampering.
+and it's an opaque blob that detects tampering with its authenticated contents.
 
 - **A portable CLI, plus an optional desktop app.** The CLI has no installer, no runtime, no DLLs, no driver of its
   own. Copy `nullguard` (or `nullguard.exe`) onto a USB stick next to
   your vault and go.
 - **Audited cryptography.** XChaCha20-Poly1305 for data, Argon2id for
   passwords and SHA-256 for hashing, all from audited Rust crates.
-- **Tamper-evident.** Every byte is authenticated. Modified, moved, swapped
+- **Tamper-evident.** Stored files and filesystem metadata are authenticated.
+  Modified, moved, swapped
   or *replayed* (rolled back) blocks are detected, and so is an old header
   put back to revive a removed keyfile or an old password.
 - **Crash-safe.** Copy-on-write with atomic commits: pulling the plug leaves
@@ -242,13 +243,27 @@ operations run in these workers. **Locked** appears only after the worker
 exits. OS and input-method buffers are outside the app's memory-wiping
 guarantees, as with other desktop password fields.
 
+Each vault uses the separate `nullguard-worker` executable, which has no
+GUI, graphics, tray or file-dialog dependencies. Keep it beside the desktop
+executable; the macOS app bundle includes it automatically. The app checks
+the worker protocol before sending credentials. At most four workers run
+per app instance, with one expensive startup operation at a time.
+
+On Linux, workers install kernel syscall restrictions after vault/native-mount
+setup. While serving, they cannot open new file paths, use network sockets or
+execute programs; a separate keyless broker handles clean unmounting. Initial
+unlock/setup and Windows/macOS workers do not have this filesystem/network
+confinement. See [hardening details](docs/security-hardening-2026-11-01.md).
+
 **Advanced** offers read-only unlocking and an integrity check. Password
 changes, keyfile generation and management, rekeying, and offline file
 operations currently use the [CLI](#commands).
 
 Download builds from the successful [CI workflow's artifacts](https://github.com/jacobzymet/nullguard/actions/workflows/ci.yml):
 choose the `nullguard-desktop-…` artifact for your OS. These builds are
-currently unsigned; macOS builds are not notarized.
+currently lack OS code signatures; macOS builds are not notarized. Default-branch
+and version-tag builds generate signed provenance after all build jobs pass;
+see [verifying downloads](docs/security-hardening-2026-11-01.md#verifying-downloads).
 
 ### Desktop on Linux
 
@@ -276,6 +291,7 @@ To build and launch from source, install Rust **1.95 or newer** and run from
 the repository root:
 
 ```bash
+cargo build -p nullguard-worker --release --locked
 cargo run -p nullguard-desktop --release --locked
 ```
 
@@ -289,19 +305,22 @@ To build and launch from source with Rust **1.95 or newer** and macFUSE
 installed, run from the repository root:
 
 ```bash
+cargo build -p nullguard-worker --release --locked
 cargo run -p nullguard-desktop --release --locked
 ```
 
 ### Desktop on Windows
 
-Install [WinFsp 2.x](https://winfsp.dev/), then open
-`nullguard-desktop.exe`. Each unlocked vault receives a free drive letter.
+Install [WinFsp 2.x](https://winfsp.dev/), extract the complete desktop ZIP,
+then open `nullguard-desktop.exe`. Keep `nullguard-worker.exe` beside it.
+Each unlocked vault receives a free drive letter.
 The GUI does not open a console window.
 
 To build and launch from source with Rust **1.95 or newer**, run in
 PowerShell from the repository root:
 
 ```powershell
+cargo build -p nullguard-worker --release --locked
 cargo run -p nullguard-desktop --release --locked
 ```
 
@@ -311,7 +330,7 @@ On Linux and Windows, run `cargo test --workspace --locked` to include the
 CLI and desktop tests. On macOS, use:
 
 ```bash
-cargo test --workspace --locked --features nullguard/macos-no-mount,nullguard-desktop/macos-no-mount
+cargo test --workspace --locked --features nullguard/macos-no-mount,nullguard-desktop/macos-no-mount,nullguard-worker/macos-no-mount
 ```
 
 Native Linux and Windows CI also test actual desktop worker creation,
@@ -356,6 +375,12 @@ random words (a diceware passphrase) is ideal: the KDF makes each guess
 expensive, but nothing can save a guessable password. Passwords are Unicode
 NFC-normalized before use, so a password with accents unlocks the same vault
 on every OS and keyboard.
+
+Unlocking rejects password hashing above normal defaults unless explicitly
+approved. For a trusted high-cost vault, use `--allow-expensive-kdf` with
+commands that unlock it, or approve the warning in the desktop app. The
+limit is checked against the actual opened header, even if the file changed
+after a warning was displayed. Password-hashing costs are never reduced.
 
 ## Platform support
 
@@ -469,6 +494,8 @@ cargo +nightly fuzz run header seeds/header -- -max_total_time=600
 ```
 
 The other targets are `superblock`, `metadata` and `keyfile`.
+CI runs all four parsers on relevant pushes/pull requests and daily, using
+AddressSanitizer with time and memory limits. Failing inputs are retained.
 
 ---
 
@@ -483,11 +510,17 @@ The main differences:
 | Integrity | XTS mode is unauthenticated: modified sectors decrypt to garbage silently, and blocks can be swapped or rolled back undetected | Every chunk is authenticated (AEAD) and bound to its position and exact version; tampering and rollback are detected |
 | Header rollback | An old volume header backup restores old passwords/keyfiles | An old header is refused, even if a superblock is also destroyed |
 | What a cloud observer sees between versions | Which 16-byte blocks changed (deterministic per sector) | Which chunks changed; rewritten data is indistinguishable from random |
-| Password hashing | PBKDF2 by default (not memory-hard: cheap on GPUs) | Argon2id, 1 GiB by default (memory-hard) |
+| Password hashing | PBKDF2; Argon2id is also available for non-system volumes since 1.26.29 | Argon2id, 1 GiB by default (memory-hard) |
+| Windows memory protections | Driver-enforced process-memory access protection and optional RAM key encryption | Restricts new process-memory handles; encrypts retained master/data keys using Windows memory protection, with page locking and wiping |
 | Algorithm choice | 5 ciphers, cascades and 5 hashes; unlocking tries the combinations | One cipher, one password hash, one hash function |
 | Code base | Large C/C++ and assembly, its own kernel driver, bootloader | Small Rust, user space only (on Windows, mounting uses the separately installed WinFsp driver) |
 | Plausible deniability | Hidden volumes | Not offered (a vault is recognizable as one) |
 | Independent audit | Yes (2016, 2020) | **Not yet** |
+
+VeraCrypt's [current KDF documentation](https://veracrypt.io/en/Header%20Key%20Derivation.html)
+describes both PBKDF2 and Argon2id. When Argon2id is selected, its default is
+416 MiB and 6 passes; nullguard's default is 1 GiB and 4 passes. These
+settings alone do not establish which implementation is safer overall.
 
 ## Threat model
 
@@ -514,9 +547,13 @@ stick, cloud sync provider, backup operator, border search of a locked device).
 **2. Someone who can modify the vault file while it is locked** (malicious
 cloud storage, an "evil maid" with access to the file, a compromised backup).
 
-- **Any change is detected.** Every chunk is AEAD-authenticated with its
+- **Changes to stored files and metadata are detected.** Each allocated
+  chunk is AEAD-authenticated with its
   vault ID and position as associated data, so flipped bits, moved chunks and
   chunks copied from another vault are rejected.
+  Unused random space and superseded chunks are not authenticated by the
+  current filesystem state; changes to those bytes are not necessarily
+  detected. Truncated containers and extra trailing bytes are refused.
 - **Rollback of individual chunks is detected.** The authenticated metadata
   records the exact nonce each data chunk must have, so restoring an older
   (validly encrypted) version of a chunk fails.
@@ -592,6 +629,12 @@ synced to the cloud).
   reports it. Argon2's working memory and the file names held by the
   filesystem, listings and lookups are wiped when no longer needed, but
   are too large to lock: use encrypted swap.
+- Retained vault master/data keys stay encrypted in RAM on Windows, Linux
+  and macOS. Operations decrypt separate temporary copies and wipe them
+  afterwards, including on failure or panic. Protection failures stop the
+  operation without a plaintext fallback. Passwords, keyfile credentials
+  and decrypted file caches are outside this encryption boundary. See
+  [RAM key protection](docs/ram-key-protection.md) for the mechanisms and limits.
 - `--password-stdin` reads from the raw input handle into a wiped buffer,
   so the password does not remain in the standard input buffer while a
   vault is mounted.
@@ -619,6 +662,10 @@ synced to the cloud).
   options.
 - Core dumps are disabled. The process is marked non-dumpable, blocking
   `ptrace` and `/proc/<pid>/mem` access by other processes of the same user.
+- RAM-wrapping keys use dedicated, strictly locked pages, inaccessible
+  between encryption/decryption operations and surrounded by guard pages.
+  The kernel excludes these mappings from ordinary core dumps and fork
+  children. Failure to lock or protect them stops the operation.
 - `get` holds destination folders open and uses directory-relative,
   no-follow operations, preventing a folder-to-link swap from redirecting
   output. `put` lists and enters source folders through their open handles.
@@ -635,6 +682,10 @@ synced to the cloud).
   use `0700`.
 - Core dumps are disabled. Debugger attachment is refused with
   `PT_DENY_ATTACH`.
+- RAM-wrapping keys use dedicated, strictly locked pages, inaccessible
+  between encryption/decryption operations and surrounded by guard pages.
+  These mappings are excluded from fork children and request wired-page
+  zeroing on deallocation. Failure to lock or protect them stops the operation.
 - `get` holds destination folders open and uses directory-relative,
   no-follow operations, preventing a folder-to-link swap from redirecting
   output. `put` lists and enters source folders through their open handles.
@@ -662,8 +713,18 @@ synced to the cloud).
   replaced while copying. It refuses links, folders owned by another
   user, and file replacements through short 8.3 aliases such as
   `REPORT~1.PDF`. `put` holds each source folder on the way open.
-- Other ordinary processes of the same user can read nullguard's memory;
-  this falls under malware running as you. Crash reports exclude heap
+- Before accepting credentials, the CLI, desktop app and desktop workers
+  restrict new process handles to limited queries, waiting, termination
+  and reading permissions. New handles for reading/writing process memory,
+  injection, handle duplication and changing the process's permissions are
+  refused, including for the same user. Startup fails if this restriction
+  cannot be installed. This is user-space hardening, not VeraCrypt's
+  driver-enforced protection: existing handles, thread-object attacks,
+  administrators with debug privileges and malware running as you remain
+  outside the guarantee.
+- Retained vault master keys and chunk-encryption keys are encrypted in
+  RAM with Windows `CryptProtectMemory`, restricted to the same process.
+- Crash reports exclude heap
   memory, and a crash ends the process before a dump is taken. Mounting
   excludes `nullguard.exe` from Windows Error Reporting for the current
   user, a lasting setting under
@@ -826,7 +887,7 @@ chunk area is filled with random bytes.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | magic `NULLGARD` |
-| 8 | 2 | version = 4 (3 is still supported) |
+| 8 | 2 | version = 4 (older versions are refused) |
 | 10 | 16 | vault ID (random) |
 | 26 | 4 | chunk size: power of two, 4 KiB to 1 MiB |
 | 30 | 8 | chunk count N (≥ 16) |
@@ -840,8 +901,11 @@ chunk area is filled with random bytes.
 The cipher is always XChaCha20-Poly1305, so the header doesn't store it.
 Parsing is strict: unknown versions, out-of-range values and non-zero
 padding are rejected, so every header has exactly one valid encoding.
-Argon2 parameters are capped when *reading* (≤ 4 GiB, ≤ 64 passes, ≤ 64
-lanes), so a crafted vault can't exhaust memory or CPU.
+The format caps Argon2 parameters (≤ 4 GiB, ≤ 64 passes, ≤ 64 lanes).
+Unlocking normally permits at most 1 GiB, 4 passes and 4 lanes. Higher costs
+require explicit approval; simultaneous derivations in one process share a
+4 GiB reservation ceiling. These are allocation/work limits, not an OS-wide
+memory quota.
 
 **Wrapped key** (104 bytes): `nonce (24) ‖ commitment (32) ‖ ciphertext (32) ‖ tag (16)`, where
 
@@ -988,20 +1052,33 @@ src/
   cli.rs         command line
   platform.rs    process hardening, no-follow file access for `get` and `put`,
                  Windows file permissions
-                 (with mount/winfsp.rs, the only code with `unsafe`)
+  platform/
+    key_memory.rs  locked, guarded Unix RAM-wrapping key pages
+                 (platform code and mount/winfsp.rs contain the `unsafe`)
 tests/cli.rs     end-to-end tests of the binary
 scripts/mount-test.sh  real FUSE mount test (Linux)
 desktop/
   src/app.rs          egui desktop interface and session states
-  src/worker.rs       vault operations and mounts in isolated worker processes
-  src/protocol.rs     bounded private-pipe messages, OS-native paths
+  src/admission.rs    live-worker and expensive-startup limits
+  src/session.rs      worker launch, protocol handshake, lifecycle and diagnostics
   src/secret_input.rs masked password input without plaintext undo history
   src/paths.rs        private settings, mount locations, file-manager opening
   src/tray.rs         platform tray / menu-bar integration
+worker/
+  src/main.rs         headless worker startup and process protections
+  src/worker.rs       vault operations and mounting, without GUI dependencies
+  src/protocol.rs     bounded private-pipe messages, OS-native paths
   tests/worker.rs     real executable and native-mount integration tests
 ```
 
 ## Limitations and roadmap
+
+Operational limits: 64 MiB of encoded filesystem metadata, 100,000 inodes,
+a 64 MiB allocation bitmap, and a 16 MiB decrypted-chunk cache per filesystem.
+Oversized existing vaults fail with a resource-limit error; nullguard never
+uses an older commit to bypass these limits. The on-disk format is unchanged.
+See [architecture hardening](docs/architecture-hardening-2026-10-31.md) for
+the boundaries, compatibility notes and remaining work.
 
 - **An independent security audit.**
 - **Incremental metadata** (a B-tree instead of rewriting all metadata per
